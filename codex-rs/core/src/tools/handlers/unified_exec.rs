@@ -6,6 +6,7 @@ use crate::protocol::EventMsg;
 use crate::protocol::ExecCommandOutputDeltaEvent;
 use crate::protocol::ExecCommandSource;
 use crate::protocol::ExecOutputStream;
+use crate::sandboxing::SandboxPermissions;
 use crate::shell::default_user_shell;
 use crate::shell::get_shell_by_model_provided_path;
 use crate::tools::context::ToolInvocation;
@@ -140,7 +141,9 @@ impl ToolHandler for UnifiedExecHandler {
                     ..
                 } = args;
 
-                if with_escalated_permissions.unwrap_or(false)
+                let sandbox_permissions = SandboxPermissions::from(with_escalated_permissions);
+
+                if sandbox_permissions.requires_escalated_permissions()
                     && !matches!(
                         context.turn.approval_policy,
                         codex_protocol::protocol::AskForApproval::OnRequest
@@ -197,7 +200,7 @@ impl ToolHandler for UnifiedExecHandler {
                             yield_time_ms,
                             max_output_tokens,
                             workdir,
-                            with_escalated_permissions,
+                            sandbox_permissions,
                             justification,
                         },
                         &context,

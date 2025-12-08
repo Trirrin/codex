@@ -27,8 +27,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize)]
 pub enum SandboxPermissions {
+    #[default]
     UseDefault,
     RequireEscalated,
 }
@@ -49,6 +50,12 @@ impl From<bool> for SandboxPermissions {
     }
 }
 
+impl From<Option<bool>> for SandboxPermissions {
+    fn from(with_escalated_permissions: Option<bool>) -> Self {
+        with_escalated_permissions.map_or(SandboxPermissions::UseDefault, SandboxPermissions::from)
+    }
+}
+
 #[derive(Debug)]
 pub struct CommandSpec {
     pub program: String,
@@ -56,7 +63,7 @@ pub struct CommandSpec {
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
     pub expiration: ExecExpiration,
-    pub with_escalated_permissions: Option<bool>,
+    pub sandbox_permissions: SandboxPermissions,
     pub justification: Option<String>,
 }
 
@@ -67,7 +74,7 @@ pub struct ExecEnv {
     pub env: HashMap<String, String>,
     pub expiration: ExecExpiration,
     pub sandbox: SandboxType,
-    pub with_escalated_permissions: Option<bool>,
+    pub sandbox_permissions: SandboxPermissions,
     pub justification: Option<String>,
     pub arg0: Option<String>,
 }
@@ -181,7 +188,7 @@ impl SandboxManager {
             env,
             expiration: spec.expiration,
             sandbox,
-            with_escalated_permissions: spec.with_escalated_permissions,
+            sandbox_permissions: spec.sandbox_permissions,
             justification: spec.justification,
             arg0: arg0_override,
         })

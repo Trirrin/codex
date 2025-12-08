@@ -3325,6 +3325,7 @@ mod tests {
         use crate::exec::ExecParams;
         use crate::protocol::AskForApproval;
         use crate::protocol::SandboxPolicy;
+        use crate::sandboxing::SandboxPermissions;
         use crate::turn_diff_tracker::TurnDiffTracker;
         use std::collections::HashMap;
 
@@ -3335,6 +3336,7 @@ mod tests {
         let mut turn_context = Arc::new(turn_context_raw);
 
         let timeout_ms = 1000;
+        let with_escalated_permissions = Some(true);
         let params = ExecParams {
             command: if cfg!(windows) {
                 vec![
@@ -3352,13 +3354,14 @@ mod tests {
             cwd: turn_context.cwd.clone(),
             expiration: timeout_ms.into(),
             env: HashMap::new(),
-            with_escalated_permissions: Some(true),
+            sandbox_permissions: SandboxPermissions::from(with_escalated_permissions),
             justification: Some("test".to_string()),
             arg0: None,
         };
 
+        let params2_with_escalated_permissions = Some(false);
         let params2 = ExecParams {
-            with_escalated_permissions: Some(false),
+            sandbox_permissions: SandboxPermissions::from(params2_with_escalated_permissions),
             command: params.command.clone(),
             cwd: params.cwd.clone(),
             expiration: timeout_ms.into(),
@@ -3385,7 +3388,7 @@ mod tests {
                         "command": params.command.clone(),
                         "workdir": Some(turn_context.cwd.to_string_lossy().to_string()),
                         "timeout_ms": params.expiration.timeout_ms(),
-                        "with_escalated_permissions": params.with_escalated_permissions,
+                        "with_escalated_permissions": with_escalated_permissions,
                         "justification": params.justification.clone(),
                     })
                     .to_string(),
@@ -3422,7 +3425,7 @@ mod tests {
                         "command": params2.command.clone(),
                         "workdir": Some(turn_context.cwd.to_string_lossy().to_string()),
                         "timeout_ms": params2.expiration.timeout_ms(),
-                        "with_escalated_permissions": params2.with_escalated_permissions,
+                        "with_escalated_permissions": params2_with_escalated_permissions,
                         "justification": params2.justification.clone(),
                     })
                     .to_string(),
