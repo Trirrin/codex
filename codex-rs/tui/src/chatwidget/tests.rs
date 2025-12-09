@@ -10,6 +10,7 @@ use codex_core::CodexAuth;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::ConfigToml;
+use codex_core::config::Constrained;
 use codex_core::openai_models::models_manager::ModelsManager;
 use codex_core::protocol::AgentMessageDeltaEvent;
 use codex_core::protocol::AgentMessageEvent;
@@ -2042,6 +2043,109 @@ fn disabled_slash_command_while_task_running_snapshot() {
     assert_snapshot!(blob);
 }
 
+#[test]
+fn approvals_popup_shows_disabled_presets() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
+
+    chat.config.approval_policy =
+        Constrained::new(AskForApproval::OnRequest, |candidate| match candidate {
+            AskForApproval::OnRequest => Ok(()),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "this message should be printed in the description",
+            )),
+        })
+        .expect("construct constrained approval policy");
+
+    chat.open_approvals_popup();
+
+    let width = 80;
+    let height = chat.desired_height(width);
+    let mut terminal =
+        ratatui::Terminal::new(VT100Backend::new(width, height)).expect("create terminal");
+    terminal.set_viewport_area(Rect::new(0, 0, width, height));
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("render approvals popup");
+
+    let screen = terminal.backend().vt100().screen().contents();
+    let collapsed = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        collapsed.contains("(disabled)"),
+        "disabled preset label should be shown"
+    );
+    assert!(
+        collapsed.contains("this message should be printed in the description"),
+        "disabled preset reason should be shown"
+    );
+}
+
+#[test]
+fn approvals_popup_navigation_skips_disabled() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None);
+
+    chat.config.approval_policy =
+        Constrained::new(AskForApproval::OnRequest, |candidate| match candidate {
+            AskForApproval::OnRequest => Ok(()),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "disabled preset",
+            )),
+        })
+        .expect("construct constrained approval policy");
+
+    chat.open_approvals_popup();
+
+    // The approvals popup is the active bottom-pane view; drive navigation via chat handle_key_event.
+    // Start selected at idx 0 (enabled), move down twice; the disabled option should be skipped.
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+
+    // Move up back across the disabled option.
+    chat.handle_key_event(KeyEvent::from(KeyCode::Up));
+
+    // Press numeric shortcut for the disabled row (3 => idx 2); should not close or accept.
+    chat.handle_key_event(KeyEvent::from(KeyCode::Char('3')));
+
+    // Ensure the popup remains open and no selection actions were sent.
+    assert!(
+        chat.bottom_pane.active_view_for_test().is_some(),
+        "popup should remain open after selecting a disabled entry"
+    );
+    assert!(
+        op_rx.try_recv().is_err(),
+        "no actions should be dispatched yet"
+    );
+    assert!(rx.try_recv().is_err(), "no history should be emitted");
+
+    // Press Enter; selection should land on an enabled preset (idx 1) and dispatch updates.
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    let mut app_events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        app_events.push(ev);
+    }
+    assert!(
+        app_events.iter().any(|ev| matches!(
+            ev,
+            AppEvent::CodexOp(Op::OverrideTurnContext {
+                approval_policy: Some(AskForApproval::OnRequest),
+                ..
+            })
+        )),
+        "enter should select an enabled preset"
+    );
+    assert!(
+        !app_events.iter().any(|ev| matches!(
+            ev,
+            AppEvent::CodexOp(Op::OverrideTurnContext {
+                approval_policy: Some(AskForApproval::Never),
+                ..
+            })
+        )),
+        "disabled preset should not be selected"
+    );
+}
+
 //
 // Snapshot test: command approval modal
 //
@@ -2052,7 +2156,10 @@ fn approval_modal_exec_snapshot() {
     // Build a chat widget with manual channels to avoid spawning the agent.
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
     // Ensure policy allows surfacing approvals explicitly (not strictly required for direct event).
-    chat.config.approval_policy = AskForApproval::OnRequest;
+    chat.config
+        .approval_policy
+        .set(AskForApproval::OnRequest)
+        .expect("set approval policy");
     // Inject an exec approval request to display the approval modal.
     let ev = ExecApprovalRequestEvent {
         call_id: "call-approve-cmd".into(),
@@ -2106,7 +2213,10 @@ fn approval_modal_exec_snapshot() {
 #[test]
 fn approval_modal_exec_without_reason_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
-    chat.config.approval_policy = AskForApproval::OnRequest;
+    chat.config
+        .approval_policy
+        .set(AskForApproval::OnRequest)
+        .expect("set approval policy");
 
     let ev = ExecApprovalRequestEvent {
         call_id: "call-approve-cmd-noreason".into(),
@@ -2145,7 +2255,10 @@ fn approval_modal_exec_without_reason_snapshot() {
 #[test]
 fn approval_modal_patch_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
-    chat.config.approval_policy = AskForApproval::OnRequest;
+    chat.config
+        .approval_policy
+        .set(AskForApproval::OnRequest)
+        .expect("set approval policy");
 
     // Build a small changeset and a reason/grant_root to exercise the prompt text.
     let mut changes = HashMap::new();
@@ -2723,7 +2836,10 @@ fn apply_patch_full_flow_integration_like() {
 fn apply_patch_untrusted_shows_approval_modal() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
     // Ensure approval policy is untrusted (OnRequest)
-    chat.config.approval_policy = AskForApproval::OnRequest;
+    chat.config
+        .approval_policy
+        .set(AskForApproval::OnRequest)
+        .expect("set approval policy");
 
     // Simulate a patch approval request from backend
     let mut changes = HashMap::new();
@@ -2769,7 +2885,10 @@ fn apply_patch_request_shows_diff_summary() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
 
     // Ensure we are in OnRequest so an approval is surfaced
-    chat.config.approval_policy = AskForApproval::OnRequest;
+    chat.config
+        .approval_policy
+        .set(AskForApproval::OnRequest)
+        .expect("set approval policy");
 
     // Simulate backend asking to apply a patch adding two lines to README.md
     let mut changes = HashMap::new();

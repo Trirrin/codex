@@ -48,6 +48,13 @@ pub(crate) enum CancellationEvent {
     NotHandled,
 }
 
+#[cfg(test)]
+impl BottomPane {
+    pub(crate) fn active_view_for_test(&self) -> Option<&dyn BottomPaneView> {
+        self.view_stack.last().map(std::convert::AsRef::as_ref)
+    }
+}
+
 pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::InputResult;
 use codex_protocol::custom_prompts::CustomPrompt;
