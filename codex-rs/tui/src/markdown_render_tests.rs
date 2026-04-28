@@ -672,6 +672,161 @@ fn link() {
 }
 
 #[test]
+fn table_renders_columns_and_alignment_markers() {
+    let md = "| Left | Center | Right |\n|:-----|:------:|------:|\n| a    |   b    |     c |\n| wide | value  |    10 |\n";
+    let text = render_markdown_text(md);
+    let lines = plain_lines(&text);
+    assert_eq!(
+        lines,
+        vec![
+            "┌──────┬────────┬───────┐",
+            "│ Left │ Center │ Right │",
+            "├──────┼────────┼───────┤",
+            "│ a    │   b    │     c │",
+            "├──────┼────────┼───────┤",
+            "│ wide │ value  │    10 │",
+            "└──────┴────────┴───────┘",
+        ]
+    );
+    assert_snapshot!("markdown_render_table_snapshot", lines.join("\n"));
+}
+
+#[test]
+fn table_accepts_short_alignment_delimiters_after_text() {
+    let md = "Trirrin, table alignment test:\n| left | center | right |\n| :-- | :-: | --: |\n| apple | banana | 123 |\n| short | medium text | 4567 |\n";
+    let text = render_markdown_text(md);
+    let lines = plain_lines(&text);
+    assert_eq!(
+        lines,
+        vec![
+            "Trirrin, table alignment test:",
+            "┌───────┬─────────────┬───────┐",
+            "│ left  │   center    │ right │",
+            "├───────┼─────────────┼───────┤",
+            "│ apple │   banana    │   123 │",
+            "├───────┼─────────────┼───────┤",
+            "│ short │ medium text │  4567 │",
+            "└───────┴─────────────┴───────┘",
+        ]
+    );
+}
+
+#[test]
+fn table_accepts_chinese_headers_with_short_alignment_delimiters() {
+    let md = "表格对齐测试：\n| 左对齐 | 居中对齐 | 右对齐 |\n| :-- | :-: | --: |\n| apple | banana | 123 |\n| short | medium text | 4567 |\n";
+    let text = render_markdown_text(md);
+    let lines = plain_lines(&text);
+
+    assert!(
+        lines.iter().any(|line| line.starts_with("┌")),
+        "expected a rendered table border, got: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains(":--")),
+        "delimiter row should not render as plain text: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("│ apple")),
+        "left-aligned cell should stay near the left edge: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("123 │")),
+        "right-aligned cell should stay near the right edge: {lines:?}"
+    );
+}
+
+#[test]
+fn table_without_delimiter_renders_as_plain_text() {
+    let md = "| 项目 | 状态 | 说明 |\n  | 新功能 | ✅ 正常 | 表格渲染测试 |\n  | 对齐   | ✅ 正常 | 第二列右对齐 |\n  | Markdown | ✅ 正常 | 基础语法可用 |\n";
+    let text = render_markdown_text(md);
+    let lines = plain_lines(&text);
+    assert_eq!(
+        lines,
+        vec![
+            "| 项目 | 状态 | 说明 |",
+            "| 新功能 | ✅ 正常 | 表格渲染测试 |",
+            "| 对齐   | ✅ 正常 | 第二列右对齐 |",
+            "| Markdown | ✅ 正常 | 基础语法可用 |",
+        ]
+    );
+}
+
+#[test]
+fn wide_table_wraps_cells_to_fit_width() {
+    let md = "| Name | Status | Description |\n| --- | --- | --- |\n| Table rendering | Pass | Markdown table renders normally in a narrow terminal |\n";
+    let text = render_markdown_text_with_width_and_cwd(md, Some(40), None);
+    let lines = plain_lines(&text);
+
+    assert!(
+        lines
+            .iter()
+            .all(|line| unicode_width::UnicodeWidthStr::width(line.as_str()) <= 40),
+        "expected every table line to fit width 40, got: {lines:?}"
+    );
+    assert!(
+        lines.len() > 5,
+        "expected the long row to wrap inside cells, got: {lines:?}"
+    );
+    assert_eq!(
+        unicode_width::UnicodeWidthStr::width(lines.first().unwrap().as_str()),
+        unicode_width::UnicodeWidthStr::width(lines.last().unwrap().as_str()),
+        "top and bottom borders should have equal width: {lines:?}"
+    );
+}
+
+#[test]
+fn wrapped_table_cells_are_vertically_centered() {
+    let md = "| A | B |\n| --- | --- |\n| short | one two three four five six seven eight |\n";
+    let text = render_markdown_text_with_width_and_cwd(md, Some(24), None);
+    let lines = plain_lines(&text);
+
+    let short_line_index = lines
+        .iter()
+        .position(|line| line.contains("short"))
+        .expect("short cell should be rendered");
+    let wrapped_body_start = lines
+        .iter()
+        .position(|line| line.contains("one two"))
+        .expect("wrapped body should start");
+    let wrapped_body_end = lines
+        .iter()
+        .rposition(|line| line.contains("seven"))
+        .expect("wrapped body should end");
+
+    assert!(
+        short_line_index > wrapped_body_start && short_line_index < wrapped_body_end,
+        "short cell should be vertically centered in wrapped row: {lines:?}"
+    );
+}
+
+#[test]
+fn table_preserves_inline_styles_and_links() {
+    let text = render_markdown_text_for_cwd(
+        "| Kind | Value |\n| --- | --- |\n| code | `x` |\n| path | [file](/Users/example/code/codex/src/main.rs:7) |\n",
+        Path::new("/Users/example/code/codex"),
+    );
+    let lines = plain_lines(&text);
+    assert_eq!(
+        lines,
+        vec![
+            "┌──────┬───────────────┐",
+            "│ Kind │ Value         │",
+            "├──────┼───────────────┤",
+            "│ code │ x             │",
+            "├──────┼───────────────┤",
+            "│ path │ src/main.rs:7 │",
+            "└──────┴───────────────┘",
+        ]
+    );
+
+    let code_cell_has_code_style = text.lines[3]
+        .spans
+        .iter()
+        .any(|span| span.content == "x" && span.style.fg.is_some());
+    assert!(code_cell_has_code_style, "inline code style was lost");
+}
+
+#[test]
 fn load_location_suffix_regexes() {
     let _colon = &*COLON_LOCATION_SUFFIX_RE;
     let _hash = &*HASH_LOCATION_SUFFIX_RE;
@@ -683,8 +838,9 @@ fn file_link_hides_destination() {
         "[codex-rs/tui/src/markdown_render.rs](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs)",
         Path::new("/Users/example/code/codex"),
     );
-    let expected =
-        Text::from(Line::from_iter(["codex-rs/tui/src/markdown_render.rs".cyan()]));
+    let expected = Text::from(Line::from_iter([
+        "codex-rs/tui/src/markdown_render.rs".cyan()
+    ]));
     assert_eq!(text, expected);
 }
 
@@ -694,9 +850,7 @@ fn file_link_decodes_percent_encoded_bare_path_destination() {
         "[report](/Users/example/code/codex/Example%20Folder/R%C3%A9sum%C3%A9/report.md)",
         Path::new("/Users/example/code/codex"),
     );
-    let expected = Text::from(Line::from_iter([
-        "Example Folder/Résumé/report.md".cyan(),
-    ]));
+    let expected = Text::from(Line::from_iter(["Example Folder/Résumé/report.md".cyan()]));
     assert_eq!(text, expected);
 }
 
@@ -707,7 +861,7 @@ fn file_link_appends_line_number_when_label_lacks_it() {
         Path::new("/Users/example/code/codex"),
     );
     let expected = Text::from(Line::from_iter([
-        "codex-rs/tui/src/markdown_render.rs:74".cyan(),
+        "codex-rs/tui/src/markdown_render.rs:74".cyan()
     ]));
     assert_eq!(text, expected);
 }
@@ -718,7 +872,9 @@ fn file_link_keeps_absolute_paths_outside_cwd() {
         "[README.md:74](/Users/example/code/codex/README.md:74)",
         Path::new("/Users/example/code/codex/codex-rs/tui"),
     );
-    let expected = Text::from(Line::from_iter(["/Users/example/code/codex/README.md:74".cyan()]));
+    let expected = Text::from(Line::from_iter([
+        "/Users/example/code/codex/README.md:74".cyan()
+    ]));
     assert_eq!(text, expected);
 }
 
@@ -728,10 +884,9 @@ fn file_link_appends_hash_anchor_when_label_lacks_it() {
         "[markdown_render.rs](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3)",
         Path::new("/Users/example/code/codex"),
     );
-    let expected =
-        Text::from(Line::from_iter([
-            "codex-rs/tui/src/markdown_render.rs:74:3".cyan(),
-        ]));
+    let expected = Text::from(Line::from_iter([
+        "codex-rs/tui/src/markdown_render.rs:74:3".cyan(),
+    ]));
     assert_eq!(text, expected);
 }
 
@@ -741,10 +896,9 @@ fn file_link_uses_target_path_for_hash_anchor() {
         "[markdown_render.rs#L74C3](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3)",
         Path::new("/Users/example/code/codex"),
     );
-    let expected =
-        Text::from(Line::from_iter([
-            "codex-rs/tui/src/markdown_render.rs:74:3".cyan(),
-        ]));
+    let expected = Text::from(Line::from_iter([
+        "codex-rs/tui/src/markdown_render.rs:74:3".cyan(),
+    ]));
     assert_eq!(text, expected);
 }
 
@@ -754,10 +908,9 @@ fn file_link_appends_range_when_label_lacks_it() {
         "[markdown_render.rs](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs:74:3-76:9)",
         Path::new("/Users/example/code/codex"),
     );
-    let expected =
-        Text::from(Line::from_iter([
-            "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
-        ]));
+    let expected = Text::from(Line::from_iter([
+        "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
+    ]));
     assert_eq!(text, expected);
 }
 
@@ -767,10 +920,9 @@ fn file_link_uses_target_path_for_range() {
         "[markdown_render.rs:74:3-76:9](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs:74:3-76:9)",
         Path::new("/Users/example/code/codex"),
     );
-    let expected =
-        Text::from(Line::from_iter([
-            "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
-        ]));
+    let expected = Text::from(Line::from_iter([
+        "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
+    ]));
     assert_eq!(text, expected);
 }
 
@@ -780,10 +932,9 @@ fn file_link_appends_hash_range_when_label_lacks_it() {
         "[markdown_render.rs](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3-L76C9)",
         Path::new("/Users/example/code/codex"),
     );
-    let expected =
-        Text::from(Line::from_iter([
-            "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
-        ]));
+    let expected = Text::from(Line::from_iter([
+        "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
+    ]));
     assert_eq!(text, expected);
 }
 
@@ -807,10 +958,9 @@ fn file_link_uses_target_path_for_hash_range() {
         "[markdown_render.rs#L74C3-L76C9](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3-L76C9)",
         Path::new("/Users/example/code/codex"),
     );
-    let expected =
-        Text::from(Line::from_iter([
-            "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
-        ]));
+    let expected = Text::from(Line::from_iter([
+        "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
+    ]));
     assert_eq!(text, expected);
 }
 
@@ -950,7 +1100,10 @@ fn code_block_known_lang_has_syntax_colors() {
         .iter()
         .flat_map(|l| l.spans.iter())
         .any(|sp| sp.style.fg.is_some());
-    assert!(has_colored_span, "expected syntax-highlighted spans with color");
+    assert!(
+        has_colored_span,
+        "expected syntax-highlighted spans with color"
+    );
 }
 
 #[test]
@@ -979,7 +1132,10 @@ fn code_block_unknown_lang_plain() {
         .iter()
         .flat_map(|l| l.spans.iter())
         .any(|sp| sp.style.fg.is_some());
-    assert!(!has_colored_span, "expected no syntax coloring for unknown lang");
+    assert!(
+        !has_colored_span,
+        "expected no syntax coloring for unknown lang"
+    );
 }
 
 #[test]
@@ -1157,7 +1313,8 @@ fn list_item_after_code_block_keeps_blank_separator() {
 
 #[test]
 fn outer_list_item_after_nested_code_block_keeps_blank_separator() {
-    let md = "1. First:\n   - Nested:\n\n     ```rust\n     fn first() {}\n     ```\n\n2. Second:\n";
+    let md =
+        "1. First:\n   - Nested:\n\n     ```rust\n     fn first() {}\n     ```\n\n2. Second:\n";
     let text = render_markdown_text(md);
     let lines = plain_lines(&text);
     assert_eq!(
@@ -1416,7 +1573,8 @@ fn code_block_preserves_trailing_blank_lines() {
         "expected a line after 'fn main() {{}}' but content ends: {content:?}"
     );
     assert_eq!(
-        content[code_start + 1], "",
+        content[code_start + 1],
+        "",
         "trailing blank line inside code fence was lost: {content:?}"
     );
 }

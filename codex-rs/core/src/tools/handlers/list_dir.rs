@@ -3,8 +3,15 @@ use std::ffi::OsStr;
 use std::fs::FileType;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Instant;
 
+use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::permissions::ReadDenyMatcher;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandBeginEvent;
+use codex_protocol::protocol::ExecCommandEndEvent;
+use codex_protocol::protocol::ExecCommandSource;
+use codex_protocol::protocol::ExecCommandStatus;
 use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Deserialize;
 use tokio::fs;
@@ -55,7 +62,13 @@ impl ToolHandler for ListDirHandler {
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
-        let ToolInvocation { payload, turn, .. } = invocation;
+        let ToolInvocation {
+            session,
+            payload,
+            turn,
+            call_id,
+            ..
+        } = invocation;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -99,26 +112,123 @@ impl ToolHandler for ListDirHandler {
                 "dir_path must be an absolute path".to_string(),
             ));
         }
+        let parsed = vec![ParsedCommand::ListFiles {
+            cmd: "list_dir".to_string(),
+            path: Some(dir_path.clone()),
+        }];
+        let started = emit_tool_begin(
+            session.as_ref(),
+            turn.as_ref(),
+            &call_id,
+            vec!["list_dir".to_string(), dir_path],
+            parsed.clone(),
+        )
+        .await;
         let file_system_sandbox_policy = turn.file_system_sandbox_policy();
         let read_deny_matcher = ReadDenyMatcher::new(&file_system_sandbox_policy, &turn.cwd);
-        if read_deny_matcher
-            .as_ref()
-            .is_some_and(|matcher| matcher.is_read_denied(&path))
-        {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "{DENY_READ_POLICY_MESSAGE}: `{}`",
-                path.display()
-            )));
-        }
+        let result = async {
+            if read_deny_matcher
+                .as_ref()
+                .is_some_and(|matcher| matcher.is_read_denied(&path))
+            {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "{DENY_READ_POLICY_MESSAGE}: `{}`",
+                    path.display()
+                )));
+            }
 
-        let entries =
-            list_dir_slice_with_policy(&path, offset, limit, depth, read_deny_matcher.as_ref())
-                .await?;
-        let mut output = Vec::with_capacity(entries.len() + 1);
-        output.push(format!("Absolute path: {}", path.display()));
-        output.extend(entries);
-        Ok(FunctionToolOutput::from_text(output.join("\n"), Some(true)))
+            let entries =
+                list_dir_slice_with_policy(&path, offset, limit, depth, read_deny_matcher.as_ref())
+                    .await?;
+            let mut output = Vec::with_capacity(entries.len() + 1);
+            output.push(format!("Absolute path: {}", path.display()));
+            output.extend(entries);
+            Ok(FunctionToolOutput::from_text(output.join("\n"), Some(true)))
+        }
+        .await;
+        emit_tool_end(
+            session.as_ref(),
+            turn.as_ref(),
+            &call_id,
+            vec!["list_dir".to_string(), path.display().to_string()],
+            parsed,
+            started,
+            &result,
+        )
+        .await;
+        result
     }
+}
+
+async fn emit_tool_begin(
+    session: &crate::session::session::Session,
+    turn: &crate::session::turn_context::TurnContext,
+    call_id: &str,
+    command: Vec<String>,
+    parsed_cmd: Vec<ParsedCommand>,
+) -> Instant {
+    session
+        .send_event(
+            turn,
+            EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                call_id: call_id.to_string(),
+                process_id: None,
+                turn_id: turn.sub_id.clone(),
+                command,
+                cwd: turn.cwd.clone(),
+                parsed_cmd,
+                source: ExecCommandSource::Agent,
+                run_mode: None,
+                interaction_input: None,
+            }),
+        )
+        .await;
+    Instant::now()
+}
+
+async fn emit_tool_end(
+    session: &crate::session::session::Session,
+    turn: &crate::session::turn_context::TurnContext,
+    call_id: &str,
+    command: Vec<String>,
+    parsed_cmd: Vec<ParsedCommand>,
+    started: Instant,
+    result: &Result<FunctionToolOutput, FunctionCallError>,
+) {
+    let (status, exit_code, output) = match result {
+        Ok(_) => (ExecCommandStatus::Completed, 0, String::new()),
+        Err(err) => (ExecCommandStatus::Failed, 1, err.to_string()),
+    };
+    session
+        .send_event(
+            turn,
+            EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                call_id: call_id.to_string(),
+                process_id: None,
+                turn_id: turn.sub_id.clone(),
+                command,
+                cwd: turn.cwd.clone(),
+                parsed_cmd,
+                source: ExecCommandSource::Agent,
+                interaction_input: None,
+                stdout: if exit_code == 0 {
+                    output.clone()
+                } else {
+                    String::new()
+                },
+                stderr: if exit_code == 0 {
+                    String::new()
+                } else {
+                    output.clone()
+                },
+                aggregated_output: output.clone(),
+                exit_code,
+                duration: started.elapsed(),
+                formatted_output: output,
+                status,
+            }),
+        )
+        .await;
 }
 
 async fn list_dir_slice_with_policy(

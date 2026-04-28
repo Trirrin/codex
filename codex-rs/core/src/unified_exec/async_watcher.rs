@@ -19,8 +19,10 @@ use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
 use codex_protocol::protocol::ExecCommandSource;
+use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::protocol::ExecOutputStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
@@ -101,6 +103,66 @@ pub(crate) fn start_streaming_output(
     });
 }
 
+/// Spawn a background task that mirrors future PTY output into another session.
+///
+/// The primary stream owns transcript mutation. Reattached streams only emit
+/// UI events for sessions created after the shell was already running.
+pub(crate) fn start_reattached_output_stream(
+    process: Arc<UnifiedExecProcess>,
+    session_ref: Arc<Session>,
+    event_id: String,
+    call_id: String,
+) {
+    let mut receiver = process.output_receiver();
+    let exit_token = process.cancellation_token();
+
+    tokio::spawn(async move {
+        use tokio::sync::broadcast::error::RecvError;
+
+        let mut pending = Vec::<u8>::new();
+        let mut emitted_deltas: usize = 0;
+        let mut grace_sleep: Option<Pin<Box<Sleep>>> = None;
+
+        loop {
+            tokio::select! {
+                _ = exit_token.cancelled(), if grace_sleep.is_none() => {
+                    let deadline = Instant::now() + TRAILING_OUTPUT_GRACE;
+                    grace_sleep.replace(Box::pin(tokio::time::sleep_until(deadline)));
+                }
+
+                _ = async {
+                    if let Some(sleep) = grace_sleep.as_mut() {
+                        sleep.as_mut().await;
+                    }
+                }, if grace_sleep.is_some() => {
+                    break;
+                }
+
+                received = receiver.recv() => {
+                    let chunk = match received {
+                        Ok(chunk) => chunk,
+                        Err(RecvError::Lagged(_)) => {
+                            continue;
+                        },
+                        Err(RecvError::Closed) => {
+                            break;
+                        }
+                    };
+
+                    emit_output_chunk(
+                        &mut pending,
+                        &call_id,
+                        &session_ref,
+                        &event_id,
+                        &mut emitted_deltas,
+                        chunk,
+                    ).await;
+                }
+            }
+        }
+    });
+}
+
 /// Spawn a background watcher that waits for the PTY to exit and then emits a
 /// single ExecCommandEnd event with the aggregated transcript.
 #[allow(clippy::too_many_arguments)]
@@ -155,6 +217,61 @@ pub(crate) fn spawn_exit_watcher(
     });
 }
 
+/// Spawn an exit watcher for a reattached session.
+///
+/// The primary watcher consumes `output_drained_notify`, so this watcher uses a
+/// short grace period after process exit before notifying the reattached UI.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_reattached_exit_watcher(
+    process: Arc<UnifiedExecProcess>,
+    session_ref: Arc<Session>,
+    event_id: String,
+    call_id: String,
+    command: Vec<String>,
+    cwd: AbsolutePathBuf,
+    process_id: i32,
+    transcript: Arc<Mutex<HeadTailBuffer>>,
+    started_at: Instant,
+) {
+    let exit_token = process.cancellation_token();
+
+    tokio::spawn(async move {
+        exit_token.cancelled().await;
+        tokio::time::sleep(TRAILING_OUTPUT_GRACE).await;
+
+        let duration = Instant::now().saturating_duration_since(started_at);
+        let output = String::from_utf8_lossy(&transcript.lock().await.to_bytes()).to_string();
+        let exit_code = process.exit_code().unwrap_or(-1);
+        let status = if exit_code == 0 {
+            ExecCommandStatus::Completed
+        } else {
+            ExecCommandStatus::Failed
+        };
+        session_ref
+            .send_event_raw(codex_protocol::protocol::Event {
+                id: event_id.clone(),
+                msg: EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                    call_id,
+                    process_id: Some(process_id.to_string()),
+                    turn_id: event_id,
+                    command,
+                    cwd,
+                    parsed_cmd: Vec::new(),
+                    source: ExecCommandSource::UnifiedExecStartup,
+                    interaction_input: None,
+                    stdout: output.clone(),
+                    stderr: String::new(),
+                    aggregated_output: output.clone(),
+                    exit_code,
+                    duration,
+                    formatted_output: output,
+                    status,
+                }),
+            })
+            .await;
+    });
+}
+
 async fn process_chunk(
     pending: &mut Vec<u8>,
     transcript: &Arc<Mutex<HeadTailBuffer>>,
@@ -182,6 +299,35 @@ async fn process_chunk(
         };
         session_ref
             .send_event(turn_ref.as_ref(), EventMsg::ExecCommandOutputDelta(event))
+            .await;
+        *emitted_deltas += 1;
+    }
+}
+
+async fn emit_output_chunk(
+    pending: &mut Vec<u8>,
+    call_id: &str,
+    session_ref: &Arc<Session>,
+    event_id: &str,
+    emitted_deltas: &mut usize,
+    chunk: Vec<u8>,
+) {
+    pending.extend_from_slice(&chunk);
+    while let Some(prefix) = split_valid_utf8_prefix(pending) {
+        if *emitted_deltas >= MAX_EXEC_OUTPUT_DELTAS_PER_CALL {
+            continue;
+        }
+
+        let event = ExecCommandOutputDeltaEvent {
+            call_id: call_id.to_string(),
+            stream: ExecOutputStream::Stdout,
+            chunk: prefix,
+        };
+        session_ref
+            .send_event_raw(codex_protocol::protocol::Event {
+                id: event_id.to_string(),
+                msg: EventMsg::ExecCommandOutputDelta(event),
+            })
             .await;
         *emitted_deltas += 1;
     }
@@ -223,6 +369,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         cwd,
         ExecCommandSource::UnifiedExecStartup,
         process_id,
+        /*run_mode*/ None,
     );
     emitter
         .emit(event_ctx, ToolEventStage::Success(output))
@@ -266,6 +413,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         cwd,
         ExecCommandSource::UnifiedExecStartup,
         process_id,
+        /*run_mode*/ None,
     );
     emitter
         .emit(

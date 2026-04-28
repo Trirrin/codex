@@ -6748,6 +6748,13 @@
         "title": "CommandExecutionOutputDeltaNotification",
         "type": "object"
       },
+      "CommandExecutionRunMode": {
+        "enum": [
+          "blocking",
+          "background"
+        ],
+        "type": "string"
+      },
       "CommandExecutionSource": {
         "enum": [
           "agent",
@@ -14875,6 +14882,16 @@
                 "type": [
                   "string",
                   "null"
+                ]
+              },
+              "runMode": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/CommandExecutionRunMode"
+                  },
+                  {
+                    "type": "null"
+                  }
                 ]
               },
               "source": {

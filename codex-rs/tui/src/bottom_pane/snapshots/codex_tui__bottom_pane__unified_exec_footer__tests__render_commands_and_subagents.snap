@@ -1,15 +1,18 @@
 ---
 source: tui/src/bottom_pane/unified_exec_footer.rs
-assertion_line: 158
+assertion_line: 181
 expression: "format!(\"{buf:?}\")"
 ---
 Buffer {
-    area: Rect { x: 0, y: 0, width: 50, height: 1 },
+    area: Rect { x: 0, y: 0, width: 50, height: 2 },
     content: [
         "  1 command running · Enter details · k kill      ",
+        "  2 subagents running · Enter details · k kill    ",
     ],
     styles: [
         x: 0, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: DIM,
         x: 44, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+        x: 0, y: 1, fg: Reset, bg: Reset, underline: Reset, modifier: DIM,
+        x: 46, y: 1, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
     ]
 }

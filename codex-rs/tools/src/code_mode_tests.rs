@@ -94,8 +94,8 @@ fn augment_tool_spec_for_code_mode_preserves_exec_tool_description() {
 #[test]
 fn tool_spec_to_code_mode_tool_definition_returns_augmented_nested_tools() {
     let spec = ToolSpec::Freeform(FreeformTool {
-        name: "apply_patch".to_string(),
-        description: "Apply a patch".to_string(),
+        name: "edit".to_string(),
+        description: "Edit a file".to_string(),
         format: FreeformToolFormat {
             r#type: "grammar".to_string(),
             syntax: "lark".to_string(),
@@ -106,13 +106,13 @@ fn tool_spec_to_code_mode_tool_definition_returns_augmented_nested_tools() {
     assert_eq!(
         tool_spec_to_code_mode_tool_definition(&spec),
         Some(codex_code_mode::ToolDefinition {
-            name: "apply_patch".to_string(),
-            tool_name: ToolName::plain("apply_patch"),
-            description: r#"Apply a patch
+            name: "edit".to_string(),
+            tool_name: ToolName::plain("edit"),
+            description: r#"Edit a file
 
 exec tool declaration:
 ```ts
-declare const tools: { apply_patch(input: string): Promise<unknown>; };
+declare const tools: { edit(input: string): Promise<unknown>; };
 ```"#
                 .to_string(),
             kind: codex_code_mode::CodeModeToolKind::Freeform,

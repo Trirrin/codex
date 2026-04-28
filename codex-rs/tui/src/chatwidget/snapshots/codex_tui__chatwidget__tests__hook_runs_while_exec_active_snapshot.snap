@@ -12,8 +12,6 @@ active hooks:
 • Running PostToolUse hook: checking output policy
 
 history after exec:
-• Ran echo done
-  └ done
 
 hook running after exec:
 • Running PostToolUse hook: checking output policy

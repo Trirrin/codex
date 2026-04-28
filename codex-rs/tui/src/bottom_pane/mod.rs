@@ -17,6 +17,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use crate::app::app_server_requests::ResolvedAppServerRequest;
+use crate::app_event::AppEvent;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::pending_input_preview::PendingInputPreview;
@@ -34,6 +35,7 @@ use codex_core_skills::model::SkillMetadata;
 use codex_features::Features;
 use codex_file_search::FileMatch;
 use codex_plugin::PluginCapabilitySummary;
+use codex_protocol::protocol::Op;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::user_input::TextElement;
 use crossterm::event::KeyCode;
@@ -41,7 +43,10 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Stylize;
 use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
+use ratatui::widgets::Widget;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -134,6 +139,7 @@ mod textarea;
 mod unified_exec_footer;
 pub(crate) use feedback_view::FeedbackNoteView;
 pub(crate) use selection_tabs::SelectionTab;
+pub(crate) use unified_exec_footer::CommandActivity;
 
 /// How long the "press again to quit" hint stays visible.
 ///
@@ -220,6 +226,9 @@ pub(crate) struct BottomPane {
     pending_thread_approvals: PendingThreadApprovals,
     context_window_percent: Option<i64>,
     context_window_used_tokens: Option<i64>,
+    estimated_output_tokens: Option<usize>,
+    background_footer_focused: bool,
+    background_activity_details_open: bool,
 }
 
 pub(crate) struct BottomPaneParams {
@@ -231,6 +240,56 @@ pub(crate) struct BottomPaneParams {
     pub(crate) disable_paste_burst: bool,
     pub(crate) animations_enabled: bool,
     pub(crate) skills: Option<Vec<SkillMetadata>>,
+}
+
+struct BackgroundActivityDetailsCard {
+    lines: Vec<String>,
+}
+
+const BACKGROUND_ACTIVITY_DETAILS_MAX_HEIGHT: usize = 20;
+
+impl BackgroundActivityDetailsCard {
+    fn new(lines: Vec<String>) -> Self {
+        Self { lines }
+    }
+}
+
+impl Renderable for BackgroundActivityDetailsCard {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        let mut lines = Vec::with_capacity(self.lines.len().saturating_add(2));
+        lines.push(Line::from("─".repeat(area.width as usize)).dim());
+        lines.extend(self.visible_lines().map(|line| {
+            if line.is_empty() {
+                Line::from("")
+            } else {
+                Line::from(line)
+            }
+        }));
+        if self.lines.len() > BACKGROUND_ACTIVITY_DETAILS_MAX_HEIGHT {
+            let omitted = self.lines.len() - BACKGROUND_ACTIVITY_DETAILS_MAX_HEIGHT;
+            lines.push(Line::from(format!("... {omitted} lines omitted")));
+        }
+        Paragraph::new(lines).render(area, buf);
+    }
+
+    fn desired_height(&self, _width: u16) -> u16 {
+        let height = self.lines.len().min(BACKGROUND_ACTIVITY_DETAILS_MAX_HEIGHT);
+        let height = if self.lines.len() > BACKGROUND_ACTIVITY_DETAILS_MAX_HEIGHT {
+            height + 1
+        } else {
+            height
+        };
+        (height + 1).max(1) as u16
+    }
+}
+
+impl BackgroundActivityDetailsCard {
+    fn visible_lines(&self) -> impl Iterator<Item = String> + '_ {
+        self.lines
+            .iter()
+            .take(BACKGROUND_ACTIVITY_DETAILS_MAX_HEIGHT)
+            .cloned()
+    }
 }
 
 impl BottomPane {
@@ -273,6 +332,9 @@ impl BottomPane {
             animations_enabled,
             context_window_percent: None,
             context_window_used_tokens: None,
+            estimated_output_tokens: None,
+            background_footer_focused: false,
+            background_activity_details_open: false,
         }
     }
 
@@ -548,6 +610,78 @@ impl BottomPane {
             self.request_redraw();
             InputResult::None
         } else {
+            if self.background_activity_details_open {
+                if self.unified_exec_footer.is_empty() {
+                    self.background_activity_details_open = false;
+                    self.request_redraw();
+                } else if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    match key_event.code {
+                        KeyCode::Esc | KeyCode::Enter => {
+                            self.background_activity_details_open = false;
+                            self.request_redraw();
+                            return InputResult::None;
+                        }
+                        KeyCode::Char('k') => {
+                            self.app_event_tx
+                                .send(AppEvent::CodexOp(Op::CleanBackgroundActivity));
+                            self.background_activity_details_open = false;
+                            self.background_footer_focused = false;
+                            self.unified_exec_footer.set_focused(false);
+                            self.request_redraw();
+                            return InputResult::None;
+                        }
+                        _ => {
+                            return InputResult::None;
+                        }
+                    }
+                }
+            }
+
+            if self.background_footer_focused
+                && matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            {
+                match key_event.code {
+                    KeyCode::Esc | KeyCode::Up => {
+                        self.background_footer_focused = false;
+                        self.unified_exec_footer.set_focused(false);
+                        self.request_redraw();
+                        return InputResult::None;
+                    }
+                    KeyCode::Enter => {
+                        let lines = self.unified_exec_footer.detail_lines();
+                        if !lines.is_empty() {
+                            self.background_activity_details_open = true;
+                            self.request_redraw_in(Duration::from_secs(1));
+                        }
+                        self.background_footer_focused = false;
+                        self.unified_exec_footer.set_focused(false);
+                        self.request_redraw();
+                        return InputResult::None;
+                    }
+                    KeyCode::Char('k') => {
+                        self.app_event_tx
+                            .send(AppEvent::CodexOp(Op::CleanBackgroundActivity));
+                        self.background_footer_focused = false;
+                        self.background_activity_details_open = false;
+                        self.unified_exec_footer.set_focused(false);
+                        self.request_redraw();
+                        return InputResult::None;
+                    }
+                    _ => {}
+                }
+            }
+
+            if key_event.code == KeyCode::Down
+                && matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && !self.unified_exec_footer.is_empty()
+                && !self.composer.popup_active()
+            {
+                self.background_footer_focused = true;
+                self.unified_exec_footer.set_focused(true);
+                self.request_redraw();
+                return InputResult::None;
+            }
+
             let is_agent_command = self
                 .composer_text()
                 .lines()
@@ -668,6 +802,13 @@ impl BottomPane {
     fn pre_draw_tick_at(&mut self, now: Instant) {
         self.composer.sync_popups();
         self.maybe_show_delayed_approval_requests_at(now);
+        if let Some(status) = self.status.as_mut() {
+            status.schedule_next_elapsed_tick_at(now);
+        }
+        if self.background_activity_details_open {
+            self.request_redraw();
+            self.request_redraw_in(Duration::from_secs(1));
+        }
     }
 
     /// Replace the composer text with `text`.
@@ -884,6 +1025,7 @@ impl BottomPane {
                 if let Some(status) = self.status.as_mut() {
                     status.set_interrupt_hint_visible(/*visible*/ true);
                 }
+                self.sync_estimated_output_tokens();
                 self.sync_status_inline_message();
                 self.request_redraw();
             }
@@ -907,6 +1049,7 @@ impl BottomPane {
                 self.frame_requester.clone(),
                 self.animations_enabled,
             ));
+            self.sync_estimated_output_tokens();
             self.sync_status_inline_message();
             self.request_redraw();
         }
@@ -929,6 +1072,19 @@ impl BottomPane {
         self.context_window_used_tokens = used_tokens;
         self.composer
             .set_context_window(percent, self.context_window_used_tokens);
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_estimated_output_tokens(&mut self, tokens: Option<usize>) {
+        if self.estimated_output_tokens == tokens {
+            if tokens.is_some() {
+                self.request_redraw();
+            }
+            return;
+        }
+
+        self.estimated_output_tokens = tokens;
+        self.sync_estimated_output_tokens();
         self.request_redraw();
     }
 
@@ -997,24 +1153,41 @@ impl BottomPane {
         self.pending_thread_approvals.threads()
     }
 
-    /// Update the unified-exec process set and refresh whichever summary surface is active.
-    ///
-    /// The summary may be displayed inline in the status row or as a dedicated
-    /// footer row depending on whether a status indicator is currently visible.
-    pub(crate) fn set_unified_exec_processes(&mut self, processes: Vec<String>) {
+    /// Update the background process set surfaced below the input composer.
+    pub(crate) fn set_unified_exec_processes(&mut self, processes: Vec<CommandActivity>) {
         if self.unified_exec_footer.set_processes(processes) {
+            self.clear_background_footer_focus_if_empty();
             self.sync_status_inline_message();
             self.request_redraw();
         }
     }
 
-    /// Copy unified-exec summary text into the active status row, if any.
-    ///
-    /// This keeps status-line inline text synchronized without forcing the
-    /// standalone unified-exec footer row to be visible.
+    pub(crate) fn set_background_subagents(&mut self, subagents: Vec<String>) {
+        if self.unified_exec_footer.set_subagents(subagents) {
+            self.clear_background_footer_focus_if_empty();
+            self.sync_status_inline_message();
+            self.request_redraw();
+        }
+    }
+
+    fn clear_background_footer_focus_if_empty(&mut self) {
+        if self.unified_exec_footer.is_empty() {
+            self.background_footer_focused = false;
+            self.background_activity_details_open = false;
+            self.unified_exec_footer.set_focused(false);
+        }
+    }
+
+    /// Keep the status row focused on turn state; background activity has its own row.
     fn sync_status_inline_message(&mut self) {
         if let Some(status) = self.status.as_mut() {
-            status.update_inline_message(self.unified_exec_footer.summary_text());
+            status.update_inline_message(None);
+        }
+    }
+
+    fn sync_estimated_output_tokens(&mut self) {
+        if let Some(status) = self.status.as_mut() {
+            status.update_estimated_output_tokens(self.estimated_output_tokens);
         }
     }
 
@@ -1040,12 +1213,17 @@ impl BottomPane {
     /// overlays or popups and not running a task. This is the safe context to
     /// use Esc-Esc for backtracking from the main view.
     pub(crate) fn is_normal_backtrack_mode(&self) -> bool {
-        !self.is_task_running && self.view_stack.is_empty() && !self.composer.popup_active()
+        !self.is_task_running
+            && self.view_stack.is_empty()
+            && !self.composer.popup_active()
+            && !self.background_activity_controls_active()
     }
 
     /// Return true when no popups or modal views are active, regardless of task state.
     pub(crate) fn can_launch_external_editor(&self) -> bool {
-        self.view_stack.is_empty() && !self.composer.popup_active()
+        self.view_stack.is_empty()
+            && !self.composer.popup_active()
+            && !self.background_activity_controls_active()
     }
 
     /// Returns true when the bottom pane has no active modal view and no active composer popup.
@@ -1055,6 +1233,11 @@ impl BottomPane {
     /// running and some are not.
     pub(crate) fn no_modal_or_popup_active(&self) -> bool {
         self.can_launch_external_editor()
+    }
+
+    fn background_activity_controls_active(&self) -> bool {
+        !self.unified_exec_footer.is_empty()
+            && (self.background_footer_focused || self.background_activity_details_open)
     }
 
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
@@ -1342,27 +1525,22 @@ impl BottomPane {
     fn as_renderable(&'_ self) -> RenderableItem<'_> {
         if let Some(view) = self.active_view() {
             RenderableItem::Borrowed(view)
+        } else if self.background_activity_details_open && !self.unified_exec_footer.is_empty() {
+            RenderableItem::Owned(Box::new(BackgroundActivityDetailsCard::new(
+                self.unified_exec_footer.detail_lines(),
+            )))
         } else {
             let mut flex = FlexRenderable::new();
             if let Some(status) = &self.status {
                 flex.push(/*flex*/ 0, RenderableItem::Borrowed(status));
             }
-            // Avoid double-surfacing the same summary and avoid adding an extra
-            // row while the status line is already visible.
-            if self.status.is_none() && !self.unified_exec_footer.is_empty() {
-                flex.push(
-                    /*flex*/ 0,
-                    RenderableItem::Borrowed(&self.unified_exec_footer),
-                );
-            }
             let has_pending_thread_approvals = !self.pending_thread_approvals.is_empty();
             let has_pending_input = !self.pending_input_preview.queued_messages.is_empty()
                 || !self.pending_input_preview.pending_steers.is_empty()
                 || !self.pending_input_preview.rejected_steers.is_empty();
-            let has_status_or_footer =
-                self.status.is_some() || !self.unified_exec_footer.is_empty();
+            let has_status = self.status.is_some();
             let has_inline_previews = has_pending_thread_approvals || has_pending_input;
-            if has_inline_previews && has_status_or_footer {
+            if has_inline_previews && has_status {
                 flex.push(/*flex*/ 0, RenderableItem::Owned("".into()));
             }
             flex.push(
@@ -1376,12 +1554,18 @@ impl BottomPane {
                 /*flex*/ 1,
                 RenderableItem::Borrowed(&self.pending_input_preview),
             );
-            if !has_inline_previews && has_status_or_footer {
+            if !has_inline_previews && has_status {
                 flex.push(/*flex*/ 0, RenderableItem::Owned("".into()));
             }
             let mut flex2 = FlexRenderable::new();
             flex2.push(/*flex*/ 1, RenderableItem::Owned(flex.into()));
             flex2.push(/*flex*/ 0, RenderableItem::Borrowed(&self.composer));
+            if !self.unified_exec_footer.is_empty() {
+                flex2.push(
+                    /*flex*/ 0,
+                    RenderableItem::Borrowed(&self.unified_exec_footer),
+                );
+            }
             RenderableItem::Owned(Box::new(flex2))
         }
     }
@@ -2043,7 +2227,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_exec_summary_does_not_increase_height_when_status_visible() {
+    fn background_activity_row_increases_height_when_status_visible() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
         let mut pane = BottomPane::new(BottomPaneParams {
@@ -2061,14 +2245,117 @@ mod tests {
         let width = 120;
         let before = pane.desired_height(width);
 
-        pane.set_unified_exec_processes(vec!["sleep 5".to_string()]);
+        pane.set_unified_exec_processes(vec![CommandActivity {
+            command: "sleep 5".to_string(),
+            shell_id: "1000".to_string(),
+            run_mode: None,
+            started_at: Instant::now(),
+            status: "running".to_string(),
+            recent_output: Vec::new(),
+        }]);
         let after = pane.desired_height(width);
 
-        assert_eq!(after, before);
+        assert_eq!(after, before + 1);
 
         let area = Rect::new(0, 0, width, after);
         let rendered = render_snapshot(&pane, area);
-        assert!(rendered.contains("background terminal running · /ps to view"));
+        assert!(rendered.contains("command running · Enter details"));
+        let composer_index = rendered
+            .find('›')
+            .expect("composer prompt should be rendered");
+        let footer_index = rendered
+            .find("command running · Enter details")
+            .expect("background footer should be rendered");
+        assert!(
+            composer_index < footer_index,
+            "background footer should render below the composer"
+        );
+    }
+
+    #[test]
+    fn background_activity_details_exit_restores_composer_layout() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = BottomPane::new(BottomPaneParams {
+            app_event_tx: tx,
+            frame_requester: FrameRequester::test_dummy(),
+            has_input_focus: true,
+            enhanced_keys_supported: false,
+            placeholder_text: "Ask Codex to do anything".to_string(),
+            disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
+        });
+
+        pane.set_task_running(/*running*/ true);
+        pane.set_unified_exec_processes(vec![CommandActivity {
+            command: "sleep 5".to_string(),
+            shell_id: "1000".to_string(),
+            run_mode: None,
+            started_at: Instant::now(),
+            status: "running".to_string(),
+            recent_output: (0..50).map(|idx| format!("line {idx}")).collect(),
+        }]);
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let rendered_details = render_snapshot(&pane, Rect::new(0, 0, 80, 30));
+        assert!(rendered_details.contains("────"));
+        assert!(rendered_details.contains("runtime:"));
+        assert!(rendered_details.contains("output:"));
+        assert!(rendered_details.contains("line 0"));
+        assert!(rendered_details.contains("line 1"));
+        assert!(rendered_details.contains("... +43 lines"));
+        assert!(rendered_details.contains("line 45"));
+        assert!(pane.cursor_pos(Rect::new(0, 0, 80, 20)).is_none());
+        assert!(!rendered_details.contains('›'));
+        assert!(!rendered_details.contains("command running · Enter details"));
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(pane.cursor_pos(Rect::new(0, 0, 80, 20)).is_some());
+        assert!(pane.desired_height(/*width*/ 80) < BACKGROUND_ACTIVITY_DETAILS_MAX_HEIGHT as u16);
+    }
+
+    #[test]
+    fn background_activity_controls_block_main_esc_backtrack_only_when_active() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = test_pane(tx);
+
+        pane.set_unified_exec_processes(vec![CommandActivity {
+            command: "sleep 5".to_string(),
+            shell_id: "1000".to_string(),
+            run_mode: None,
+            started_at: Instant::now(),
+            status: "running".to_string(),
+            recent_output: Vec::new(),
+        }]);
+
+        assert!(pane.is_normal_backtrack_mode());
+        assert!(pane.no_modal_or_popup_active());
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        assert!(!pane.is_normal_backtrack_mode());
+        assert!(!pane.no_modal_or_popup_active());
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(pane.is_normal_backtrack_mode());
+        assert!(pane.no_modal_or_popup_active());
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!pane.is_normal_backtrack_mode());
+        assert!(!pane.no_modal_or_popup_active());
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(pane.is_normal_backtrack_mode());
+        assert!(pane.no_modal_or_popup_active());
     }
 
     #[test]

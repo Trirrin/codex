@@ -80,6 +80,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
     use crate::tools::handlers::CodeModeExecuteHandler;
     use crate::tools::handlers::CodeModeWaitHandler;
     use crate::tools::handlers::DynamicToolHandler;
+    use crate::tools::handlers::FileHandler;
     use crate::tools::handlers::GoalHandler;
     use crate::tools::handlers::ListDirHandler;
     use crate::tools::handlers::McpHandler;
@@ -149,6 +150,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
     let plan_handler = Arc::new(PlanHandler);
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let dynamic_tool_handler = Arc::new(DynamicToolHandler);
+    let file_handler = Arc::new(FileHandler);
     let goal_handler = Arc::new(GoalHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
@@ -209,6 +211,9 @@ pub(crate) fn build_specs_with_discoverable_tools(
             }
             ToolHandlerKind::FollowupTaskV2 => {
                 builder.register_handler(handler.name, Arc::new(FollowupTaskHandlerV2));
+            }
+            ToolHandlerKind::File => {
+                builder.register_handler(handler.name, file_handler.clone());
             }
             ToolHandlerKind::Goal => {
                 builder.register_handler(handler.name, goal_handler.clone());

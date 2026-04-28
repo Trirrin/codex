@@ -4289,6 +4289,7 @@ mod tests {
                 ],
                 output: None,
                 source: ExecCommandSource::Agent,
+                run_mode: None,
                 start_time: Some(Instant::now()),
                 duration: None,
                 interaction_input: None,
@@ -4296,7 +4297,12 @@ mod tests {
             /*animations_enabled*/ true,
         );
         // Mark call complete so markers are ✓
-        cell.complete_call(&call_id, CommandOutput::default(), Duration::from_millis(1));
+        cell.complete_call(
+            &call_id,
+            CommandOutput::default(),
+            Duration::from_millis(1),
+            None,
+        );
 
         let lines = cell.display_lines(/*width*/ 80);
         let rendered = render_lines(&lines).join("\n");
@@ -4316,6 +4322,7 @@ mod tests {
                 }],
                 output: None,
                 source: ExecCommandSource::Agent,
+                run_mode: None,
                 start_time: Some(Instant::now()),
                 duration: None,
                 interaction_input: None,
@@ -4323,7 +4330,12 @@ mod tests {
             /*animations_enabled*/ true,
         );
         // Call 1: Search only
-        cell.complete_call("c1", CommandOutput::default(), Duration::from_millis(1));
+        cell.complete_call(
+            "c1",
+            CommandOutput::default(),
+            Duration::from_millis(1),
+            None,
+        );
         // Call 2: Read A
         cell = cell
             .with_added_call(
@@ -4335,10 +4347,16 @@ mod tests {
                     path: "shimmer.rs".into(),
                 }],
                 ExecCommandSource::Agent,
+                /*run_mode*/ None,
                 /*interaction_input*/ None,
             )
             .unwrap();
-        cell.complete_call("c2", CommandOutput::default(), Duration::from_millis(1));
+        cell.complete_call(
+            "c2",
+            CommandOutput::default(),
+            Duration::from_millis(1),
+            None,
+        );
         // Call 3: Read B
         cell = cell
             .with_added_call(
@@ -4350,10 +4368,16 @@ mod tests {
                     path: "status_indicator_widget.rs".into(),
                 }],
                 ExecCommandSource::Agent,
+                /*run_mode*/ None,
                 /*interaction_input*/ None,
             )
             .unwrap();
-        cell.complete_call("c3", CommandOutput::default(), Duration::from_millis(1));
+        cell.complete_call(
+            "c3",
+            CommandOutput::default(),
+            Duration::from_millis(1),
+            None,
+        );
 
         let lines = cell.display_lines(/*width*/ 80);
         let rendered = render_lines(&lines).join("\n");
@@ -4385,13 +4409,19 @@ mod tests {
                 ],
                 output: None,
                 source: ExecCommandSource::Agent,
+                run_mode: None,
                 start_time: Some(Instant::now()),
                 duration: None,
                 interaction_input: None,
             },
             /*animations_enabled*/ true,
         );
-        cell.complete_call("c1", CommandOutput::default(), Duration::from_millis(1));
+        cell.complete_call(
+            "c1",
+            CommandOutput::default(),
+            Duration::from_millis(1),
+            None,
+        );
         let lines = cell.display_lines(/*width*/ 80);
         let rendered = render_lines(&lines).join("\n");
         insta::assert_snapshot!(rendered);
@@ -4409,6 +4439,7 @@ mod tests {
                 parsed: Vec::new(),
                 output: None,
                 source: ExecCommandSource::Agent,
+                run_mode: None,
                 start_time: Some(Instant::now()),
                 duration: None,
                 interaction_input: None,
@@ -4416,7 +4447,12 @@ mod tests {
             /*animations_enabled*/ true,
         );
         // Mark call complete so it renders as "Ran"
-        cell.complete_call(&call_id, CommandOutput::default(), Duration::from_millis(1));
+        cell.complete_call(
+            &call_id,
+            CommandOutput::default(),
+            Duration::from_millis(1),
+            None,
+        );
 
         // Small width to keep the wrapped continuation-indent path covered.
         let width: u16 = 28;
@@ -4435,13 +4471,19 @@ mod tests {
                 parsed: Vec::new(),
                 output: None,
                 source: ExecCommandSource::Agent,
+                run_mode: None,
                 start_time: Some(Instant::now()),
                 duration: None,
                 interaction_input: None,
             },
             /*animations_enabled*/ true,
         );
-        cell.complete_call(&call_id, CommandOutput::default(), Duration::from_millis(1));
+        cell.complete_call(
+            &call_id,
+            CommandOutput::default(),
+            Duration::from_millis(1),
+            None,
+        );
         // Wide enough that it fits inline
         let lines = cell.display_lines(/*width*/ 80);
         let rendered = render_lines(&lines).join("\n");
@@ -4459,13 +4501,19 @@ mod tests {
                 parsed: Vec::new(),
                 output: None,
                 source: ExecCommandSource::Agent,
+                run_mode: None,
                 start_time: Some(Instant::now()),
                 duration: None,
                 interaction_input: None,
             },
             /*animations_enabled*/ true,
         );
-        cell.complete_call(&call_id, CommandOutput::default(), Duration::from_millis(1));
+        cell.complete_call(
+            &call_id,
+            CommandOutput::default(),
+            Duration::from_millis(1),
+            None,
+        );
         let lines = cell.display_lines(/*width*/ 24);
         let rendered = render_lines(&lines).join("\n");
         insta::assert_snapshot!(rendered);
@@ -4482,13 +4530,19 @@ mod tests {
                 parsed: Vec::new(),
                 output: None,
                 source: ExecCommandSource::Agent,
+                run_mode: None,
                 start_time: Some(Instant::now()),
                 duration: None,
                 interaction_input: None,
             },
             /*animations_enabled*/ true,
         );
-        cell.complete_call(&call_id, CommandOutput::default(), Duration::from_millis(1));
+        cell.complete_call(
+            &call_id,
+            CommandOutput::default(),
+            Duration::from_millis(1),
+            None,
+        );
         let lines = cell.display_lines(/*width*/ 80);
         let rendered = render_lines(&lines).join("\n");
         insta::assert_snapshot!(rendered);
@@ -4506,13 +4560,19 @@ mod tests {
                 parsed: Vec::new(),
                 output: None,
                 source: ExecCommandSource::Agent,
+                run_mode: None,
                 start_time: Some(Instant::now()),
                 duration: None,
                 interaction_input: None,
             },
             /*animations_enabled*/ true,
         );
-        cell.complete_call(&call_id, CommandOutput::default(), Duration::from_millis(1));
+        cell.complete_call(
+            &call_id,
+            CommandOutput::default(),
+            Duration::from_millis(1),
+            None,
+        );
         let lines = cell.display_lines(/*width*/ 28);
         let rendered = render_lines(&lines).join("\n");
         insta::assert_snapshot!(rendered);
@@ -4530,6 +4590,7 @@ mod tests {
                 parsed: Vec::new(),
                 output: None,
                 source: ExecCommandSource::Agent,
+                run_mode: None,
                 start_time: Some(Instant::now()),
                 duration: None,
                 interaction_input: None,
@@ -4548,6 +4609,7 @@ mod tests {
                 aggregated_output: stderr,
             },
             Duration::from_millis(1),
+            None,
         );
 
         let rendered = cell
@@ -4580,6 +4642,7 @@ mod tests {
                 parsed: Vec::new(),
                 output: None,
                 source: ExecCommandSource::Agent,
+                run_mode: None,
                 start_time: Some(Instant::now()),
                 duration: None,
                 interaction_input: None,
@@ -4596,6 +4659,7 @@ mod tests {
                 aggregated_output: stderr,
             },
             Duration::from_millis(5),
+            None,
         );
 
         // Narrow width to force the command to render under the header line.

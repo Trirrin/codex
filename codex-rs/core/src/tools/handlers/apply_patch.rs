@@ -488,7 +488,7 @@ pub(crate) async fn intercept_apply_patch(
             session
                 .record_model_warning(
                     format!(
-                        "apply_patch was requested via {tool_name}. Use the apply_patch tool instead of exec_command."
+                        "apply_patch was requested via {tool_name}. Use edit, write, or delete instead of execute."
                     ),
                     turn.as_ref(),
                 )

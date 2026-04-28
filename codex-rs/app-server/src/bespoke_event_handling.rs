@@ -1711,6 +1711,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     exec_command_begin_event.source,
                     codex_protocol::protocol::ExecCommandSource::UnifiedExecInteraction
                 )
+                && !is_shell_output_tool_call(&exec_command_begin_event.command)
             {
                 // TerminalInteraction is the v2 surface for unified exec
                 // stdin/poll events. Suppress the legacy CommandExecution
@@ -1740,6 +1741,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     cwd,
                     process_id,
                     source: exec_command_begin_event.source.into(),
+                    run_mode: exec_command_begin_event.run_mode.map(Into::into),
                     status: CommandExecutionStatus::InProgress,
                     command_actions,
                     aggregated_output: None,
@@ -1825,6 +1827,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     exec_command_end_event.source,
                     codex_protocol::protocol::ExecCommandSource::UnifiedExecInteraction
                 )
+                && !is_shell_output_tool_call(&exec_command_end_event.command)
             {
                 // The paired begin event is suppressed above; keep the
                 // completion out of v2 as well so no orphan legacy item is
@@ -2103,6 +2106,13 @@ async fn complete_file_change_item(
         .await;
 }
 
+fn is_shell_output_tool_call(command: &[String]) -> bool {
+    command
+        .last()
+        .and_then(|script| script.split_whitespace().next())
+        .is_some_and(|name| matches!(name, "read_shell_output" | "wait_shell_output"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_command_execution_item(
     conversation_id: &ThreadId,
@@ -2132,6 +2142,7 @@ async fn start_command_execution_item(
                 cwd,
                 process_id: None,
                 source,
+                run_mode: None,
                 status: CommandExecutionStatus::InProgress,
                 command_actions,
                 aggregated_output: None,
@@ -2176,6 +2187,7 @@ async fn complete_command_execution_item(
         cwd,
         process_id,
         source,
+        run_mode: None,
         status,
         command_actions,
         aggregated_output: None,
@@ -3200,6 +3212,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn detects_shell_output_tool_calls() {
+        assert!(is_shell_output_tool_call(&[
+            "bash".to_string(),
+            "-lc".to_string(),
+            "read_shell_output 10555".to_string(),
+        ]));
+        assert!(is_shell_output_tool_call(&[
+            "bash".to_string(),
+            "-lc".to_string(),
+            "wait_shell_output 10555".to_string(),
+        ]));
+        assert!(!is_shell_output_tool_call(&[
+            "bash".to_string(),
+            "-lc".to_string(),
+            "printf hi".to_string(),
+        ]));
+    }
+
     fn guardian_command_assessment(
         id: &str,
         turn_id: &str,
@@ -3455,6 +3486,7 @@ mod tests {
                         cwd: completion_item.cwd.clone(),
                         process_id: None,
                         source: CommandExecutionSource::Agent,
+                        run_mode: None,
                         status: CommandExecutionStatus::InProgress,
                         command_actions: completion_item.command_actions.clone(),
                         aggregated_output: None,

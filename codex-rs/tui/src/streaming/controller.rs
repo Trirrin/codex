@@ -13,14 +13,21 @@
 use crate::history_cell::HistoryCell;
 use crate::history_cell::{self};
 use crate::markdown::append_markdown;
+use crate::markdown_render::render_markdown_text_with_width_and_cwd;
+use crate::render::line_utils::line_to_static;
 use crate::render::line_utils::prefix_lines;
 use crate::style::proposed_plan_style;
+use crate::wrapping::RtOptions;
+use crate::wrapping::adaptive_wrap_line;
+use pulldown_cmark::Alignment;
 use ratatui::prelude::Stylize;
 use ratatui::text::Line;
+use ratatui::text::Span;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
+use unicode_width::UnicodeWidthStr;
 
 use super::StreamState;
 
@@ -39,6 +46,14 @@ struct StreamCore {
     enqueued_len: usize,
     emitted_len: usize,
     cwd: PathBuf,
+    live_table: Option<LivePipeTable>,
+    live_table_candidate_header: Option<String>,
+}
+
+struct LivePipeTable {
+    widths: Vec<usize>,
+    alignments: Vec<Alignment>,
+    has_rows: bool,
 }
 
 impl StreamCore {
@@ -51,6 +66,8 @@ impl StreamCore {
             enqueued_len: 0,
             emitted_len: 0,
             cwd: cwd.to_path_buf(),
+            live_table: None,
+            live_table_candidate_header: None,
         }
     }
 
@@ -61,9 +78,15 @@ impl StreamCore {
         self.state.collector.push_delta(delta);
 
         if delta.contains('\n')
-            && let Some(committed_source) = self.state.collector.commit_complete_source()
+            && let Some(committed_source) = self
+                .state
+                .collector
+                .commit_complete_source_for_live_preview()
         {
             self.raw_source.push_str(&committed_source);
+            if self.process_live_table_preview_source(&committed_source) {
+                return self.state.queued_len() > 0;
+            }
             self.recompute_render();
             return self.sync_queue_to_render();
         }
@@ -75,6 +98,20 @@ impl StreamCore {
         let remainder_source = self.state.collector.finalize_and_drain_source();
         if !remainder_source.is_empty() {
             self.raw_source.push_str(&remainder_source);
+            if self.process_live_table_preview_source(&remainder_source) {
+                self.close_live_table_preview();
+                return self.rendered_lines[self.emitted_len..].to_vec();
+            }
+        }
+
+        if self.live_table.is_some() {
+            self.close_live_table_preview();
+            return self.rendered_lines[self.emitted_len..].to_vec();
+        }
+
+        if self.live_table_candidate_header.is_some() {
+            self.flush_live_table_candidate_header();
+            return self.rendered_lines[self.emitted_len..].to_vec();
         }
 
         let mut rendered = Vec::new();
@@ -88,6 +125,26 @@ impl StreamCore {
             Vec::new()
         } else {
             rendered[self.emitted_len..].to_vec()
+        }
+    }
+
+    fn close_live_table_preview(&mut self) {
+        if let Some(table) = self.live_table.take() {
+            self.rendered_lines
+                .push(live_table_border(&table.widths, '└', '┴', '┘'));
+            self.enqueued_len = self.rendered_lines.len();
+        }
+    }
+
+    fn flush_live_table_candidate_header(&mut self) {
+        if let Some(header) = self.live_table_candidate_header.take() {
+            append_markdown(
+                &header,
+                self.width,
+                Some(self.cwd.as_path()),
+                &mut self.rendered_lines,
+            );
+            self.enqueued_len = self.rendered_lines.len();
         }
     }
 
@@ -161,6 +218,8 @@ impl StreamCore {
         self.rendered_lines.clear();
         self.enqueued_len = 0;
         self.emitted_len = 0;
+        self.live_table = None;
+        self.live_table_candidate_header = None;
     }
 
     fn recompute_render(&mut self) {
@@ -208,6 +267,314 @@ impl StreamCore {
         }
         self.enqueued_len = target_len;
     }
+
+    fn process_live_table_preview_source(&mut self, source: &str) -> bool {
+        let mut handled = false;
+        let mut pending_markdown = String::new();
+        let mut preview_lines = Vec::new();
+
+        for line in source.split_inclusive('\n') {
+            let line_without_newline = line.trim_end_matches(['\r', '\n']);
+            if let Some(table) = &mut self.live_table {
+                if is_live_pipe_table_row(line_without_newline) {
+                    if live_pipe_table_alignments(line_without_newline).is_some() {
+                        handled = true;
+                        continue;
+                    }
+
+                    let cells = parse_live_pipe_table_cells(line_without_newline);
+                    if table.has_rows {
+                        preview_lines.push(live_table_border(&table.widths, '├', '┼', '┤'));
+                    }
+                    preview_lines.extend(live_table_row(
+                        &cells,
+                        &table.widths,
+                        &table.alignments,
+                        &self.cwd,
+                        /*is_header*/ false,
+                    ));
+                    table.has_rows = true;
+                    handled = true;
+                    continue;
+                }
+
+                let Some(table) = self.live_table.take() else {
+                    continue;
+                };
+                preview_lines.push(live_table_border(&table.widths, '└', '┴', '┘'));
+                handled = true;
+                pending_markdown.push_str(line);
+                continue;
+            }
+
+            if let Some(candidate_header) = self.live_table_candidate_header.take() {
+                let header_cells =
+                    parse_live_pipe_table_cells(candidate_header.trim_end_matches(['\r', '\n']));
+                if let Some(alignments) = live_pipe_table_alignments(line_without_newline)
+                    && alignments.len() == header_cells.len()
+                {
+                    if !pending_markdown.is_empty() {
+                        append_markdown(
+                            &pending_markdown,
+                            self.width,
+                            Some(self.cwd.as_path()),
+                            &mut preview_lines,
+                        );
+                        pending_markdown.clear();
+                    }
+
+                    self.live_table = Some(LivePipeTable {
+                        widths: live_table_widths(self.width, &header_cells, &self.cwd),
+                        alignments,
+                        has_rows: true,
+                    });
+                    if let Some(table) = &self.live_table {
+                        preview_lines.push(live_table_border(&table.widths, '┌', '┬', '┐'));
+                        preview_lines.extend(live_table_row(
+                            &header_cells,
+                            &table.widths,
+                            &table.alignments,
+                            &self.cwd,
+                            /*is_header*/ true,
+                        ));
+                    }
+                    handled = true;
+                    continue;
+                }
+
+                pending_markdown.push_str(&candidate_header);
+            }
+
+            if is_live_pipe_table_row(line_without_newline) {
+                if live_pipe_table_alignments(line_without_newline).is_some() {
+                    pending_markdown.push_str(line);
+                } else {
+                    self.live_table_candidate_header = Some(line.to_string());
+                    handled = true;
+                }
+            } else {
+                pending_markdown.push_str(line);
+            }
+        }
+
+        if !pending_markdown.is_empty() {
+            append_markdown(
+                &pending_markdown,
+                self.width,
+                Some(self.cwd.as_path()),
+                &mut preview_lines,
+            );
+        }
+
+        if handled {
+            self.rendered_lines.extend(preview_lines.clone());
+            self.state.enqueue(preview_lines);
+            self.enqueued_len = self.rendered_lines.len();
+        }
+        handled
+    }
+}
+
+fn is_live_pipe_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.matches('|').count() >= 3
+}
+
+fn live_pipe_table_alignments(line: &str) -> Option<Vec<Alignment>> {
+    parse_live_pipe_table_cells(line)
+        .iter()
+        .map(|cell| live_pipe_table_alignment(cell))
+        .collect()
+}
+
+fn live_pipe_table_alignment(cell: &str) -> Option<Alignment> {
+    let cell = cell.trim();
+    let left = cell.starts_with(':');
+    let right = cell.ends_with(':');
+    let dashes = cell.trim_matches(':');
+    if dashes.is_empty() || !dashes.chars().all(|ch| ch == '-') {
+        return None;
+    }
+
+    match (left, right) {
+        (true, true) => Some(Alignment::Center),
+        (true, false) => Some(Alignment::Left),
+        (false, true) => Some(Alignment::Right),
+        (false, false) => Some(Alignment::None),
+    }
+}
+
+fn parse_live_pipe_table_cells(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_matches('|')
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
+fn live_table_widths(width: Option<usize>, cells: &[String], cwd: &Path) -> Vec<usize> {
+    let column_count = cells.len().max(1);
+    let natural: Vec<usize> = cells
+        .iter()
+        .map(|cell| live_table_cell_width(cell, cwd).max(3))
+        .collect();
+    let Some(width) = width else {
+        return natural;
+    };
+    let fixed_width = column_count * 3 + 1;
+    let available = width.saturating_sub(fixed_width).max(column_count);
+    let base = (available / column_count).max(1);
+    let mut widths = vec![base; column_count];
+    for width in widths.iter_mut().take(available % column_count) {
+        *width += 1;
+    }
+    widths
+}
+
+fn live_table_border(widths: &[usize], left: char, middle: char, right: char) -> Line<'static> {
+    let mut line = left.to_string();
+    for (index, width) in widths.iter().copied().enumerate() {
+        line.push_str(&"─".repeat(width + 2));
+        line.push(if index + 1 < widths.len() {
+            middle
+        } else {
+            right
+        });
+    }
+    Line::from(line)
+}
+
+fn live_table_cell_width(cell: &str, cwd: &Path) -> usize {
+    render_live_table_cell(cell, cwd)
+        .into_iter()
+        .map(|spans| spans_display_width(&spans))
+        .max()
+        .unwrap_or(0)
+}
+
+fn render_live_table_cell(cell: &str, cwd: &Path) -> Vec<Vec<Span<'static>>> {
+    let rendered = render_markdown_text_with_width_and_cwd(cell, /*width*/ None, Some(cwd));
+    if rendered.lines.is_empty() {
+        return vec![Vec::new()];
+    }
+
+    rendered.lines.into_iter().map(|line| line.spans).collect()
+}
+
+fn live_table_row(
+    cells: &[String],
+    widths: &[usize],
+    alignments: &[Alignment],
+    cwd: &Path,
+    is_header: bool,
+) -> Vec<Line<'static>> {
+    let wrapped: Vec<Vec<Vec<Span<'static>>>> = widths
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, width)| {
+            let cell = cells.get(index).map(String::as_str).unwrap_or("");
+            wrap_live_table_cell(cell, width, cwd, is_header)
+        })
+        .collect();
+    let row_height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+    let top_padding: Vec<usize> = wrapped
+        .iter()
+        .map(|cell| row_height.saturating_sub(cell.len()) / 2)
+        .collect();
+
+    (0..row_height)
+        .map(|line_index| {
+            let mut spans = vec!["│".into()];
+            for (column_index, ((cell, top_padding), width)) in wrapped
+                .iter()
+                .zip(top_padding.iter().copied())
+                .zip(widths.iter().copied())
+                .enumerate()
+            {
+                let line_spans = line_index
+                    .checked_sub(top_padding)
+                    .and_then(|index| cell.get(index))
+                    .cloned()
+                    .unwrap_or_else(Vec::new);
+                let alignment = alignments
+                    .get(column_index)
+                    .copied()
+                    .unwrap_or(Alignment::None);
+                spans.extend(pad_live_table_cell_line(line_spans, width, alignment));
+                spans.push("│".into());
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn wrap_live_table_cell(
+    cell: &str,
+    width: usize,
+    cwd: &Path,
+    is_header: bool,
+) -> Vec<Vec<Span<'static>>> {
+    let mut lines = render_live_table_cell(cell, cwd);
+    if is_header {
+        for line in &mut lines {
+            for span in line {
+                span.style = span.style.patch(ratatui::style::Style::new().bold());
+            }
+        }
+    }
+
+    let mut wrapped = Vec::new();
+    for spans in lines {
+        let line = Line::from(spans);
+        let wrapped_lines = adaptive_wrap_line(&line, RtOptions::new(width.max(1)));
+        if wrapped_lines.is_empty() {
+            wrapped.push(Vec::new());
+        } else {
+            wrapped.extend(wrapped_lines.iter().map(|line| line_to_static(line).spans));
+        }
+    }
+
+    if wrapped.is_empty() {
+        vec![Vec::new()]
+    } else {
+        wrapped
+    }
+}
+
+fn pad_live_table_cell_line(
+    spans: Vec<Span<'static>>,
+    width: usize,
+    alignment: Alignment,
+) -> Vec<Span<'static>> {
+    let content_width = spans_display_width(&spans);
+    let padding = width.saturating_sub(content_width);
+    let (left, right) = match alignment {
+        Alignment::None | Alignment::Left => (0, padding),
+        Alignment::Center => {
+            let left = padding / 2;
+            (left, padding - left)
+        }
+        Alignment::Right => (padding, 0),
+    };
+
+    let mut padded = vec![Span::from(" ")];
+    if left > 0 {
+        padded.push(Span::from(" ".repeat(left)));
+    }
+    padded.extend(spans);
+    if right > 0 {
+        padded.push(Span::from(" ".repeat(right)));
+    }
+    padded.push(Span::from(" "));
+    padded
+}
+
+fn spans_display_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
 }
 
 /// Controls newline-gated streaming for assistant messages.
@@ -430,6 +797,7 @@ impl PlanStreamController {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use ratatui::style::Modifier;
 
     fn test_cwd() -> PathBuf {
         std::env::temp_dir()
@@ -571,6 +939,180 @@ mod tests {
     fn simple_lines_stream_in_order() {
         let actual = collect_streamed_lines(&["hello\n", "world\n"], Some(80));
         assert_eq!(actual, vec!["hello".to_string(), "world".to_string()]);
+    }
+
+    #[test]
+    fn pipe_table_rows_stream_as_live_preview() {
+        let mut ctrl = stream_controller(Some(20));
+
+        assert!(!ctrl.push("| A | B |\n"));
+        assert_eq!(ctrl.queued_lines(), 0);
+
+        assert!(ctrl.push("| --- | --- |\n"));
+        assert_eq!(ctrl.queued_lines(), 2);
+        let (cell, idle) = ctrl.on_commit_tick_batch(usize::MAX);
+        assert!(idle);
+        let lines = lines_to_plain_strings(
+            &cell
+                .expect("expected header preview")
+                .transcript_lines(u16::MAX),
+        )
+        .into_iter()
+        .map(|line| line.chars().skip(2).collect::<String>())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            vec![
+                "┌─────────┬────────┐".to_string(),
+                "│ A       │ B      │".to_string(),
+            ]
+        );
+
+        assert!(ctrl.push("| C | D |\n"));
+        assert_eq!(ctrl.queued_lines(), 2);
+        let (cell, idle) = ctrl.on_commit_tick_batch(usize::MAX);
+        assert!(idle);
+        let lines = lines_to_plain_strings(
+            &cell
+                .expect("expected body row preview")
+                .transcript_lines(u16::MAX),
+        )
+        .into_iter()
+        .map(|line| line.chars().skip(2).collect::<String>())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            vec![
+                "├─────────┼────────┤".to_string(),
+                "│ C       │ D      │".to_string(),
+            ]
+        );
+
+        let (cell, source) = ctrl.finalize();
+        assert_eq!(
+            source,
+            Some("| A | B |\n| --- | --- |\n| C | D |\n".to_string())
+        );
+        let lines = lines_to_plain_strings(
+            &cell
+                .expect("expected table closing border")
+                .transcript_lines(u16::MAX),
+        )
+        .into_iter()
+        .map(|line| line.chars().skip(2).collect::<String>())
+        .collect::<Vec<_>>();
+        assert_eq!(lines, vec!["└─────────┴────────┘".to_string()]);
+    }
+
+    #[test]
+    fn pipe_table_live_preview_renders_inline_markdown() {
+        let mut ctrl = stream_controller(Some(60));
+
+        assert!(!ctrl.push("| Type | Effect |\n"));
+        assert!(ctrl.push("| --- | --- |\n"));
+        let (cell, idle) = ctrl.on_commit_tick_batch(usize::MAX);
+        assert!(idle);
+        assert!(cell.is_some(), "expected header preview");
+
+        assert!(ctrl.push("| bold | **bold** |\n"));
+        let (cell, idle) = ctrl.on_commit_tick_batch(usize::MAX);
+        assert!(idle);
+        let lines = cell
+            .expect("expected body row preview")
+            .transcript_lines(u16::MAX);
+        let plain = lines_to_plain_strings(&lines);
+        assert!(
+            plain.iter().all(|line| !line.contains("**")),
+            "live preview should not leak raw emphasis markers: {plain:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.content == "bold"
+                    && span.style.add_modifier.contains(Modifier::BOLD)),
+            "expected bold cell content to keep bold styling: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn short_alignment_delimiters_stream_as_live_table() {
+        let mut ctrl = stream_controller(Some(30));
+
+        assert!(!ctrl.push("| L | C | R |\n"));
+        assert_eq!(ctrl.queued_lines(), 0);
+
+        assert!(ctrl.push("| :-- | :-: | --: |\n"));
+        let (cell, idle) = ctrl.on_commit_tick_batch(usize::MAX);
+        assert!(idle);
+        let lines = lines_to_plain_strings(
+            &cell
+                .expect("expected header preview")
+                .transcript_lines(u16::MAX),
+        )
+        .into_iter()
+        .map(|line| line.chars().skip(2).collect::<String>())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            vec![
+                "┌─────────┬─────────┬────────┐".to_string(),
+                "│ L       │    C    │      R │".to_string(),
+            ]
+        );
+
+        assert!(ctrl.push("| a | b | 123 |\n"));
+        let (cell, idle) = ctrl.on_commit_tick_batch(usize::MAX);
+        assert!(idle);
+        let lines = lines_to_plain_strings(
+            &cell
+                .expect("expected body row preview")
+                .transcript_lines(u16::MAX),
+        )
+        .into_iter()
+        .map(|line| line.chars().skip(2).collect::<String>())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            vec![
+                "├─────────┼─────────┼────────┤".to_string(),
+                "│ a       │    b    │    123 │".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pipe_rows_without_delimiter_do_not_stream_as_live_table() {
+        let mut ctrl = stream_controller(Some(80));
+
+        assert!(!ctrl.push("| A | B |\n"));
+        assert_eq!(ctrl.queued_lines(), 0);
+
+        assert!(ctrl.push("| C | D |\n"));
+        assert_eq!(ctrl.queued_lines(), 1);
+        let (cell, idle) = ctrl.on_commit_tick_batch(usize::MAX);
+        assert!(idle);
+        let lines = lines_to_plain_strings(
+            &cell
+                .expect("expected first non-table pipe row as text")
+                .transcript_lines(u16::MAX),
+        )
+        .into_iter()
+        .map(|line| line.chars().skip(2).collect::<String>())
+        .collect::<Vec<_>>();
+        assert_eq!(lines, vec!["| A | B |".to_string()]);
+
+        let (cell, source) = ctrl.finalize();
+        assert_eq!(source, Some("| A | B |\n| C | D |\n".to_string()));
+        let lines = lines_to_plain_strings(
+            &cell
+                .expect("expected final non-table pipe row as text")
+                .transcript_lines(u16::MAX),
+        )
+        .into_iter()
+        .map(|line| line.chars().skip(2).collect::<String>())
+        .collect::<Vec<_>>();
+        assert_eq!(lines, vec!["| C | D |".to_string()]);
     }
 
     #[test]

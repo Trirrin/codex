@@ -26,6 +26,7 @@ impl ToolHandler for Handler {
             args.target,
             args.message,
             args.interrupt,
+            args.mode,
         )
         .await
     }

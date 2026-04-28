@@ -390,6 +390,7 @@ fn exec_command_tool_output_formats_truncated_response() {
         wall_time: std::time::Duration::from_millis(1250),
         raw_output: b"token one token two token three token four token five".to_vec(),
         max_output_tokens: Some(4),
+        shell_id: None,
         process_id: None,
         exit_code: Some(0),
         original_token_count: Some(10),

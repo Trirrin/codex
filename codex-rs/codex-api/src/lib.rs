@@ -55,6 +55,7 @@ pub use crate::endpoint::ResponsesClient;
 pub use crate::endpoint::ResponsesOptions;
 pub use crate::endpoint::ResponsesWebsocketClient;
 pub use crate::endpoint::ResponsesWebsocketConnection;
+pub use crate::endpoint::decode_models_response;
 pub use crate::endpoint::session_update_session_json;
 pub use crate::error::ApiError;
 pub use crate::files::upload_local_file;

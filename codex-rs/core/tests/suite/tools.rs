@@ -110,7 +110,18 @@ async fn empty_turn_environments_omits_environment_backed_tools() -> Result<()> 
         tools.contains(&"update_plan".to_string()),
         "non-environment tool should remain available; got {tools:?}"
     );
-    for environment_tool in ["exec_command", "write_stdin", "apply_patch", "view_image"] {
+    for environment_tool in [
+        "execute",
+        "read_file",
+        "search_file",
+        "grep_file",
+        "glob_file",
+        "edit",
+        "write",
+        "delete",
+        "list_dir",
+        "view_image",
+    ] {
         assert!(
             !tools.contains(&environment_tool.to_string()),
             "{environment_tool} should be omitted for explicit empty turn environments; got {tools:?}"
@@ -154,7 +165,7 @@ async fn turn_environment_selection_keeps_environment_backed_tools() -> Result<(
 
     let tools = tool_names(&response_mock.single_request().body_json());
     assert!(
-        tools.contains(&"exec_command".to_string()),
+        tools.contains(&"execute".to_string()),
         "environment tool should remain available with selected local environment; got {tools:?}"
     );
 
@@ -692,22 +703,14 @@ async fn unified_exec_spec_toggle_end_to_end() -> Result<()> {
 
     let tools_disabled = collect_tools(/*use_unified_exec*/ false).await?;
     assert!(
-        !tools_disabled.iter().any(|name| name == "exec_command"),
-        "tools list should not include exec_command when disabled: {tools_disabled:?}"
-    );
-    assert!(
-        !tools_disabled.iter().any(|name| name == "write_stdin"),
-        "tools list should not include write_stdin when disabled: {tools_disabled:?}"
+        !tools_disabled.iter().any(|name| name == "execute"),
+        "tools list should not include execute when disabled: {tools_disabled:?}"
     );
 
     let tools_enabled = collect_tools(/*use_unified_exec*/ true).await?;
     assert!(
-        tools_enabled.iter().any(|name| name == "exec_command"),
-        "tools list should include exec_command when enabled: {tools_enabled:?}"
-    );
-    assert!(
-        tools_enabled.iter().any(|name| name == "write_stdin"),
-        "tools list should include write_stdin when enabled: {tools_enabled:?}"
+        tools_enabled.iter().any(|name| name == "execute"),
+        "tools list should include execute when enabled: {tools_enabled:?}"
     );
 
     Ok(())

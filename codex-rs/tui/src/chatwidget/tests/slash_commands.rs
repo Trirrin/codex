@@ -1674,17 +1674,17 @@ async fn slash_exit_requests_exit() {
 }
 
 #[tokio::test]
-async fn slash_stop_submits_background_terminal_cleanup() {
+async fn slash_stop_submits_background_activity_cleanup() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.dispatch_command(SlashCommand::Stop);
 
-    assert_matches!(op_rx.try_recv(), Ok(Op::CleanBackgroundTerminals));
+    assert_matches!(op_rx.try_recv(), Ok(Op::CleanBackgroundActivity));
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1, "expected cleanup confirmation message");
     let rendered = lines_to_single_string(&cells[0]);
     assert!(
-        rendered.contains("Stopping all background terminals."),
+        rendered.contains("Stopping background activity."),
         "expected cleanup confirmation, got {rendered:?}"
     );
 }

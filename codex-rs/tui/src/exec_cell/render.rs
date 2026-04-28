@@ -14,6 +14,7 @@ use crate::wrapping::adaptive_wrap_line;
 use crate::wrapping::adaptive_wrap_lines;
 use codex_ansi_escape::ansi_escape_line;
 use codex_protocol::parse_command::ParsedCommand;
+use codex_protocol::protocol::ExecCommandRunMode;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_shell_command::bash::extract_bash_command;
 use codex_utils_elapsed::format_duration;
@@ -29,6 +30,7 @@ use unicode_width::UnicodeWidthStr;
 pub(crate) const TOOL_CALL_MAX_LINES: usize = 5;
 const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
 const MAX_INTERACTION_PREVIEW_CHARS: usize = 80;
+const MAX_EXECUTE_COMMAND_DISPLAY_CHARS: usize = 20;
 const TRANSCRIPT_HINT: &str = "ctrl + t to view transcript";
 
 pub(crate) struct OutputLinesParams {
@@ -43,6 +45,7 @@ pub(crate) fn new_active_exec_command(
     command: Vec<String>,
     parsed: Vec<ParsedCommand>,
     source: ExecCommandSource,
+    run_mode: Option<ExecCommandRunMode>,
     interaction_input: Option<String>,
     animations_enabled: bool,
 ) -> ExecCell {
@@ -53,6 +56,7 @@ pub(crate) fn new_active_exec_command(
             parsed,
             output: None,
             source,
+            run_mode,
             start_time: Some(Instant::now()),
             duration: None,
             interaction_input,
@@ -67,6 +71,18 @@ fn format_unified_exec_interaction(command: &[String], input: Option<&str>) -> S
     } else {
         command.join(" ")
     };
+    if let Some(shell_id) = command_display.strip_prefix("read_shell_output ") {
+        return format!("Read output from shell `{}`", shell_id.trim());
+    }
+    if let Some(shell_id) = command_display.strip_prefix("wait_shell_output ") {
+        return format!("Waited for output from shell `{}`", shell_id.trim());
+    }
+    if command_display == "list_shells" {
+        return "Listed active shells".to_string();
+    }
+    if let Some(shell_id) = command_display.strip_prefix("stop_shell ") {
+        return format!("Stopped shell `{}`", shell_id.trim());
+    }
     match input {
         Some(data) if !data.is_empty() => {
             let preview = summarize_interaction_input(data);
@@ -222,6 +238,9 @@ impl HistoryCell for ExecCell {
             lines.extend(cmd_display);
 
             if let Some(output) = call.output.as_ref() {
+                if call.is_background_unified_exec_startup() {
+                    continue;
+                }
                 if !call.is_unified_exec_interaction() {
                     let wrap_width = width.max(1) as usize;
                     let wrap_opts = RtOptions::new(wrap_width);
@@ -367,16 +386,25 @@ impl ExecCell {
             panic!("Expected exactly one call in a command display cell");
         };
         let layout = EXEC_DISPLAY_LAYOUT;
-        let success = call.output.as_ref().map(|o| o.exit_code == 0);
-        let bullet = match success {
-            Some(true) => "•".green().bold(),
-            Some(false) => "•".red().bold(),
-            None => spinner(call.start_time, self.animations_enabled()),
-        };
         let is_interaction = call.is_unified_exec_interaction();
+        let is_running = self.is_active() || call.is_background_unified_exec_startup();
+        let success = call.output.as_ref().map(|o| o.exit_code == 0);
+        let bullet = if is_running {
+            if self.animations_enabled() {
+                "•".slow_blink()
+            } else {
+                "•".dim()
+            }
+        } else {
+            match success {
+                Some(true) => "•".green().bold(),
+                Some(false) => "•".red().bold(),
+                None => spinner(call.start_time, self.animations_enabled()),
+            }
+        };
         let title = if is_interaction {
             ""
-        } else if self.is_active() {
+        } else if is_running {
             "Running"
         } else if call.is_user_shell_command() {
             "You ran"
@@ -393,6 +421,14 @@ impl ExecCell {
 
         let cmd_display = if call.is_unified_exec_interaction() {
             format_unified_exec_interaction(&call.command, call.interaction_input.as_deref())
+        } else if call.is_unified_exec_startup() {
+            let display =
+                truncate_execute_command_display(&strip_bash_lc_and_escape(&call.command));
+            if call.is_background_unified_exec_startup() {
+                format!("{display} in background (Use down arrow to see details)")
+            } else {
+                display
+            }
         } else {
             strip_bash_lc_and_escape(&call.command)
         };
@@ -439,7 +475,9 @@ impl ExecCell {
             ));
         }
 
-        if let Some(output) = call.output.as_ref() {
+        if let Some(output) = call.output.as_ref()
+            && !call.is_background_unified_exec_startup()
+        {
             let line_limit = if call.is_user_shell_command() {
                 USER_SHELL_TOOL_CALL_MAX_LINES
             } else {
@@ -658,6 +696,19 @@ impl ExecCell {
     }
 }
 
+fn truncate_execute_command_display(command: &str) -> String {
+    let mut chars = command.chars();
+    let head = chars
+        .by_ref()
+        .take(MAX_EXECUTE_COMMAND_DISPLAY_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PrefixedBlock {
     initial_prefix: &'static str,
@@ -724,6 +775,37 @@ mod tests {
     }
 
     #[test]
+    fn running_command_with_live_output_uses_blinking_bullet_not_success_bullet() {
+        let call = ExecCall {
+            call_id: "call-id".to_string(),
+            command: vec!["bash".into(), "-lc".into(), "printf done".into()],
+            parsed: Vec::new(),
+            output: Some(CommandOutput {
+                exit_code: 0,
+                aggregated_output: "partial output\n".to_string(),
+                formatted_output: String::new(),
+            }),
+            source: ExecCommandSource::UnifiedExecStartup,
+            run_mode: Some(ExecCommandRunMode::Blocking),
+            start_time: Some(Instant::now()),
+            duration: None,
+            interaction_input: None,
+        };
+
+        let cell = ExecCell::new(call, /*animations_enabled*/ true);
+        let lines = cell.command_display_lines(/*width*/ 80);
+        let bullet = &lines[0].spans[0];
+
+        assert_eq!(bullet.content.as_ref(), "•");
+        assert_ne!(bullet.style.fg, Some(Color::Green));
+        assert!(
+            bullet.style.add_modifier.contains(Modifier::SLOW_BLINK),
+            "running command bullet should blink until an exit code completes the command"
+        );
+        assert_eq!(render_line_text(&lines[0]), "• Running printf done");
+    }
+
+    #[test]
     fn user_shell_output_is_limited_by_screen_lines() {
         let long_url_like = format!(
             "https://example.test/api/v1/projects/alpha-team/releases/2026-02-17/builds/1234567890/{}",
@@ -784,6 +866,7 @@ mod tests {
             parsed: Vec::new(),
             output: Some(output),
             source: ExecCommandSource::UserShell,
+            run_mode: None,
             start_time: None,
             duration: None,
             interaction_input: None,
@@ -933,6 +1016,7 @@ mod tests {
             parsed: Vec::new(),
             output: None,
             source: ExecCommandSource::UserShell,
+            run_mode: None,
             start_time: None,
             duration: None,
             interaction_input: None,
@@ -970,6 +1054,7 @@ mod tests {
             }],
             output: None,
             source: ExecCommandSource::Agent,
+            run_mode: None,
             start_time: None,
             duration: None,
             interaction_input: None,
@@ -1011,6 +1096,7 @@ mod tests {
                 aggregated_output: url.to_string(),
             }),
             source: ExecCommandSource::UserShell,
+            run_mode: None,
             start_time: None,
             duration: None,
             interaction_input: None,
@@ -1048,6 +1134,7 @@ mod tests {
                 aggregated_output: url.to_string(),
             }),
             source: ExecCommandSource::Agent,
+            run_mode: None,
             start_time: None,
             duration: None,
             interaction_input: None,

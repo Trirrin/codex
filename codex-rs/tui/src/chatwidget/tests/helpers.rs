@@ -221,8 +221,11 @@ pub(super) async fn make_chatwidget_manual(
         latest_proposed_plan_markdown: None,
         saw_copy_source_this_turn: false,
         running_commands: HashMap::new(),
+        active_model_activities: Vec::new(),
+        background_unified_exec_call_ids: HashSet::new(),
         collab_agent_metadata: HashMap::new(),
         pending_collab_spawn_requests: HashMap::new(),
+        collab_agent_activities: Vec::new(),
         suppressed_exec_calls: HashSet::new(),
         skills_all: Vec::new(),
         skills_initial_state: None,
@@ -290,6 +293,7 @@ pub(super) async fn make_chatwidget_manual(
         last_plan_progress: None,
         plan_delta_buffer: String::new(),
         plan_item_active: false,
+        output_chars_this_turn: 0,
         last_separator_elapsed_secs: None,
         turn_runtime_metrics: RuntimeMetricsSummary::default(),
         last_rendered_width: std::cell::Cell::new(None),
@@ -501,6 +505,16 @@ pub(super) fn begin_exec_with_source(
     raw_cmd: &str,
     source: ExecCommandSource,
 ) -> ExecCommandBeginEvent {
+    begin_exec_with_source_and_run_mode(chat, call_id, raw_cmd, source, /*run_mode*/ None)
+}
+
+pub(super) fn begin_exec_with_source_and_run_mode(
+    chat: &mut ChatWidget,
+    call_id: &str,
+    raw_cmd: &str,
+    source: ExecCommandSource,
+    run_mode: Option<ExecCommandRunMode>,
+) -> ExecCommandBeginEvent {
     // Build the full command vec and parse it using core's parser,
     // then convert to protocol variants for the event payload.
     let command = vec!["bash".to_string(), "-lc".to_string(), raw_cmd.to_string()];
@@ -516,6 +530,7 @@ pub(super) fn begin_exec_with_source(
         cwd,
         parsed_cmd,
         source,
+        run_mode,
         interaction_input,
     };
     chat.handle_codex_event(Event {
@@ -541,6 +556,7 @@ pub(super) fn begin_unified_exec_startup(
         cwd,
         parsed_cmd: Vec::new(),
         source: ExecCommandSource::UnifiedExecStartup,
+        run_mode: Some(codex_protocol::protocol::ExecCommandRunMode::Background),
         interaction_input: None,
     };
     chat.handle_codex_event(Event {
@@ -658,6 +674,7 @@ pub(super) fn end_exec(
         source,
         interaction_input,
         process_id,
+        run_mode: _,
     } = begin_event;
     chat.handle_codex_event(Event {
         id: call_id.clone(),

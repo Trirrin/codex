@@ -379,6 +379,7 @@ pub struct ExecCommandToolOutput {
     /// Raw bytes returned for this unified exec call before any truncation.
     pub raw_output: Vec<u8>,
     pub max_output_tokens: Option<usize>,
+    pub shell_id: Option<String>,
     pub process_id: Option<i32>,
     pub exit_code: Option<i32>,
     pub original_token_count: Option<usize>,
@@ -422,7 +423,9 @@ impl ToolOutput for ExecCommandToolOutput {
             #[serde(skip_serializing_if = "Option::is_none")]
             exit_code: Option<i32>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            session_id: Option<i32>,
+            shell_id: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            process_id: Option<i32>,
             #[serde(skip_serializing_if = "Option::is_none")]
             original_token_count: Option<usize>,
             output: String,
@@ -432,7 +435,8 @@ impl ToolOutput for ExecCommandToolOutput {
             chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
             wall_time_seconds: self.wall_time.as_secs_f64(),
             exit_code: self.exit_code,
-            session_id: self.process_id,
+            shell_id: self.shell_id.clone(),
+            process_id: self.process_id,
             original_token_count: self.original_token_count,
             output: self.truncated_output(),
         };
@@ -464,8 +468,12 @@ impl ExecCommandToolOutput {
             sections.push(format!("Process exited with code {exit_code}"));
         }
 
+        if let Some(shell_id) = &self.shell_id {
+            sections.push(format!("Shell ID: {shell_id}"));
+        }
+
         if let Some(process_id) = &self.process_id {
-            sections.push(format!("Process running with session ID {process_id}"));
+            sections.push(format!("Process running with process ID {process_id}"));
         }
 
         if let Some(original_token_count) = self.original_token_count {

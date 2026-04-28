@@ -16,7 +16,7 @@ pub struct ShellToolOptions {
     pub exec_permission_approvals_enabled: bool,
 }
 
-pub fn create_exec_command_tool(options: CommandToolOptions) -> ToolSpec {
+pub fn create_execute_tool(options: CommandToolOptions) -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "cmd".to_string(),
@@ -39,6 +39,13 @@ pub fn create_exec_command_tool(options: CommandToolOptions) -> ToolSpec {
             "tty".to_string(),
             JsonSchema::boolean(Some(
                 "Whether to allocate a TTY for the command. Defaults to false (plain pipes); set to true to open a PTY and access TTY process."
+                    .to_string(),
+            )),
+        ),
+        (
+            "mode".to_string(),
+            JsonSchema::string(Some(
+                "Execution mode: \"blocking\" waits for completion; \"background\" returns after startup with a shell id. Defaults to \"blocking\"."
                     .to_string(),
             )),
         ),
@@ -68,14 +75,14 @@ pub fn create_exec_command_tool(options: CommandToolOptions) -> ToolSpec {
     ));
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "exec_command".to_string(),
+        name: "execute".to_string(),
         description: if cfg!(windows) {
             format!(
-                "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}",
+                "Runs a command in a PTY. Defaults to mode=\"blocking\"; use mode=\"background\" to keep it running.\n\n{}",
                 windows_shell_guidance()
             )
         } else {
-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
+            "Runs a command in a PTY. Defaults to mode=\"blocking\"; use mode=\"background\" to keep it running."
                 .to_string()
         },
         strict: false,
@@ -89,24 +96,12 @@ pub fn create_exec_command_tool(options: CommandToolOptions) -> ToolSpec {
     })
 }
 
-pub fn create_write_stdin_tool() -> ToolSpec {
+pub fn create_read_shell_output_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
-            "session_id".to_string(),
-            JsonSchema::number(Some(
-                "Identifier of the running unified exec session.".to_string(),
-            )),
-        ),
-        (
-            "chars".to_string(),
+            "shell_id".to_string(),
             JsonSchema::string(Some(
-                "Bytes to write to stdin (may be empty to poll).".to_string(),
-            )),
-        ),
-        (
-            "yield_time_ms".to_string(),
-            JsonSchema::number(Some(
-                "How long to wait (in milliseconds) for output before yielding.".to_string(),
+                "Shell id returned by execute mode=\"background\".".to_string(),
             )),
         ),
         (
@@ -118,15 +113,86 @@ pub fn create_write_stdin_tool() -> ToolSpec {
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "write_stdin".to_string(),
-        description:
-            "Writes characters to an existing unified exec session and returns recent output."
-                .to_string(),
+        name: "read_shell_output".to_string(),
+        description: "Reads the retained output for a background shell in the current session."
+            .to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
             properties,
-            Some(vec!["session_id".to_string()]),
+            Some(vec!["shell_id".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: Some(unified_exec_output_schema()),
+    })
+}
+
+pub fn create_wait_shell_output_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "shell_id".to_string(),
+            JsonSchema::string(Some(
+                "Shell id returned by execute mode=\"background\".".to_string(),
+            )),
+        ),
+        (
+            "yield_time_ms".to_string(),
+            JsonSchema::number(Some(
+                "Maximum time in milliseconds to block while waiting for the next output."
+                    .to_string(),
+            )),
+        ),
+        (
+            "max_output_tokens".to_string(),
+            JsonSchema::number(Some(
+                "Maximum number of tokens to return. Excess output will be truncated.".to_string(),
+            )),
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "wait_shell_output".to_string(),
+        description: "Blocks until the background shell emits output after this call starts, or until the wait timeout expires.".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["shell_id".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: Some(unified_exec_output_schema()),
+    })
+}
+
+pub fn create_list_shells_tool() -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: "list_shells".to_string(),
+        description:
+            "Lists all active background shells that are still running in this Codex process."
+                .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(BTreeMap::new(), Some(Vec::new()), Some(false.into())),
+        output_schema: Some(unified_exec_output_schema()),
+    })
+}
+
+pub fn create_stop_shell_tool() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "shell_id".to_string(),
+        JsonSchema::string(Some(
+            "Shell id returned by execute mode=\"background\".".to_string(),
+        )),
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "stop_shell".to_string(),
+        description: "Stops an active background shell by shell id.".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["shell_id".to_string()]),
             Some(false.into()),
         ),
         output_schema: Some(unified_exec_output_schema()),
@@ -312,9 +378,13 @@ fn unified_exec_output_schema() -> Value {
                 "type": "number",
                 "description": "Process exit code when the command finished during this call."
             },
-            "session_id": {
+            "process_id": {
                 "type": "number",
-                "description": "Session identifier to pass to write_stdin when the process is still running."
+                "description": "Process identifier returned when a background command is still running."
+            },
+            "shell_id": {
+                "type": "string",
+                "description": "Stable shell identifier for background output tools in the current session."
             },
             "original_token_count": {
                 "type": "number",

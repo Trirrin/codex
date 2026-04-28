@@ -92,19 +92,19 @@ Examples of valid command strings:
 }
 
 #[test]
-fn exec_command_tool_matches_expected_spec() {
-    let tool = create_exec_command_tool(CommandToolOptions {
+fn execute_tool_matches_expected_spec() {
+    let tool = create_execute_tool(CommandToolOptions {
         allow_login_shell: true,
         exec_permission_approvals_enabled: false,
     });
 
     let description = if cfg!(windows) {
         format!(
-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.{}",
+            "Runs a command in a PTY. Defaults to mode=\"blocking\"; use mode=\"background\" to keep it running.{}",
             windows_shell_guidance_description()
         )
     } else {
-        "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
+        "Runs a command in a PTY. Defaults to mode=\"blocking\"; use mode=\"background\" to keep it running."
             .to_string()
     };
 
@@ -134,6 +134,13 @@ fn exec_command_tool_matches_expected_spec() {
                 )),
         ),
         (
+            "mode".to_string(),
+            JsonSchema::string(Some(
+                "Execution mode: \"blocking\" waits for completion; \"background\" returns after startup with a shell id. Defaults to \"blocking\"."
+                    .to_string(),
+            )),
+        ),
+        (
             "yield_time_ms".to_string(),
             JsonSchema::number(Some(
                     "How long to wait (in milliseconds) for output before yielding.".to_string(),
@@ -160,7 +167,7 @@ fn exec_command_tool_matches_expected_spec() {
     assert_eq!(
         tool,
         ToolSpec::Function(ResponsesApiTool {
-            name: "exec_command".to_string(),
+            name: "execute".to_string(),
             description,
             strict: false,
             defer_loading: None,
@@ -175,48 +182,36 @@ fn exec_command_tool_matches_expected_spec() {
 }
 
 #[test]
-fn write_stdin_tool_matches_expected_spec() {
-    let tool = create_write_stdin_tool();
-
-    let properties = BTreeMap::from([
-        (
-            "session_id".to_string(),
-            JsonSchema::number(Some(
-                "Identifier of the running unified exec session.".to_string(),
-            )),
-        ),
-        (
-            "chars".to_string(),
-            JsonSchema::string(Some(
-                "Bytes to write to stdin (may be empty to poll).".to_string(),
-            )),
-        ),
-        (
-            "yield_time_ms".to_string(),
-            JsonSchema::number(Some(
-                "How long to wait (in milliseconds) for output before yielding.".to_string(),
-            )),
-        ),
-        (
-            "max_output_tokens".to_string(),
-            JsonSchema::number(Some(
-                "Maximum number of tokens to return. Excess output will be truncated.".to_string(),
-            )),
-        ),
-    ]);
-
+fn shell_management_tools_match_expected_specs() {
     assert_eq!(
-        tool,
+        create_list_shells_tool(),
         ToolSpec::Function(ResponsesApiTool {
-            name: "write_stdin".to_string(),
+            name: "list_shells".to_string(),
             description:
-                "Writes characters to an existing unified exec session and returns recent output."
+                "Lists all active background shells that are still running in this Codex process."
                     .to_string(),
             strict: false,
             defer_loading: None,
+            parameters: JsonSchema::object(BTreeMap::new(), Some(Vec::new()), Some(false.into())),
+            output_schema: Some(unified_exec_output_schema()),
+        })
+    );
+
+    assert_eq!(
+        create_stop_shell_tool(),
+        ToolSpec::Function(ResponsesApiTool {
+            name: "stop_shell".to_string(),
+            description: "Stops an active background shell by shell id.".to_string(),
+            strict: false,
+            defer_loading: None,
             parameters: JsonSchema::object(
-                properties,
-                Some(vec!["session_id".to_string()]),
+                BTreeMap::from([(
+                    "shell_id".to_string(),
+                    JsonSchema::string(Some(
+                        "Shell id returned by execute mode=\"background\".".to_string(),
+                    )),
+                )]),
+                Some(vec!["shell_id".to_string()]),
                 Some(false.into())
             ),
             output_schema: Some(unified_exec_output_schema()),

@@ -72,6 +72,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     assert!(!description.contains("hidden display (`hidden-model`)"));
     assert!(properties.contains_key("task_name"));
     assert!(properties.contains_key("message"));
+    assert!(properties.contains_key("mode"));
     assert!(properties.contains_key("fork_turns"));
     assert!(!properties.contains_key("items"));
     assert!(!properties.contains_key("fork_context"));
@@ -87,7 +88,11 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     );
     assert_eq!(
         parameters.required.as_ref(),
-        Some(&vec!["task_name".to_string(), "message".to_string()])
+        Some(&vec![
+            "task_name".to_string(),
+            "message".to_string(),
+            "mode".to_string()
+        ])
     );
     assert_eq!(
         output_schema.expect("spawn_agent output schema")["required"],
@@ -190,6 +195,7 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
     assert!(properties.contains_key("target"));
     assert!(properties.contains_key("message"));
     assert!(properties.contains_key("interrupt"));
+    assert!(properties.contains_key("mode"));
     assert!(!properties.contains_key("items"));
     assert!(description.contains(
         "Send a string message to an existing non-root agent and trigger a turn in the target."
@@ -207,7 +213,11 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
     );
     assert_eq!(
         parameters.required.as_ref(),
-        Some(&vec!["target".to_string(), "message".to_string()])
+        Some(&vec![
+            "target".to_string(),
+            "message".to_string(),
+            "mode".to_string()
+        ])
     );
     assert_eq!(output_schema, None);
 }

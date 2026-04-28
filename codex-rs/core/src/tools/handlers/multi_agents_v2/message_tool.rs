@@ -45,6 +45,8 @@ pub(crate) struct FollowupTaskArgs {
     pub(crate) message: String,
     #[serde(default)]
     pub(crate) interrupt: bool,
+    #[serde(default)]
+    pub(crate) mode: AgentToolMode,
 }
 
 fn message_content(message: String) -> Result<String, FunctionCallError> {
@@ -63,6 +65,7 @@ pub(crate) async fn handle_message_string_tool(
     target: String,
     message: String,
     interrupt: bool,
+    wait_mode: AgentToolMode,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
     handle_message_submission(
         invocation,
@@ -70,6 +73,7 @@ pub(crate) async fn handle_message_string_tool(
         target,
         message_content(message)?,
         interrupt,
+        wait_mode,
     )
     .await
 }
@@ -80,6 +84,7 @@ async fn handle_message_submission(
     target: String,
     prompt: String,
     interrupt: bool,
+    wait_mode: AgentToolMode,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
     let ToolInvocation {
         session,
@@ -141,11 +146,19 @@ async fn handle_message_submission(
         .send_inter_agent_communication(receiver_thread_id, mode.apply(communication))
         .await
         .map_err(|err| collab_agent_error(receiver_thread_id, err));
-    let status = session
+    let mut status = session
         .services
         .agent_control
         .get_status(receiver_thread_id)
         .await;
+    if matches!(wait_mode, AgentToolMode::Blocking) {
+        status = wait_for_agent_final_status(
+            session.clone(),
+            receiver_thread_id,
+            DEFAULT_WAIT_TIMEOUT_MS,
+        )
+        .await;
+    }
     session
         .send_event(
             &turn,
@@ -156,12 +169,17 @@ async fn handle_message_submission(
                 receiver_agent_nickname: receiver_agent.agent_nickname,
                 receiver_agent_role: receiver_agent.agent_role,
                 prompt,
-                status,
+                status: status.clone(),
             }
             .into(),
         )
         .await;
     result?;
 
-    Ok(FunctionToolOutput::from_text(String::new(), Some(true)))
+    let output = if matches!(wait_mode, AgentToolMode::Blocking) {
+        serde_json::json!({ "status": status }).to_string()
+    } else {
+        String::new()
+    };
+    Ok(FunctionToolOutput::from_text(output, Some(true)))
 }

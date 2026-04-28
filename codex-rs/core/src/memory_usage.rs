@@ -69,7 +69,7 @@ fn shell_command_for_invocation(invocation: &ToolInvocation) -> Option<(Vec<Stri
                     invocation.turn.resolve_path(params.workdir).to_path_buf(),
                 )
             }),
-        (None, "exec_command") => serde_json::from_str::<ExecCommandArgs>(arguments)
+        (None, "execute") => serde_json::from_str::<ExecCommandArgs>(arguments)
             .ok()
             .and_then(|params| {
                 let command = crate::tools::handlers::unified_exec::get_command(

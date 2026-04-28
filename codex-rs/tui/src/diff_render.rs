@@ -74,6 +74,7 @@ const LIGHT_256_DEL_LINE_BG_IDX: u8 = 224;
 const LIGHT_256_ADD_NUM_BG_IDX: u8 = 157;
 const LIGHT_256_DEL_NUM_BG_IDX: u8 = 217;
 const LIGHT_256_GUTTER_FG_IDX: u8 = 236;
+const MAX_RENDERED_ADDED_LINES: usize = 10;
 
 use crate::color::is_light;
 use crate::color::perceptual_distance;
@@ -421,7 +422,7 @@ fn render_changes_block(rows: Vec<Row>, wrap_cols: usize, cwd: &Path) -> Vec<RtL
     if let [row] = &rows[..] {
         let verb = match &row.change {
             FileChange::Add { .. } => "Added",
-            FileChange::Delete { .. } => "Deleted",
+            FileChange::Delete { .. } => "Delete",
             _ => "Edited",
         };
         header_spans.push(verb.bold());
@@ -483,8 +484,10 @@ fn render_change(
         FileChange::Add { content } => {
             // Pre-highlight the entire file content as a whole.
             let syntax_lines = lang.and_then(|l| highlight_code_to_styled_spans(content, l));
-            let line_number_width = line_number_width(content.lines().count());
-            for (i, raw) in content.lines().enumerate() {
+            let lines = content.lines().collect::<Vec<_>>();
+            let rendered_line_count = lines.len().min(MAX_RENDERED_ADDED_LINES);
+            let line_number_width = line_number_width(rendered_line_count);
+            for (i, raw) in lines.iter().take(MAX_RENDERED_ADDED_LINES).enumerate() {
                 let syn = syntax_lines.as_ref().and_then(|sl| sl.get(i));
                 if let Some(spans) = syn {
                     out.extend(push_wrapped_diff_line_inner_with_theme_and_color_level(
@@ -512,39 +515,13 @@ fn render_change(
                     ));
                 }
             }
-        }
-        FileChange::Delete { content } => {
-            let syntax_lines = lang.and_then(|l| highlight_code_to_styled_spans(content, l));
-            let line_number_width = line_number_width(content.lines().count());
-            for (i, raw) in content.lines().enumerate() {
-                let syn = syntax_lines.as_ref().and_then(|sl| sl.get(i));
-                if let Some(spans) = syn {
-                    out.extend(push_wrapped_diff_line_inner_with_theme_and_color_level(
-                        i + 1,
-                        DiffLineType::Delete,
-                        raw,
-                        width,
-                        line_number_width,
-                        Some(spans),
-                        style_context.theme,
-                        style_context.color_level,
-                        style_context.diff_backgrounds,
-                    ));
-                } else {
-                    out.extend(push_wrapped_diff_line_inner_with_theme_and_color_level(
-                        i + 1,
-                        DiffLineType::Delete,
-                        raw,
-                        width,
-                        line_number_width,
-                        /*syntax_spans*/ None,
-                        style_context.theme,
-                        style_context.color_level,
-                        style_context.diff_backgrounds,
-                    ));
-                }
+            let omitted = lines.len().saturating_sub(MAX_RENDERED_ADDED_LINES);
+            if omitted > 0 {
+                let noun = if omitted == 1 { "line" } else { "lines" };
+                out.push(format!("⋮ {omitted} {noun} omitted").dim().into());
             }
         }
+        FileChange::Delete { .. } => {}
         FileChange::Update { unified_diff, .. } => {
             if let Ok(patch) = diffy::Patch::from_str(unified_diff) {
                 let mut max_line_number = 0;
@@ -2201,7 +2178,36 @@ mod tests {
     }
 
     #[test]
-    fn delete_diff_uses_path_extension_for_highlighting() {
+    fn add_diff_shows_first_ten_lines_and_omits_the_rest() {
+        let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
+        let content = (1..=12)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        changes.insert(
+            PathBuf::from("large_write.txt"),
+            FileChange::Add { content },
+        );
+
+        let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("+line 10"));
+        assert!(!text.contains("+line 11"));
+        assert!(text.contains("⋮ 2 lines omitted"));
+    }
+
+    #[test]
+    fn delete_diff_renders_summary_without_deleted_content() {
         let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
         changes.insert(
             PathBuf::from("highlight_delete.py"),
@@ -2211,15 +2217,20 @@ mod tests {
         );
 
         let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
-        let has_rgb = lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|s| matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..))))
-        });
-        assert!(
-            has_rgb,
-            "delete diff for .py file should produce syntax-highlighted (RGB) spans"
-        );
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("• Delete highlight_delete.py (+0 -2)"));
+        assert!(!text.contains("def scale"));
+        assert!(!text.contains("return x * 2"));
     }
 
     #[test]

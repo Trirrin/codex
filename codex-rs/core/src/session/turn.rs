@@ -57,6 +57,7 @@ use crate::tools::router::ToolRouterParams;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::turn_timing::record_turn_ttft_metric;
 use crate::unavailable_tool::collect_unavailable_called_tools;
+use crate::unified_exec::ActiveShell;
 use crate::util::backoff;
 use crate::util::error_or_panic;
 use codex_analytics::AppInvocation;
@@ -981,7 +982,11 @@ async fn run_sampling_request(
     )
     .await?;
 
-    let base_instructions = sess.get_base_instructions().await;
+    let mut base_instructions = sess.get_base_instructions().await;
+    inject_active_shells_context(
+        &mut base_instructions,
+        sess.services.unified_exec_manager.active_shells().await,
+    );
 
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&router),
@@ -1099,6 +1104,30 @@ async fn run_sampling_request(
             return Err(err);
         }
     }
+}
+
+fn inject_active_shells_context(
+    base_instructions: &mut BaseInstructions,
+    shells: Vec<ActiveShell>,
+) {
+    if shells.is_empty() {
+        return;
+    }
+
+    base_instructions.text.push_str("\n\n<active_shells>\n");
+    base_instructions.text.push_str(&format!(
+        "There are {} active background shell(s) still running in this Codex process. They remain available across /new sessions by shell id:\n",
+        shells.len()
+    ));
+    for (index, shell) in shells.into_iter().enumerate() {
+        base_instructions.text.push_str(&format!(
+            "{}. {} (shell/session id: {})\n",
+            index + 1,
+            shell.command,
+            shell.shell_id
+        ));
+    }
+    base_instructions.text.push_str("</active_shells>");
 }
 
 #[expect(
@@ -2232,4 +2261,45 @@ pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -
         }
     }
     None
+}
+
+#[cfg(test)]
+mod active_shell_context_tests {
+    use super::*;
+
+    #[test]
+    fn inject_active_shells_context_adds_shell_summary() {
+        let mut instructions = BaseInstructions {
+            text: "base".to_string(),
+        };
+
+        inject_active_shells_context(
+            &mut instructions,
+            vec![ActiveShell {
+                shell_id: 12345,
+                command: "cargo run -p codex-tui".to_string(),
+                runtime: std::time::Duration::from_secs(9),
+                output: Vec::new(),
+            }],
+        );
+
+        assert!(instructions.text.contains("<active_shells>"));
+        assert!(instructions.text.contains("1 active background shell(s)"));
+        assert!(
+            instructions
+                .text
+                .contains("cargo run -p codex-tui (shell/session id: 12345)")
+        );
+    }
+
+    #[test]
+    fn inject_active_shells_context_omits_empty_list() {
+        let mut instructions = BaseInstructions {
+            text: "base".to_string(),
+        };
+
+        inject_active_shells_context(&mut instructions, Vec::new());
+
+        assert_eq!(instructions.text, "base");
+    }
 }

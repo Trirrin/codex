@@ -168,6 +168,7 @@ pub(crate) async fn execute_user_shell_command(
                 cwd: cwd.clone(),
                 parsed_cmd: parsed_cmd.clone(),
                 source: ExecCommandSource::UserShell,
+                run_mode: None,
                 interaction_input: None,
             }),
         )

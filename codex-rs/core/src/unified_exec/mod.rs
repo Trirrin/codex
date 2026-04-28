@@ -29,6 +29,7 @@ use std::sync::Weak;
 
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::protocol::ExecCommandRunMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use rand::Rng;
 use rand::rng;
@@ -90,6 +91,7 @@ pub(crate) struct ExecCommandRequest {
     pub command: Vec<String>,
     pub hook_command: String,
     pub process_id: i32,
+    pub run_mode: ExecCommandRunMode,
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
     pub workdir: Option<AbsolutePathBuf>,
@@ -110,28 +112,57 @@ pub(crate) struct WriteStdinRequest<'a> {
     pub max_output_tokens: Option<usize>,
 }
 
+#[derive(Debug)]
+pub(crate) struct ShellOutputRequest {
+    pub process_id: i32,
+    pub yield_time_ms: Option<u64>,
+    pub max_output_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveShell {
+    pub shell_id: i32,
+    pub command: String,
+    pub runtime: std::time::Duration,
+    pub output: Vec<u8>,
+}
+
 #[derive(Default)]
 pub(crate) struct ProcessStore {
     processes: HashMap<i32, ProcessEntry>,
+    completed_processes: HashMap<i32, CompletedProcessEntry>,
     reserved_process_ids: HashSet<i32>,
 }
 
 impl ProcessStore {
     fn remove(&mut self, process_id: i32) -> Option<ProcessEntry> {
         self.reserved_process_ids.remove(&process_id);
+        self.completed_processes.remove(&process_id);
         self.processes.remove(&process_id)
     }
 }
 
+pub(crate) type SharedProcessStore = Arc<Mutex<ProcessStore>>;
+
 pub(crate) struct UnifiedExecProcessManager {
-    process_store: Mutex<ProcessStore>,
+    process_store: SharedProcessStore,
     max_write_stdin_yield_time_ms: u64,
 }
 
 impl UnifiedExecProcessManager {
     pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
+        Self::new_with_store(
+            max_write_stdin_yield_time_ms,
+            Arc::new(Mutex::new(ProcessStore::default())),
+        )
+    }
+
+    pub(crate) fn new_with_store(
+        max_write_stdin_yield_time_ms: u64,
+        process_store: SharedProcessStore,
+    ) -> Self {
         Self {
-            process_store: Mutex::new(ProcessStore::default()),
+            process_store,
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
         }
@@ -146,13 +177,24 @@ impl Default for UnifiedExecProcessManager {
 
 struct ProcessEntry {
     process: Arc<UnifiedExecProcess>,
+    transcript: Arc<tokio::sync::Mutex<head_tail_buffer::HeadTailBuffer>>,
     call_id: String,
     process_id: i32,
     hook_command: String,
     tty: bool,
     network_approval_id: Option<String>,
     session: Weak<Session>,
+    started_at: tokio::time::Instant,
     last_used: tokio::time::Instant,
+}
+
+struct CompletedProcessEntry {
+    transcript: Arc<tokio::sync::Mutex<head_tail_buffer::HeadTailBuffer>>,
+    call_id: String,
+    hook_command: String,
+    exit_code: Option<i32>,
+    started_at: tokio::time::Instant,
+    completed_at: tokio::time::Instant,
 }
 
 pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {

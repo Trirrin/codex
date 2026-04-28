@@ -1055,6 +1055,7 @@ mod tests {
             vec!["bash".into(), "-lc".into(), "ls".into()],
             vec![ParsedCommand::Unknown { cmd: "ls".into() }],
             ExecCommandSource::Agent,
+            /*run_mode*/ None,
             /*interaction_input*/ None,
             /*animations_enabled*/ true,
         );
@@ -1066,6 +1067,7 @@ mod tests {
                 formatted_output: "src\nREADME.md\n".into(),
             },
             Duration::from_millis(420),
+            None,
         );
         let exec_cell: Arc<dyn HistoryCell> = Arc::new(exec_cell);
         cells.push(exec_cell);

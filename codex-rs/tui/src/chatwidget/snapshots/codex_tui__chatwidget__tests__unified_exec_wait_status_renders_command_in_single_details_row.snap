@@ -2,10 +2,14 @@
 source: tui/src/chatwidget/tests/exec_flow.rs
 expression: normalize_snapshot_paths(rendered)
 ---
-• Waiting for background terminal (0s • esc to …
+• Running cargo test -p codex-… in background
+  │ (Use down arrow to see details)
+
+• Waiting for background terminal (0s · 21 toke…
   └ cargo test -p codex-core -- --exact…
 
 
 › Ask Codex to do anything
 
   gpt-5.5 default · /tmp/project
+  1 background command running · Enter details ·

@@ -19,11 +19,10 @@ use ratatui::widgets::WidgetRef;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app_event_sender::AppEventSender;
-use crate::exec_cell::spinner;
 use crate::key_hint;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::render::renderable::Renderable;
-use crate::shimmer::shimmer_spans;
+use crate::status::format_tokens_compact;
 use crate::text_formatting::capitalize_first;
 use crate::tui::FrameRequester;
 use crate::wrapping::RtOptions;
@@ -46,10 +45,12 @@ pub(crate) struct StatusIndicatorWidget {
     details_max_lines: usize,
     /// Optional suffix rendered after the elapsed/interrupt segment.
     inline_message: Option<String>,
+    estimated_output_tokens: Option<usize>,
     show_interrupt_hint: bool,
 
     elapsed_running: Duration,
     last_resume_at: Instant,
+    next_elapsed_tick_at: Option<Instant>,
     is_paused: bool,
     app_event_tx: AppEventSender,
     frame_requester: FrameRequester,
@@ -84,9 +85,11 @@ impl StatusIndicatorWidget {
             details: None,
             details_max_lines: STATUS_DETAILS_DEFAULT_MAX_LINES,
             inline_message: None,
+            estimated_output_tokens: None,
             show_interrupt_hint: true,
             elapsed_running: Duration::ZERO,
             last_resume_at: Instant::now(),
+            next_elapsed_tick_at: None,
             is_paused: false,
 
             app_event_tx,
@@ -134,6 +137,15 @@ impl StatusIndicatorWidget {
             .filter(|message| !message.is_empty());
     }
 
+    pub(crate) fn update_estimated_output_tokens(&mut self, tokens: Option<usize>) {
+        self.estimated_output_tokens = tokens;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn estimated_output_tokens(&self) -> Option<usize> {
+        self.estimated_output_tokens
+    }
+
     #[cfg(test)]
     pub(crate) fn header(&self) -> &str {
         &self.header
@@ -166,6 +178,7 @@ impl StatusIndicatorWidget {
             return;
         }
         self.elapsed_running += now.saturating_duration_since(self.last_resume_at);
+        self.next_elapsed_tick_at = None;
         self.is_paused = true;
     }
 
@@ -175,7 +188,39 @@ impl StatusIndicatorWidget {
         }
         self.last_resume_at = now;
         self.is_paused = false;
+        self.next_elapsed_tick_at = None;
         self.frame_requester.schedule_frame();
+    }
+
+    pub(crate) fn schedule_next_elapsed_tick_at(&mut self, now: Instant) {
+        if self.is_paused {
+            self.next_elapsed_tick_at = None;
+            return;
+        }
+        if self
+            .next_elapsed_tick_at
+            .is_some_and(|scheduled| scheduled <= now)
+        {
+            self.next_elapsed_tick_at = None;
+        }
+
+        let elapsed = self.elapsed_duration_at(now);
+        let subsecond = elapsed.subsec_nanos();
+        let delay = if subsecond == 0 {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(1).saturating_sub(Duration::from_nanos(u64::from(subsecond)))
+        };
+        let next_tick = now + delay;
+        if self
+            .next_elapsed_tick_at
+            .is_some_and(|scheduled| scheduled <= next_tick)
+        {
+            return;
+        }
+
+        self.next_elapsed_tick_at = Some(next_tick);
+        self.frame_requester.schedule_frame_in(delay);
     }
 
     fn elapsed_duration_at(&self, now: Instant) -> Duration {
@@ -237,32 +282,41 @@ impl Renderable for StatusIndicatorWidget {
             return;
         }
 
-        if self.animations_enabled {
-            // Schedule next animation frame.
-            self.frame_requester
-                .schedule_frame_in(Duration::from_millis(32));
-        }
         let now = Instant::now();
         let elapsed_duration = self.elapsed_duration_at(now);
         let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());
 
         let mut spans = Vec::with_capacity(5);
-        spans.push(spinner(Some(self.last_resume_at), self.animations_enabled));
-        spans.push(" ".into());
         if self.animations_enabled {
-            spans.extend(shimmer_spans(&self.header));
-        } else if !self.header.is_empty() {
+            spans.push("•".slow_blink());
+        } else {
+            spans.push("•".dim());
+        }
+        spans.push(" ".into());
+        if !self.header.is_empty() {
             spans.push(self.header.clone().into());
         }
         spans.push(" ".into());
         if self.show_interrupt_hint {
+            let token_estimate = self.estimated_output_tokens.map(|tokens| {
+                format!(
+                    " · {} tokens",
+                    format_tokens_compact(i64::try_from(tokens).unwrap_or(i64::MAX))
+                )
+            });
             spans.extend(vec![
-                format!("({pretty_elapsed} • ").dim(),
+                format!("({pretty_elapsed}{} • ", token_estimate.unwrap_or_default()).dim(),
                 key_hint::plain(KeyCode::Esc).into(),
                 " to interrupt)".dim(),
             ]);
         } else {
-            spans.push(format!("({pretty_elapsed})").dim());
+            let token_estimate = self.estimated_output_tokens.map(|tokens| {
+                format!(
+                    " · {} tokens",
+                    format_tokens_compact(i64::try_from(tokens).unwrap_or(i64::MAX))
+                )
+            });
+            spans.push(format!("({pretty_elapsed}{})", token_estimate.unwrap_or_default()).dim());
         }
         if let Some(message) = &self.inline_message {
             // Keep optional context after elapsed/interrupt text so that core
@@ -351,6 +405,31 @@ mod tests {
     }
 
     #[test]
+    fn renders_estimated_output_tokens_after_elapsed_time() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut w = StatusIndicatorWidget::new(
+            tx,
+            crate::tui::FrameRequester::test_dummy(),
+            /*animations_enabled*/ false,
+        );
+        w.update_estimated_output_tokens(Some(1234));
+        w.is_paused = true;
+        w.elapsed_running = Duration::from_secs(5);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).expect("terminal");
+        terminal
+            .draw(|f| w.render(f.area(), f.buffer_mut()))
+            .expect("draw");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains("(5s · 1.23K tokens • esc to interrupt)"),
+            "expected token estimate after elapsed time, got {rendered:?}"
+        );
+    }
+
+    #[test]
     fn renders_wrapped_details_panama_two_lines() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
@@ -402,6 +481,38 @@ mod tests {
         widget.resume_timer_at(baseline + Duration::from_secs(10));
         let after_resume = widget.elapsed_seconds_at(baseline + Duration::from_secs(13));
         assert_eq!(after_resume, before_pause + 3);
+    }
+
+    #[test]
+    fn schedules_elapsed_tick_on_next_second_boundary() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut widget = StatusIndicatorWidget::new(
+            tx,
+            crate::tui::FrameRequester::test_dummy(),
+            /*animations_enabled*/ true,
+        );
+
+        let baseline = Instant::now();
+        widget.last_resume_at = baseline;
+        let now = baseline + Duration::from_millis(250);
+        widget.schedule_next_elapsed_tick_at(now);
+        assert_eq!(
+            widget.next_elapsed_tick_at,
+            Some(baseline + Duration::from_secs(1))
+        );
+
+        widget.schedule_next_elapsed_tick_at(now + Duration::from_millis(100));
+        assert_eq!(
+            widget.next_elapsed_tick_at,
+            Some(baseline + Duration::from_secs(1))
+        );
+
+        widget.schedule_next_elapsed_tick_at(baseline + Duration::from_secs(1));
+        assert_eq!(
+            widget.next_elapsed_tick_at,
+            Some(baseline + Duration::from_secs(2))
+        );
     }
 
     #[test]

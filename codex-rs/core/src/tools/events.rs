@@ -10,6 +10,7 @@ use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
+use codex_protocol::protocol::ExecCommandRunMode;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::protocol::FileChange;
@@ -67,6 +68,7 @@ pub(crate) async fn emit_exec_command_begin(
     cwd: &AbsolutePathBuf,
     parsed_cmd: &[ParsedCommand],
     source: ExecCommandSource,
+    run_mode: Option<ExecCommandRunMode>,
     interaction_input: Option<String>,
     process_id: Option<&str>,
 ) {
@@ -81,6 +83,7 @@ pub(crate) async fn emit_exec_command_begin(
                 cwd: cwd.clone(),
                 parsed_cmd: parsed_cmd.to_vec(),
                 source,
+                run_mode,
                 interaction_input,
             }),
         )
@@ -105,6 +108,7 @@ pub(crate) enum ToolEmitter {
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
         process_id: Option<String>,
+        run_mode: Option<ExecCommandRunMode>,
     },
 }
 
@@ -137,6 +141,7 @@ impl ToolEmitter {
         cwd: AbsolutePathBuf,
         source: ExecCommandSource,
         process_id: Option<String>,
+        run_mode: Option<ExecCommandRunMode>,
     ) -> Self {
         let parsed_cmd = parse_command(command);
         Self::UnifiedExec {
@@ -145,6 +150,7 @@ impl ToolEmitter {
             source,
             parsed_cmd,
             process_id,
+            run_mode,
         }
     }
 
@@ -164,7 +170,7 @@ impl ToolEmitter {
                     ctx,
                     ExecCommandInput::new(
                         command, cwd, parsed_cmd, *source, /*interaction_input*/ None,
-                        /*process_id*/ None,
+                        /*process_id*/ None, /*run_mode*/ None,
                     ),
                     stage,
                 )
@@ -262,6 +268,7 @@ impl ToolEmitter {
                     source,
                     parsed_cmd,
                     process_id,
+                    run_mode,
                 },
                 stage,
             ) => {
@@ -274,6 +281,7 @@ impl ToolEmitter {
                         *source,
                         /*interaction_input*/ None,
                         process_id.as_deref(),
+                        *run_mode,
                     ),
                     stage,
                 )
@@ -366,6 +374,7 @@ struct ExecCommandInput<'a> {
     source: ExecCommandSource,
     interaction_input: Option<&'a str>,
     process_id: Option<&'a str>,
+    run_mode: Option<ExecCommandRunMode>,
 }
 
 impl<'a> ExecCommandInput<'a> {
@@ -376,6 +385,7 @@ impl<'a> ExecCommandInput<'a> {
         source: ExecCommandSource,
         interaction_input: Option<&'a str>,
         process_id: Option<&'a str>,
+        run_mode: Option<ExecCommandRunMode>,
     ) -> Self {
         Self {
             command,
@@ -384,6 +394,7 @@ impl<'a> ExecCommandInput<'a> {
             source,
             interaction_input,
             process_id,
+            run_mode,
         }
     }
 }
@@ -411,6 +422,7 @@ async fn emit_exec_stage(
                 exec_input.cwd,
                 exec_input.parsed_cmd,
                 exec_input.source,
+                exec_input.run_mode,
                 exec_input.interaction_input.map(str::to_owned),
                 exec_input.process_id,
             )

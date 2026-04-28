@@ -76,6 +76,7 @@ pub(crate) struct SessionConfiguration {
 
     // TODO(pakrym): Remove config from here
     pub(super) original_config_do_not_use: Arc<Config>,
+    pub(super) unified_exec_process_store: Option<SharedProcessStore>,
     /// Optional service name tag for session metrics.
     pub(super) metrics_service_name: Option<String>,
     pub(super) app_server_client_name: Option<String>,
@@ -790,9 +791,18 @@ impl Session {
                     &config.permissions.permission_profile,
                 ))),
                 mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
-                unified_exec_manager: UnifiedExecProcessManager::new(
-                    config.background_terminal_max_timeout,
-                ),
+                unified_exec_manager: session_configuration
+                    .unified_exec_process_store
+                    .as_ref()
+                    .map_or_else(
+                        || UnifiedExecProcessManager::new(config.background_terminal_max_timeout),
+                        |store| {
+                            UnifiedExecProcessManager::new_with_store(
+                                config.background_terminal_max_timeout,
+                                Arc::clone(store),
+                            )
+                        },
+                    ),
                 shell_zsh_path: config.zsh_path.clone(),
                 main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
                 analytics_events_client,
@@ -866,6 +876,15 @@ impl Session {
             // Dispatch the SessionConfiguredEvent first and then report any errors.
             // If resuming, include converted initial messages in the payload so UIs can render them immediately.
             let initial_messages = initial_history.get_event_msgs();
+            let active_shell_events = sess
+                .services
+                .unified_exec_manager
+                .reattach_active_shell_events(
+                    Arc::clone(&sess),
+                    INITIAL_SUBMIT_ID.to_owned(),
+                    session_configuration.cwd.clone(),
+                )
+                .await;
             let events = std::iter::once(Event {
                 id: INITIAL_SUBMIT_ID.to_owned(),
                 msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
@@ -891,6 +910,7 @@ impl Session {
                     rollout_path,
                 }),
             })
+            .chain(active_shell_events.into_iter())
             .chain(post_session_configured_events.into_iter());
             for event in events {
                 sess.send_event_raw(event).await;

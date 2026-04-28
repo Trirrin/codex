@@ -3,9 +3,12 @@ source: tui/src/chatwidget/tests/exec_flow.rs
 expression: normalized_backend_snapshot(terminal.backend())
 ---
 "                                                                                "
-"• Working (0s • esc to interrupt) · 1 background terminal running · /ps to view…"
+"• Running sleep 2 in background (Use down arrow to see details)                 "
+"                                                                                "
+"• Running (0s · 10 tokens • esc to interrupt)                                   "
 "                                                                                "
 "                                                                                "
 "› Ask Codex to do anything                                                      "
 "                                                                                "
 "  gpt-5.5 default · /tmp/project                                                "
+"  1 background command running · Enter details · k kill                         "

@@ -204,7 +204,7 @@ impl App {
                 }
             }
             AppEvent::EndInitialHistoryReplayBuffer => {
-                self.finish_initial_history_replay_buffer(tui);
+                self.finish_initial_history_replay_buffer(tui)?;
             }
             AppEvent::ConsolidateAgentMessage { source, cwd } => {
                 if !self.terminal_resize_reflow_enabled() {

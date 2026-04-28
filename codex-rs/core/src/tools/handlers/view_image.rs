@@ -8,6 +8,7 @@ use codex_protocol::openai_models::InputModality;
 use codex_utils_image::PromptImageMode;
 use codex_utils_image::load_for_prompt_bytes;
 use serde::Deserialize;
+use serde::Serialize;
 
 use crate::function_tool::FunctionCallError;
 use crate::original_image_detail::can_request_original_image_detail;
@@ -29,6 +30,8 @@ const VIEW_IMAGE_UNSUPPORTED_MESSAGE: &str =
 struct ViewImageArgs {
     path: String,
     detail: Option<String>,
+    #[serde(default)]
+    include_metadata: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -147,6 +150,12 @@ impl ToolHandler for ViewImageHandler {
                     abs_path.display()
                 ))
             })?;
+        let image_metadata = args.include_metadata.then(|| ViewImageMetadata {
+            width: image.width,
+            height: image.height,
+            mime: image.mime.clone(),
+            size_bytes: image.bytes.len(),
+        });
         let image_url = image.into_data_url();
 
         session
@@ -162,6 +171,7 @@ impl ToolHandler for ViewImageHandler {
         Ok(ViewImageOutput {
             image_url,
             image_detail,
+            image_metadata,
         })
     }
 }
@@ -169,6 +179,15 @@ impl ToolHandler for ViewImageHandler {
 pub struct ViewImageOutput {
     image_url: String,
     image_detail: Option<ImageDetail>,
+    image_metadata: Option<ViewImageMetadata>,
+}
+
+#[derive(Clone, Serialize)]
+struct ViewImageMetadata {
+    width: u32,
+    height: u32,
+    mime: String,
+    size_bytes: usize,
 }
 
 impl ToolOutput for ViewImageOutput {
@@ -200,7 +219,8 @@ impl ToolOutput for ViewImageOutput {
     fn code_mode_result(&self, _payload: &ToolPayload) -> serde_json::Value {
         serde_json::json!({
             "image_url": self.image_url,
-            "detail": self.image_detail
+            "detail": self.image_detail,
+            "metadata": self.image_metadata
         })
     }
 }
@@ -216,6 +236,7 @@ mod tests {
         let output = ViewImageOutput {
             image_url: "data:image/png;base64,AAA".to_string(),
             image_detail: Some(DEFAULT_IMAGE_DETAIL),
+            image_metadata: None,
         };
 
         let result = output.code_mode_result(&ToolPayload::Function {
@@ -227,6 +248,7 @@ mod tests {
             json!({
                 "image_url": "data:image/png;base64,AAA",
                 "detail": "high",
+                "metadata": null,
             })
         );
     }

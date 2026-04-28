@@ -179,6 +179,7 @@ use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
+use codex_protocol::protocol::ExecCommandRunMode;
 use codex_protocol::protocol::ExecCommandSource;
 #[cfg(test)]
 use codex_protocol::protocol::ExitedReviewModeEvent;
@@ -326,6 +327,7 @@ use crate::bottom_pane::BottomPaneParams;
 use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::CollaborationModeIndicator;
 use crate::bottom_pane::ColumnWidthMode;
+use crate::bottom_pane::CommandActivity;
 use crate::bottom_pane::DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED;
 use crate::bottom_pane::ExperimentalFeatureItem;
 use crate::bottom_pane::ExperimentalFeaturesView;
@@ -425,18 +427,72 @@ const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it l
 const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_STATUS_LINE_ITEMS: [&str; 2] = ["model-with-reasoning", "current-dir"];
+const ESTIMATED_CHARS_PER_OUTPUT_TOKEN: usize = 4;
 // Track information about an in-flight exec command.
 struct RunningCommand {
     command: Vec<String>,
     parsed_cmd: Vec<ParsedCommand>,
     source: ExecCommandSource,
+    run_mode: Option<ExecCommandRunMode>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelActivityKind {
+    Calling,
+    Closing,
+    Generating,
+    Globing,
+    Reading,
+    Resuming,
+    Running,
+    Searching,
+    Sending,
+    Spawning,
+    Thinking,
+    Waiting,
+    Writing,
+}
+
+impl ModelActivityKind {
+    fn label(self) -> &'static str {
+        match self {
+            ModelActivityKind::Calling => "Calling",
+            ModelActivityKind::Closing => "Closing",
+            ModelActivityKind::Generating => "Generating",
+            ModelActivityKind::Globing => "Globing",
+            ModelActivityKind::Reading => "Reading",
+            ModelActivityKind::Resuming => "Resuming",
+            ModelActivityKind::Running => "Running",
+            ModelActivityKind::Searching => "Searching",
+            ModelActivityKind::Sending => "Sending",
+            ModelActivityKind::Spawning => "Spawning",
+            ModelActivityKind::Thinking => "Thinking",
+            ModelActivityKind::Waiting => "Waiting",
+            ModelActivityKind::Writing => "Writing",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveModelActivity {
+    call_id: String,
+    kinds: Vec<ModelActivityKind>,
 }
 
 struct UnifiedExecProcessSummary {
     key: String,
     call_id: String,
     command_display: String,
+    run_mode: Option<ExecCommandRunMode>,
+    started_at: Instant,
     recent_chunks: Vec<String>,
+}
+
+#[derive(Clone)]
+struct CollabAgentActivity {
+    thread_id: ThreadId,
+    label: String,
+    status: AgentStatus,
 }
 
 struct UnifiedExecWaitState {
@@ -487,6 +543,123 @@ fn is_standard_tool_call(parsed_cmd: &[ParsedCommand]) -> bool {
         && parsed_cmd
             .iter()
             .all(|parsed| !matches!(parsed, ParsedCommand::Unknown { .. }))
+}
+
+fn is_shell_output_tool_call(command: &[String]) -> bool {
+    matches!(
+        shell_tool_name(command),
+        Some("read_shell_output" | "wait_shell_output")
+    )
+}
+
+fn is_shell_management_tool_call(command: &[String]) -> bool {
+    matches!(shell_tool_name(command), Some("list_shells" | "stop_shell"))
+}
+
+fn is_shell_tool_call(command: &[String]) -> bool {
+    shell_tool_name(command).is_some()
+}
+
+fn shell_tool_name(command: &[String]) -> Option<&str> {
+    command
+        .last()
+        .and_then(|script| script.split_whitespace().next())
+        .filter(|name| {
+            matches!(
+                *name,
+                "read_shell_output" | "wait_shell_output" | "list_shells" | "stop_shell"
+            )
+        })
+}
+
+fn dedupe_activity_kinds(
+    kinds: impl IntoIterator<Item = ModelActivityKind>,
+) -> Vec<ModelActivityKind> {
+    let mut deduped = Vec::new();
+    for kind in kinds {
+        if !deduped.contains(&kind) {
+            deduped.push(kind);
+        }
+    }
+    deduped
+}
+
+fn model_activity_header(kinds: &[ModelActivityKind]) -> Option<String> {
+    let labels = kinds
+        .iter()
+        .take(3)
+        .map(|kind| kind.label())
+        .collect::<Vec<_>>();
+    match labels.as_slice() {
+        [] => None,
+        [one] => Some((*one).to_string()),
+        [first, second] => Some(format!("{first} and {second}")),
+        [first, second, third] => Some(format!("{first}, {second} and {third}")),
+        _ => unreachable!("activity labels are capped at three"),
+    }
+}
+
+fn model_activity_kind_for_parsed_command(parsed: &ParsedCommand) -> ModelActivityKind {
+    match parsed {
+        ParsedCommand::Read { .. } => ModelActivityKind::Reading,
+        ParsedCommand::ListFiles { .. } => ModelActivityKind::Globing,
+        ParsedCommand::Search { .. } => ModelActivityKind::Searching,
+        ParsedCommand::Unknown { .. } => ModelActivityKind::Running,
+    }
+}
+
+fn model_activity_kinds_for_exec(
+    command: &[String],
+    parsed_cmd: &[ParsedCommand],
+) -> Vec<ModelActivityKind> {
+    let parsed_kinds = dedupe_activity_kinds(
+        parsed_cmd
+            .iter()
+            .map(model_activity_kind_for_parsed_command),
+    );
+    if !parsed_kinds.is_empty() {
+        return parsed_kinds;
+    }
+
+    if is_shell_output_tool_call(command) {
+        return vec![ModelActivityKind::Reading];
+    }
+    if is_shell_management_tool_call(command) {
+        return vec![ModelActivityKind::Running];
+    }
+
+    vec![ModelActivityKind::Running]
+}
+
+fn model_activity_kind_for_tool_name(tool_name: &str) -> ModelActivityKind {
+    let normalized = tool_name.to_ascii_lowercase();
+    if normalized.contains("search")
+        || normalized.contains("find")
+        || normalized.contains("grep")
+        || normalized.contains("query")
+    {
+        ModelActivityKind::Searching
+    } else if normalized.contains("read")
+        || normalized.contains("view")
+        || normalized.contains("fetch")
+        || normalized.contains("get")
+        || normalized.contains("open")
+    {
+        ModelActivityKind::Reading
+    } else if normalized.contains("write")
+        || normalized.contains("edit")
+        || normalized.contains("update")
+        || normalized.contains("create")
+        || normalized.contains("patch")
+    {
+        ModelActivityKind::Writing
+    } else if normalized.contains("glob") || normalized.contains("list") {
+        ModelActivityKind::Globing
+    } else if normalized.contains("generate") {
+        ModelActivityKind::Generating
+    } else {
+        ModelActivityKind::Calling
+    }
 }
 
 const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
@@ -856,8 +1029,11 @@ pub(crate) struct ChatWidget {
     /// emitted.
     saw_copy_source_this_turn: bool,
     running_commands: HashMap<String, RunningCommand>,
+    active_model_activities: Vec<ActiveModelActivity>,
+    background_unified_exec_call_ids: HashSet<String>,
     collab_agent_metadata: HashMap<ThreadId, CollabAgentMetadata>,
     pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
+    collab_agent_activities: Vec<CollabAgentActivity>,
     suppressed_exec_calls: HashSet<String>,
     skills_all: Vec<ProtocolSkillMetadata>,
     skills_initial_state: Option<HashMap<AbsolutePathBuf, bool>>,
@@ -1007,6 +1183,8 @@ pub(crate) struct ChatWidget {
     plan_delta_buffer: String,
     // True while a plan item is streaming.
     plan_item_active: bool,
+    // Estimated model output for the active turn, counted as streamed characters / 4.
+    output_chars_this_turn: usize,
     // Status-indicator elapsed seconds captured at the last emitted final-message separator.
     //
     // This lets the separator show per-chunk work time (since the previous separator) rather than
@@ -1123,6 +1301,7 @@ pub(crate) struct UserMessage {
 enum UserMessageHistoryRecord {
     UserMessageText,
     Override(UserMessageHistoryOverride),
+    Hidden,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1387,6 +1566,7 @@ fn remap_placeholders_for_message_and_history_record(
                 text_elements,
             })
         }
+        UserMessageHistoryRecord::Hidden => UserMessageHistoryRecord::Hidden,
         record => record,
     };
 
@@ -1489,6 +1669,13 @@ fn user_message_for_restore(
         UserMessageHistoryRecord::Override(_) | UserMessageHistoryRecord::UserMessageText => {
             message
         }
+        UserMessageHistoryRecord::Hidden => UserMessage {
+            text: String::new(),
+            local_images: Vec::new(),
+            remote_image_urls: Vec::new(),
+            text_elements: Vec::new(),
+            mention_bindings: Vec::new(),
+        },
     }
 }
 
@@ -1503,6 +1690,7 @@ fn user_message_preview_text(
         Some(UserMessageHistoryRecord::Override(_))
         | Some(UserMessageHistoryRecord::UserMessageText)
         | None => message.text.clone(),
+        Some(UserMessageHistoryRecord::Hidden) => String::new(),
     }
 }
 
@@ -1526,6 +1714,16 @@ fn user_message_event_for_display(
 fn merge_user_messages_with_history_record(
     messages: Vec<(UserMessage, UserMessageHistoryRecord)>,
 ) -> (UserMessage, UserMessageHistoryRecord) {
+    let messages = messages
+        .into_iter()
+        .filter(|(_, record)| *record != UserMessageHistoryRecord::Hidden)
+        .collect::<Vec<_>>();
+    if messages.is_empty() {
+        return (
+            UserMessage::from(String::new()),
+            UserMessageHistoryRecord::Hidden,
+        );
+    }
     let messages = remap_user_messages_with_history_records(messages);
     let history_record = if messages
         .iter()
@@ -1558,6 +1756,7 @@ fn merge_user_messages_with_history_record(
                 | UserMessageHistoryRecord::UserMessageText => {
                     append_history_segment(&message.text, message.text_elements.clone());
                 }
+                UserMessageHistoryRecord::Hidden => {}
             }
         }
         UserMessageHistoryRecord::Override(UserMessageHistoryOverride {
@@ -1799,6 +1998,13 @@ fn app_server_collab_state_to_core(state: &AppServerCollabAgentState) -> AgentSt
     }
 }
 
+fn is_final_agent_status(status: &AgentStatus) -> bool {
+    !matches!(
+        status,
+        AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted
+    )
+}
+
 /// Converts app-server collab agent states into the core protocol representation, enriching each
 /// entry with cached nickname and role metadata so rendered items show human-readable names.
 fn app_server_collab_agent_statuses_to_core(
@@ -1992,9 +2198,79 @@ impl ChatWidget {
             self.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
             self.set_status_header(header);
         } else if self.bottom_pane.is_task_running() {
-            self.terminal_title_status_kind = TerminalTitleStatusKind::Working;
-            self.set_status_header(String::from("Working"));
+            self.refresh_model_activity_status();
         }
+    }
+
+    fn upsert_model_activity(&mut self, call_id: String, kinds: Vec<ModelActivityKind>) {
+        let kinds = dedupe_activity_kinds(kinds);
+        if kinds.is_empty() {
+            return;
+        }
+
+        if let Some(activity) = self
+            .active_model_activities
+            .iter_mut()
+            .find(|activity| activity.call_id == call_id)
+        {
+            activity.kinds = kinds;
+        } else {
+            self.active_model_activities
+                .push(ActiveModelActivity { call_id, kinds });
+        }
+        self.refresh_model_activity_status();
+    }
+
+    fn remove_model_activity(&mut self, call_id: &str) {
+        let before = self.active_model_activities.len();
+        self.active_model_activities
+            .retain(|activity| activity.call_id != call_id);
+        if self.active_model_activities.len() != before {
+            self.refresh_model_activity_status();
+        }
+    }
+
+    fn clear_model_activities(&mut self) {
+        self.active_model_activities.clear();
+    }
+
+    fn current_model_activity_header(&self) -> Option<String> {
+        let kinds = dedupe_activity_kinds(
+            self.active_model_activities
+                .iter()
+                .flat_map(|activity| activity.kinds.iter().copied()),
+        );
+        model_activity_header(&kinds)
+    }
+
+    fn refresh_model_activity_status(&mut self) {
+        if (!self.bottom_pane.is_task_running() && self.bottom_pane.status_widget().is_none())
+            || !self.pending_guardian_review_status.is_empty()
+            || matches!(
+                self.terminal_title_status_kind,
+                TerminalTitleStatusKind::Undoing
+                    | TerminalTitleStatusKind::WaitingForBackgroundTerminal
+            )
+        {
+            return;
+        }
+
+        let (kind, header) = if let Some(header) = extract_first_bold(&self.reasoning_buffer) {
+            (TerminalTitleStatusKind::Thinking, header)
+        } else if !self.reasoning_buffer.is_empty() {
+            (
+                TerminalTitleStatusKind::Thinking,
+                ModelActivityKind::Thinking.label().to_string(),
+            )
+        } else if let Some(header) = self.current_model_activity_header() {
+            (TerminalTitleStatusKind::Working, header)
+        } else {
+            (TerminalTitleStatusKind::Working, String::from("Working"))
+        };
+
+        self.bottom_pane.ensure_status_indicator();
+        self.terminal_title_status_kind = kind;
+        self.set_status_header(header);
     }
 
     fn flush_unified_exec_wait_streak(&mut self) {
@@ -2583,6 +2859,7 @@ impl ChatWidget {
     }
 
     fn on_agent_message_delta(&mut self, delta: String) {
+        self.record_model_output_delta(&delta);
         self.handle_streaming_delta(delta);
     }
 
@@ -2590,6 +2867,7 @@ impl ChatWidget {
         if self.active_mode_kind() != ModeKind::Plan {
             return;
         }
+        self.record_model_output_delta(&delta);
         if !self.plan_item_active {
             self.plan_item_active = true;
             self.plan_delta_buffer.clear();
@@ -2658,6 +2936,7 @@ impl ChatWidget {
     }
 
     fn on_agent_reasoning_delta(&mut self, delta: String) {
+        self.record_model_output_delta(&delta);
         // For reasoning deltas, do not stream to history. Accumulate the
         // current reasoning block and extract the first bold element
         // (between **/**) as the chunk header. Show this header as status.
@@ -2674,9 +2953,35 @@ impl ChatWidget {
             self.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
             self.set_status_header(header);
         } else {
-            // Fallback while we don't yet have a bold header: leave existing header as-is.
+            self.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
+            self.set_status_header(ModelActivityKind::Thinking.label().to_string());
         }
         self.request_redraw();
+    }
+
+    fn record_model_output_delta(&mut self, delta: &str) {
+        if !self.agent_turn_running || delta.is_empty() {
+            return;
+        }
+
+        self.output_chars_this_turn = self
+            .output_chars_this_turn
+            .saturating_add(delta.chars().count());
+        self.bottom_pane.set_estimated_output_tokens(Some(
+            self.output_chars_this_turn
+                .div_ceil(ESTIMATED_CHARS_PER_OUTPUT_TOKEN),
+        ));
+    }
+
+    fn record_model_output_json(&mut self, value: &impl serde::Serialize) {
+        if !self.agent_turn_running {
+            return;
+        }
+
+        match serde_json::to_string(value) {
+            Ok(serialized) => self.record_model_output_delta(&serialized),
+            Err(err) => warn!("failed to estimate model output tokens from JSON value: {err}"),
+        }
     }
 
     fn on_agent_reasoning_final(&mut self) {
@@ -2691,6 +2996,7 @@ impl ChatWidget {
         }
         self.reasoning_buffer.clear();
         self.full_reasoning_buffer.clear();
+        self.refresh_model_activity_status();
         self.request_redraw();
     }
 
@@ -2715,8 +3021,10 @@ impl ChatWidget {
         self.latest_proposed_plan_markdown = None;
         self.plan_delta_buffer.clear();
         self.plan_item_active = false;
+        self.output_chars_this_turn = 0;
         self.adaptive_chunking.reset();
         self.plan_stream_controller = None;
+        self.clear_model_activities();
         self.turn_runtime_metrics = RuntimeMetricsSummary::default();
         self.session_telemetry.reset_runtime_metrics();
         self.bottom_pane.clear_quit_shortcut_hint();
@@ -2730,6 +3038,7 @@ impl ChatWidget {
         self.pending_status_indicator_restore = false;
         self.bottom_pane
             .set_interrupt_hint_visible(/*visible*/ true);
+        self.bottom_pane.set_estimated_output_tokens(Some(0));
         self.terminal_title_status_kind = TerminalTitleStatusKind::Working;
         self.set_status_header(String::from("Working"));
         self.full_reasoning_buffer.clear();
@@ -2807,10 +3116,14 @@ impl ChatWidget {
         self.user_turn_pending_start = false;
         self.agent_turn_running = false;
         self.goal_status_active_turn_started_at = None;
+        self.output_chars_this_turn = 0;
+        self.bottom_pane.set_estimated_output_tokens(None);
         self.turn_sleep_inhibitor
             .set_turn_running(/*turn_running*/ false);
         self.update_task_running_state();
         self.running_commands.clear();
+        self.clear_model_activities();
+        self.background_unified_exec_call_ids.clear();
         self.suppressed_exec_calls.clear();
         self.last_unified_wait = None;
         self.unified_exec_wait_streak = None;
@@ -3275,6 +3588,7 @@ impl ChatWidget {
             .set_turn_running(/*turn_running*/ false);
         self.update_task_running_state();
         self.running_commands.clear();
+        self.background_unified_exec_call_ids.clear();
         self.suppressed_exec_calls.clear();
         self.last_unified_wait = None;
         self.unified_exec_wait_streak = None;
@@ -4063,12 +4377,12 @@ impl ChatWidget {
                     status.details_max_lines,
                 );
             } else if self.current_status.is_guardian_review() {
-                self.set_status_header(String::from("Working"));
+                self.refresh_model_activity_status();
             }
         } else if self.pending_guardian_review_status.is_empty()
             && self.current_status.is_guardian_review()
         {
-            self.set_status_header(String::from("Working"));
+            self.refresh_model_activity_status();
         }
 
         if ev.status == GuardianAssessmentStatus::Approved {
@@ -4209,7 +4523,10 @@ impl ChatWidget {
             }
             // Unified exec may be parsed as Unknown; keep the working indicator visible regardless.
             self.bottom_pane.ensure_status_indicator();
-            if !is_standard_tool_call(&ev.parsed_cmd) {
+            if ev.source != ExecCommandSource::UnifiedExecStartup
+                && !is_shell_tool_call(&ev.command)
+                && !is_standard_tool_call(&ev.parsed_cmd)
+            {
                 return;
             }
         }
@@ -4218,7 +4535,12 @@ impl ChatWidget {
     }
 
     fn on_exec_command_output_delta(&mut self, ev: ExecCommandOutputDeltaEvent) {
-        self.track_unified_exec_output_chunk(&ev.call_id, &ev.chunk);
+        if self.track_unified_exec_output_chunk(&ev.call_id, &ev.chunk) {
+            self.sync_unified_exec_footer();
+        }
+        if self.background_unified_exec_call_ids.contains(&ev.call_id) {
+            return;
+        }
         if !self.bottom_pane.is_task_running() {
             return;
         }
@@ -4292,6 +4614,8 @@ impl ChatWidget {
     }
 
     fn on_patch_apply_begin(&mut self, event: PatchApplyBeginEvent) {
+        self.record_model_output_json(&event.changes);
+        self.upsert_model_activity(event.call_id.clone(), vec![ModelActivityKind::Writing]);
         self.add_to_history(history_cell::new_patch_event(
             event.changes,
             &self.config.cwd,
@@ -4300,6 +4624,7 @@ impl ChatWidget {
 
     fn on_view_image_tool_call(&mut self, event: ViewImageToolCallEvent) {
         self.flush_answer_stream_with_separator();
+        self.record_model_output_json(&event.path);
         self.add_to_history(history_cell::new_view_image_tool_call(
             event.path,
             &self.config.cwd,
@@ -4307,12 +4632,15 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn on_image_generation_begin(&mut self, _event: ImageGenerationBeginEvent) {
+    fn on_image_generation_begin(&mut self, event: ImageGenerationBeginEvent) {
+        self.record_model_output_delta(&event.call_id);
+        self.upsert_model_activity(event.call_id, vec![ModelActivityKind::Generating]);
         self.flush_answer_stream_with_separator();
     }
 
     fn on_image_generation_end(&mut self, event: ImageGenerationEndEvent) {
         self.flush_answer_stream_with_separator();
+        self.remove_model_activity(&event.call_id);
         self.add_to_history(history_cell::new_image_generation_call(
             event.call_id,
             event.revised_prompt,
@@ -4339,8 +4667,40 @@ impl ChatWidget {
             {
                 self.flush_unified_exec_wait_streak();
             }
+            let shell_exit_message = ev.process_id.as_deref().and_then(|shell_id| {
+                let process = self
+                    .unified_exec_processes
+                    .iter()
+                    .find(|process| process.key == shell_id)?;
+                if ev.source != ExecCommandSource::UnifiedExecStartup
+                    || !matches!(process.run_mode, Some(ExecCommandRunMode::Background))
+                    || (self.running_commands.contains_key(&ev.call_id)
+                        && process.call_id == ev.call_id)
+                {
+                    return None;
+                }
+                Some(format!(
+                    "Background shell {shell_id} exited with code {}.\nCommand: {}\n\nUse read_shell_output with shell_id {shell_id} if you need the final output.",
+                    ev.exit_code, process.command_display
+                ))
+            });
+            let task_was_running = self.bottom_pane.is_task_running();
             self.track_unified_exec_process_end(&ev);
-            if !self.bottom_pane.is_task_running() {
+            if let Some(message) = shell_exit_message {
+                let user_message = UserMessage {
+                    text: message,
+                    local_images: Vec::new(),
+                    remote_image_urls: Vec::new(),
+                    text_elements: Vec::new(),
+                    mention_bindings: Vec::new(),
+                };
+                self.submit_user_message_with_history_and_shell_escape_policy(
+                    user_message,
+                    UserMessageHistoryRecord::Hidden,
+                    ShellEscapePolicy::Disallow,
+                );
+            }
+            if !task_was_running {
                 return;
             }
         }
@@ -4361,12 +4721,16 @@ impl ChatWidget {
         {
             existing.call_id = ev.call_id.clone();
             existing.command_display = command_display;
+            existing.run_mode = ev.run_mode;
+            existing.started_at = Instant::now();
             existing.recent_chunks.clear();
         } else {
             self.unified_exec_processes.push(UnifiedExecProcessSummary {
                 key,
                 call_id: ev.call_id.clone(),
                 command_display,
+                run_mode: ev.run_mode,
+                started_at: Instant::now(),
                 recent_chunks: Vec::new(),
             });
         }
@@ -4374,7 +4738,19 @@ impl ChatWidget {
     }
 
     fn track_unified_exec_process_end(&mut self, ev: &ExecCommandEndEvent) {
+        if ev.source != ExecCommandSource::UnifiedExecStartup {
+            return;
+        }
         let key = ev.process_id.clone().unwrap_or(ev.call_id.to_string());
+        let is_initial_background_tool_response = self.running_commands.contains_key(&ev.call_id)
+            && self.unified_exec_processes.iter().any(|process| {
+                process.key == key
+                    && process.call_id == ev.call_id
+                    && matches!(process.run_mode, Some(ExecCommandRunMode::Background))
+            });
+        if is_initial_background_tool_response {
+            return;
+        }
         let before = self.unified_exec_processes.len();
         self.unified_exec_processes
             .retain(|process| process.key != key);
@@ -4387,21 +4763,77 @@ impl ChatWidget {
         let processes = self
             .unified_exec_processes
             .iter()
-            .map(|process| process.command_display.clone())
+            .map(|process| CommandActivity {
+                command: process.command_display.clone(),
+                shell_id: process.key.clone(),
+                run_mode: process.run_mode,
+                started_at: process.started_at,
+                status: "running".to_string(),
+                recent_output: process.recent_chunks.clone(),
+            })
             .collect();
         self.bottom_pane.set_unified_exec_processes(processes);
     }
 
+    fn sync_collab_agent_footer(&mut self) {
+        let subagents = self
+            .collab_agent_activities
+            .iter()
+            .filter(|agent| !is_final_agent_status(&agent.status))
+            .map(|agent| agent.label.clone())
+            .collect();
+        self.bottom_pane.set_background_subagents(subagents);
+    }
+
+    fn track_collab_agent_status(
+        &mut self,
+        thread_id: ThreadId,
+        nickname: Option<String>,
+        role: Option<String>,
+        status: AgentStatus,
+    ) {
+        let label = nickname
+            .filter(|nickname| !nickname.is_empty())
+            .or(role.filter(|role| !role.is_empty()))
+            .unwrap_or_else(|| thread_id.to_string());
+        if is_final_agent_status(&status) {
+            let before = self.collab_agent_activities.len();
+            self.collab_agent_activities
+                .retain(|agent| agent.thread_id != thread_id);
+            if before != self.collab_agent_activities.len() {
+                self.sync_collab_agent_footer();
+            }
+            return;
+        }
+
+        if let Some(agent) = self
+            .collab_agent_activities
+            .iter_mut()
+            .find(|agent| agent.thread_id == thread_id)
+        {
+            agent.label = label;
+            agent.status = status;
+        } else {
+            self.collab_agent_activities.push(CollabAgentActivity {
+                thread_id,
+                label,
+                status,
+            });
+        }
+        self.sync_collab_agent_footer();
+    }
+
     /// Record recent stdout/stderr lines for the unified exec footer.
-    fn track_unified_exec_output_chunk(&mut self, call_id: &str, chunk: &[u8]) {
+    fn track_unified_exec_output_chunk(&mut self, call_id: &str, chunk: &[u8]) -> bool {
         let Some(process) = self
             .unified_exec_processes
             .iter_mut()
             .find(|process| process.call_id == call_id)
         else {
-            return;
+            return false;
         };
 
+        let before = process.recent_chunks.len();
         let text = String::from_utf8_lossy(chunk);
         for line in text
             .lines()
@@ -4411,11 +4843,12 @@ impl ChatWidget {
             process.recent_chunks.push(line.to_string());
         }
 
-        const MAX_RECENT_CHUNKS: usize = 3;
+        const MAX_RECENT_CHUNKS: usize = 200;
         if process.recent_chunks.len() > MAX_RECENT_CHUNKS {
             let drop_count = process.recent_chunks.len() - MAX_RECENT_CHUNKS;
             process.recent_chunks.drain(0..drop_count);
         }
+        process.recent_chunks.len() != before
     }
 
     fn on_mcp_tool_call_begin(&mut self, ev: McpToolCallBeginEvent) {
@@ -4428,9 +4861,22 @@ impl ChatWidget {
         self.defer_or_handle(|q| q.push_mcp_end(ev), |s| s.handle_mcp_end_now(ev2));
     }
 
+    fn on_dynamic_tool_call_begin(&mut self, call_id: String, tool: &str) {
+        self.record_model_output_delta(tool);
+        self.upsert_model_activity(call_id, vec![model_activity_kind_for_tool_name(tool)]);
+        self.request_redraw();
+    }
+
+    fn on_dynamic_tool_call_end(&mut self, call_id: &str) {
+        self.remove_model_activity(call_id);
+        self.request_redraw();
+    }
+
     fn on_web_search_begin(&mut self, ev: WebSearchBeginEvent) {
         self.flush_answer_stream_with_separator();
         self.flush_active_cell();
+        self.record_model_output_delta(&ev.call_id);
+        self.upsert_model_activity(ev.call_id.clone(), vec![ModelActivityKind::Searching]);
         self.active_cell = Some(Box::new(history_cell::new_active_web_search_call(
             ev.call_id,
             String::new(),
@@ -4447,6 +4893,7 @@ impl ChatWidget {
             query,
             action,
         } = ev;
+        self.remove_model_activity(&call_id);
         let mut handled = false;
         if let Some(cell) = self
             .active_cell
@@ -4497,6 +4944,19 @@ impl ChatWidget {
         let first_receiver_metadata =
             first_receiver.map(|thread_id| self.collab_agent_metadata(thread_id));
 
+        let activity_kind = match &tool {
+            CollabAgentTool::SpawnAgent => ModelActivityKind::Spawning,
+            CollabAgentTool::SendInput => ModelActivityKind::Sending,
+            CollabAgentTool::ResumeAgent => ModelActivityKind::Resuming,
+            CollabAgentTool::Wait => ModelActivityKind::Waiting,
+            CollabAgentTool::CloseAgent => ModelActivityKind::Closing,
+        };
+        if matches!(status, CollabAgentToolCallStatus::InProgress) {
+            self.upsert_model_activity(id.clone(), vec![activity_kind]);
+        } else {
+            self.remove_model_activity(&id);
+        }
+
         match tool {
             CollabAgentTool::SpawnAgent => {
                 if let (Some(model), Some(reasoning_effort)) = (model.clone(), reasoning_effort) {
@@ -4521,6 +4981,23 @@ impl ChatWidget {
                                     }
                                 })
                         });
+                    let spawned_status = first_receiver
+                        .as_ref()
+                        .and_then(|thread_id| agents_states.get(&thread_id.to_string()))
+                        .map(app_server_collab_state_to_core)
+                        .unwrap_or_else(|| AgentStatus::Errored("Agent spawn failed".into()));
+                    if let Some(thread_id) = first_receiver {
+                        self.track_collab_agent_status(
+                            thread_id,
+                            first_receiver_metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.agent_nickname.clone()),
+                            first_receiver_metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.agent_role.clone()),
+                            spawned_status.clone(),
+                        );
+                    }
                     self.on_collab_event(multi_agents::spawn_end(
                         codex_protocol::protocol::CollabAgentSpawnEndEvent {
                             call_id: id,
@@ -4535,13 +5012,7 @@ impl ChatWidget {
                             prompt: prompt.unwrap_or_default(),
                             model: String::new(),
                             reasoning_effort: ReasoningEffortConfig::Medium,
-                            status: first_receiver
-                                .as_ref()
-                                .and_then(|thread_id| agents_states.get(&thread_id.to_string()))
-                                .map(app_server_collab_state_to_core)
-                                .unwrap_or_else(|| {
-                                    AgentStatus::Errored("Agent spawn failed".into())
-                                }),
+                            status: spawned_status,
                         },
                         spawn_request.as_ref(),
                     ));
@@ -4551,6 +5022,21 @@ impl ChatWidget {
                 if let Some(receiver_thread_id) = first_receiver
                     && !matches!(status, CollabAgentToolCallStatus::InProgress)
                 {
+                    let interaction_status = receiver_thread_ids
+                        .iter()
+                        .find_map(|thread_id| agents_states.get(thread_id))
+                        .map(app_server_collab_state_to_core)
+                        .unwrap_or_else(|| AgentStatus::Errored("Agent interaction failed".into()));
+                    self.track_collab_agent_status(
+                        receiver_thread_id,
+                        first_receiver_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.agent_nickname.clone()),
+                        first_receiver_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.agent_role.clone()),
+                        interaction_status.clone(),
+                    );
                     self.on_collab_event(multi_agents::interaction_end(
                         codex_protocol::protocol::CollabAgentInteractionEndEvent {
                             call_id: id,
@@ -4563,13 +5049,7 @@ impl ChatWidget {
                                 .as_ref()
                                 .and_then(|metadata| metadata.agent_role.clone()),
                             prompt: prompt.unwrap_or_default(),
-                            status: receiver_thread_ids
-                                .iter()
-                                .find_map(|thread_id| agents_states.get(thread_id))
-                                .map(app_server_collab_state_to_core)
-                                .unwrap_or_else(|| {
-                                    AgentStatus::Errored("Agent interaction failed".into())
-                                }),
+                            status: interaction_status,
                         },
                     ));
                 }
@@ -4638,6 +5118,14 @@ impl ChatWidget {
                         &agents_states,
                         &self.collab_agent_metadata,
                     );
+                    for entry in &agent_statuses {
+                        self.track_collab_agent_status(
+                            entry.thread_id,
+                            entry.agent_nickname.clone(),
+                            entry.agent_role.clone(),
+                            entry.status.clone(),
+                        );
+                    }
                     self.on_collab_event(multi_agents::waiting_end(
                         codex_protocol::protocol::CollabWaitingEndEvent {
                             sender_thread_id,
@@ -4652,6 +5140,21 @@ impl ChatWidget {
                 if let Some(receiver_thread_id) = first_receiver
                     && !matches!(status, CollabAgentToolCallStatus::InProgress)
                 {
+                    let close_status = receiver_thread_ids
+                        .iter()
+                        .find_map(|thread_id| agents_states.get(thread_id))
+                        .map(app_server_collab_state_to_core)
+                        .unwrap_or_else(|| AgentStatus::Errored("Agent close failed".into()));
+                    self.track_collab_agent_status(
+                        receiver_thread_id,
+                        first_receiver_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.agent_nickname.clone()),
+                        first_receiver_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.agent_role.clone()),
+                        AgentStatus::Shutdown,
+                    );
                     self.on_collab_event(multi_agents::close_end(
                         codex_protocol::protocol::CollabCloseEndEvent {
                             call_id: id,
@@ -4663,13 +5166,7 @@ impl ChatWidget {
                             receiver_agent_role: first_receiver_metadata
                                 .as_ref()
                                 .and_then(|metadata| metadata.agent_role.clone()),
-                            status: receiver_thread_ids
-                                .iter()
-                                .find_map(|thread_id| agents_states.get(thread_id))
-                                .map(app_server_collab_state_to_core)
-                                .unwrap_or_else(|| {
-                                    AgentStatus::Errored("Agent close failed".into())
-                                }),
+                            status: close_status,
                         },
                     ));
                 }
@@ -5078,17 +5575,34 @@ impl ChatWidget {
             NewCell,
         }
 
+        self.remove_model_activity(&ev.call_id);
         let running = self.running_commands.remove(&ev.call_id);
         if self.suppressed_exec_calls.remove(&ev.call_id) {
             return;
         }
-        let (command, parsed, source) = match running {
-            Some(rc) => (rc.command, rc.parsed_cmd, rc.source),
-            None => (ev.command.clone(), ev.parsed_cmd.clone(), ev.source),
+        let was_background_unified_exec = self.background_unified_exec_call_ids.remove(&ev.call_id);
+        let (command, parsed, source, run_mode) = match running {
+            Some(rc) => (rc.command, rc.parsed_cmd, rc.source, rc.run_mode),
+            None => (ev.command.clone(), ev.parsed_cmd.clone(), ev.source, None),
         };
+        let is_background_unified_exec = was_background_unified_exec
+            || matches!(run_mode, Some(ExecCommandRunMode::Background))
+            || (run_mode.is_none()
+                && matches!(source, ExecCommandSource::UnifiedExecStartup)
+                && ev.process_id.is_some());
+        let run_mode = if is_background_unified_exec {
+            Some(ExecCommandRunMode::Background)
+        } else {
+            run_mode
+        };
+        if is_background_unified_exec {
+            self.had_work_activity = true;
+            return;
+        }
         let parsed = self.annotate_skill_reads_in_parsed_cmd(parsed);
         let is_unified_exec_interaction =
             matches!(source, ExecCommandSource::UnifiedExecInteraction);
+        let is_shell_tool = is_shell_tool_call(&command);
         let is_user_shell = source == ExecCommandSource::UserShell;
         let end_target = match self.active_cell.as_ref() {
             Some(cell) => match cell.as_any().downcast_ref::<ExecCell>() {
@@ -5109,19 +5623,20 @@ impl ChatWidget {
 
         // Unified exec interaction rows intentionally hide command output text in the exec cell and
         // instead render the interaction-specific content elsewhere in the UI.
-        let output = if is_unified_exec_interaction {
-            CommandOutput {
-                exit_code: ev.exit_code,
-                formatted_output: String::new(),
-                aggregated_output: String::new(),
-            }
-        } else {
-            CommandOutput {
-                exit_code: ev.exit_code,
-                formatted_output: ev.formatted_output.clone(),
-                aggregated_output: ev.aggregated_output.clone(),
-            }
-        };
+        let output =
+            if (is_unified_exec_interaction && !is_shell_tool) || is_background_unified_exec {
+                CommandOutput {
+                    exit_code: ev.exit_code,
+                    formatted_output: String::new(),
+                    aggregated_output: String::new(),
+                }
+            } else {
+                CommandOutput {
+                    exit_code: ev.exit_code,
+                    formatted_output: ev.formatted_output.clone(),
+                    aggregated_output: ev.aggregated_output.clone(),
+                }
+            };
 
         match end_target {
             ExecEndTarget::ActiveTracked => {
@@ -5130,14 +5645,10 @@ impl ChatWidget {
                     .as_mut()
                     .and_then(|c| c.as_any_mut().downcast_mut::<ExecCell>())
                 {
-                    let completed = cell.complete_call(&ev.call_id, output, ev.duration);
+                    let completed = cell.complete_call(&ev.call_id, output, ev.duration, run_mode);
                     debug_assert!(completed, "active exec cell should contain {}", ev.call_id);
-                    if cell.should_flush() {
-                        self.flush_active_cell();
-                    } else {
-                        self.bump_active_cell_revision();
-                        self.request_redraw();
-                    }
+                    self.bump_active_cell_revision();
+                    self.request_redraw();
                 }
             }
             ExecEndTarget::OrphanHistoryWhileActiveExec => {
@@ -5146,10 +5657,11 @@ impl ChatWidget {
                     command,
                     parsed,
                     source,
+                    run_mode,
                     ev.interaction_input.clone(),
                     self.config.animations,
                 );
-                let completed = orphan.complete_call(&ev.call_id, output, ev.duration);
+                let completed = orphan.complete_call(&ev.call_id, output, ev.duration, run_mode);
                 debug_assert!(
                     completed,
                     "new orphan exec cell should contain {}",
@@ -5167,10 +5679,11 @@ impl ChatWidget {
                     command,
                     parsed,
                     source,
+                    run_mode,
                     ev.interaction_input.clone(),
                     self.config.animations,
                 );
-                let completed = cell.complete_call(&ev.call_id, output, ev.duration);
+                let completed = cell.complete_call(&ev.call_id, output, ev.duration, run_mode);
                 debug_assert!(completed, "new exec cell should contain {}", ev.call_id);
                 if cell.should_flush() {
                     self.add_to_history(cell);
@@ -5192,6 +5705,7 @@ impl ChatWidget {
         &mut self,
         event: codex_protocol::protocol::PatchApplyEndEvent,
     ) {
+        self.remove_model_activity(&event.call_id);
         // If the patch was successful, just let the "Edited" block stand.
         // Otherwise, add a failure block.
         if !event.success {
@@ -5315,15 +5829,24 @@ impl ChatWidget {
         // Ensure the status indicator is visible while the command runs.
         self.bottom_pane.ensure_status_indicator();
         let parsed_cmd = self.annotate_skill_reads_in_parsed_cmd(ev.parsed_cmd.clone());
+        let run_mode = ev.run_mode;
+        if matches!(run_mode, Some(ExecCommandRunMode::Background))
+            && matches!(ev.source, ExecCommandSource::UnifiedExecStartup)
+        {
+            self.background_unified_exec_call_ids
+                .insert(ev.call_id.clone());
+        }
         self.running_commands.insert(
             ev.call_id.clone(),
             RunningCommand {
                 command: ev.command.clone(),
                 parsed_cmd: parsed_cmd.clone(),
                 source: ev.source,
+                run_mode,
             },
         );
         let is_wait_interaction = matches!(ev.source, ExecCommandSource::UnifiedExecInteraction)
+            && !is_shell_tool_call(&ev.command)
             && ev
                 .interaction_input
                 .as_deref()
@@ -5344,7 +5867,39 @@ impl ChatWidget {
             self.suppressed_exec_calls.insert(ev.call_id);
             return;
         }
+        if ev.source != ExecCommandSource::UserShell && !is_wait_interaction {
+            self.record_model_output_json(&ev.command);
+            self.upsert_model_activity(
+                ev.call_id.clone(),
+                model_activity_kinds_for_exec(&ev.command, &parsed_cmd),
+            );
+        }
         let interaction_input = ev.interaction_input.clone();
+        let is_background_unified_exec = matches!(run_mode, Some(ExecCommandRunMode::Background))
+            && matches!(ev.source, ExecCommandSource::UnifiedExecStartup);
+        let active_unrelated_exec_is_running = self
+            .active_cell
+            .as_ref()
+            .and_then(|cell| cell.as_any().downcast_ref::<ExecCell>())
+            .is_some_and(|cell| {
+                cell.is_active() && !cell.iter_calls().any(|call| call.call_id == ev.call_id)
+            });
+        if is_background_unified_exec && active_unrelated_exec_is_running {
+            let cell = new_active_exec_command(
+                ev.call_id.clone(),
+                ev.command.clone(),
+                parsed_cmd,
+                ev.source,
+                run_mode,
+                interaction_input,
+                self.config.animations,
+            );
+            self.needs_final_message_separator = true;
+            self.app_event_tx
+                .send(AppEvent::InsertHistoryCell(Box::new(cell)));
+            self.request_redraw();
+            return;
+        }
         if let Some(cell) = self
             .active_cell
             .as_mut()
@@ -5354,11 +5909,15 @@ impl ChatWidget {
                 ev.command.clone(),
                 parsed_cmd.clone(),
                 ev.source,
+                run_mode,
                 interaction_input.clone(),
             )
         {
             *cell = new_exec;
             self.bump_active_cell_revision();
+        } else if active_unrelated_exec_is_running {
+            self.request_redraw();
+            return;
         } else {
             self.flush_active_cell();
 
@@ -5367,6 +5926,7 @@ impl ChatWidget {
                 ev.command.clone(),
                 parsed_cmd,
                 ev.source,
+                run_mode,
                 interaction_input,
                 self.config.animations,
             )));
@@ -5379,6 +5939,11 @@ impl ChatWidget {
     pub(crate) fn handle_mcp_begin_now(&mut self, ev: McpToolCallBeginEvent) {
         self.flush_answer_stream_with_separator();
         self.flush_active_cell();
+        self.record_model_output_json(&ev.invocation);
+        self.upsert_model_activity(
+            ev.call_id.clone(),
+            vec![model_activity_kind_for_tool_name(&ev.invocation.tool)],
+        );
         self.active_cell = Some(Box::new(history_cell::new_active_mcp_tool_call(
             ev.call_id,
             ev.invocation,
@@ -5397,6 +5962,7 @@ impl ChatWidget {
             result,
             ..
         } = ev;
+        self.remove_model_activity(&call_id);
 
         let extra_cell = match self
             .active_cell
@@ -5525,8 +6091,11 @@ impl ChatWidget {
             plan_stream_controller: None,
             clipboard_lease: None,
             running_commands: HashMap::new(),
+            active_model_activities: Vec::new(),
+            background_unified_exec_call_ids: HashSet::new(),
             collab_agent_metadata: HashMap::new(),
             pending_collab_spawn_requests: HashMap::new(),
+            collab_agent_activities: Vec::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
             unified_exec_wait_streak: None,
@@ -5600,6 +6169,7 @@ impl ChatWidget {
             last_plan_progress: None,
             plan_delta_buffer: String::new(),
             plan_item_active: false,
+            output_chars_this_turn: 0,
             last_separator_elapsed_secs: None,
             turn_runtime_metrics: RuntimeMetricsSummary::default(),
             last_rendered_width: std::cell::Cell::new(None),
@@ -6442,9 +7012,9 @@ impl ChatWidget {
             UserMessageHistoryRecord::Override(history) if !history.text.is_empty() => {
                 Some(encode_history_mentions(&history.text, &encoded_mentions))
             }
-            UserMessageHistoryRecord::UserMessageText | UserMessageHistoryRecord::Override(_) => {
-                None
-            }
+            UserMessageHistoryRecord::UserMessageText
+            | UserMessageHistoryRecord::Override(_)
+            | UserMessageHistoryRecord::Hidden => None,
         };
         if let Some(history_text) = history_text {
             self.submit_op(Op::AddToHistory { text: history_text });
@@ -6456,61 +7026,72 @@ impl ChatWidget {
             self.refresh_pending_input_preview();
         }
 
-        // Show replayable user content in conversation history.
-        let display_user_message = render_in_history.then(|| {
-            user_message_for_restore(
-                UserMessage {
+        if render_in_history {
+            if history_record == UserMessageHistoryRecord::Hidden {
+                let local_image_paths = local_images
+                    .iter()
+                    .map(|img| img.path.clone())
+                    .collect::<Vec<_>>();
+                self.last_rendered_user_message_event =
+                    Some(Self::rendered_user_message_event_from_parts(
+                        text,
+                        text_elements,
+                        local_image_paths,
+                        remote_image_urls,
+                    ));
+            } else {
+                let display_user_message = user_message_for_restore(
+                    UserMessage {
+                        text,
+                        local_images,
+                        remote_image_urls,
+                        text_elements,
+                        mention_bindings,
+                    },
+                    &history_record,
+                );
+                let UserMessage {
                     text,
                     local_images,
                     remote_image_urls,
                     text_elements,
-                    mention_bindings,
-                },
-                &history_record,
-            )
-        });
-        if let Some(display_user_message) = display_user_message {
-            let UserMessage {
-                text,
-                local_images,
-                remote_image_urls,
-                text_elements,
-                mention_bindings: _,
-            } = display_user_message;
-            if !text.is_empty() {
-                let local_image_paths = local_images
-                    .into_iter()
-                    .map(|img| img.path)
-                    .collect::<Vec<_>>();
-                self.last_rendered_user_message_event =
-                    Some(Self::rendered_user_message_event_from_parts(
-                        text.clone(),
-                        text_elements.clone(),
-                        local_image_paths.clone(),
-                        remote_image_urls.clone(),
+                    mention_bindings: _,
+                } = display_user_message;
+                if !text.is_empty() {
+                    let local_image_paths = local_images
+                        .into_iter()
+                        .map(|img| img.path)
+                        .collect::<Vec<_>>();
+                    self.last_rendered_user_message_event =
+                        Some(Self::rendered_user_message_event_from_parts(
+                            text.clone(),
+                            text_elements.clone(),
+                            local_image_paths.clone(),
+                            remote_image_urls.clone(),
+                        ));
+                    self.add_to_history(history_cell::new_user_prompt(
+                        text,
+                        text_elements,
+                        local_image_paths,
+                        remote_image_urls,
                     ));
-                self.add_to_history(history_cell::new_user_prompt(
-                    text,
-                    text_elements,
-                    local_image_paths,
-                    remote_image_urls,
-                ));
-                self.record_visible_user_turn_for_copy();
-            } else if !remote_image_urls.is_empty() {
-                self.last_rendered_user_message_event =
-                    Some(Self::rendered_user_message_event_from_parts(
+                    self.record_visible_user_turn_for_copy();
+                } else if !remote_image_urls.is_empty() {
+                    self.last_rendered_user_message_event =
+                        Some(Self::rendered_user_message_event_from_parts(
+                            String::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            remote_image_urls.clone(),
+                        ));
+                    self.add_to_history(history_cell::new_user_prompt(
                         String::new(),
                         Vec::new(),
                         Vec::new(),
-                        remote_image_urls.clone(),
+                        remote_image_urls,
                     ));
-                self.add_to_history(history_cell::new_user_prompt(
-                    String::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    remote_image_urls,
-                ));
-                self.record_visible_user_turn_for_copy();
+                    self.record_visible_user_turn_for_copy();
+                }
             }
         }
 
@@ -6673,6 +7254,7 @@ impl ChatWidget {
                 cwd,
                 process_id,
                 source,
+                run_mode,
                 status,
                 command_actions,
                 aggregated_output,
@@ -6694,6 +7276,8 @@ impl ChatWidget {
                             .map(codex_app_server_protocol::CommandAction::into_core)
                             .collect(),
                         source: source.to_core(),
+                        run_mode: run_mode
+                            .map(codex_app_server_protocol::CommandExecutionRunMode::to_core),
                         interaction_input: None,
                     });
                 } else {
@@ -6836,6 +7420,23 @@ impl ChatWidget {
                     saved_path,
                 });
             }
+            ThreadItem::DynamicToolCall {
+                id,
+                tool,
+                arguments,
+                status,
+                ..
+            } => {
+                if matches!(
+                    status,
+                    codex_app_server_protocol::DynamicToolCallStatus::InProgress
+                ) {
+                    self.record_model_output_json(&arguments);
+                    self.on_dynamic_tool_call_begin(id, &tool);
+                } else {
+                    self.on_dynamic_tool_call_end(&id);
+                }
+            }
             ThreadItem::EnteredReviewMode { review, .. } => {
                 if from_replay {
                     self.enter_review_mode_with_hint(review, /*from_replay*/ true);
@@ -6869,7 +7470,6 @@ impl ChatWidget {
                 reasoning_effort,
                 agents_states,
             }),
-            ThreadItem::DynamicToolCall { .. } => {}
         }
 
         if matches!(replay_kind, Some(ReplayKind::ThreadSnapshot)) && turn_id.is_empty() {
@@ -7290,6 +7890,7 @@ impl ChatWidget {
                 cwd,
                 process_id,
                 source,
+                run_mode,
                 command_actions,
                 ..
             } => {
@@ -7304,6 +7905,8 @@ impl ChatWidget {
                         .map(codex_app_server_protocol::CommandAction::into_core)
                         .collect(),
                     source: source.to_core(),
+                    run_mode: run_mode
+                        .map(codex_app_server_protocol::CommandExecutionRunMode::to_core),
                     interaction_input: None,
                 });
             }
@@ -7338,6 +7941,21 @@ impl ChatWidget {
             }
             ThreadItem::ImageGeneration { id, .. } => {
                 self.on_image_generation_begin(ImageGenerationBeginEvent { call_id: id });
+            }
+            ThreadItem::DynamicToolCall {
+                id,
+                tool,
+                arguments,
+                status,
+                ..
+            } => {
+                if matches!(
+                    status,
+                    codex_app_server_protocol::DynamicToolCallStatus::InProgress
+                ) {
+                    self.record_model_output_json(&arguments);
+                    self.on_dynamic_tool_call_begin(id, &tool);
+                }
             }
             ThreadItem::CollabAgentToolCall {
                 id,
@@ -7748,21 +8366,60 @@ impl ChatWidget {
                 );
             }
             EventMsg::CollabAgentSpawnEnd(ev) => {
+                if let Some(thread_id) = ev.new_thread_id {
+                    self.track_collab_agent_status(
+                        thread_id,
+                        ev.new_agent_nickname.clone(),
+                        ev.new_agent_role.clone(),
+                        ev.status.clone(),
+                    );
+                }
                 let spawn_request = self.pending_collab_spawn_requests.remove(&ev.call_id);
                 self.on_collab_event(multi_agents::spawn_end(ev, spawn_request.as_ref()));
             }
             EventMsg::CollabAgentInteractionBegin(_) => {}
             EventMsg::CollabAgentInteractionEnd(ev) => {
+                self.track_collab_agent_status(
+                    ev.receiver_thread_id,
+                    ev.receiver_agent_nickname.clone(),
+                    ev.receiver_agent_role.clone(),
+                    ev.status.clone(),
+                );
                 self.on_collab_event(multi_agents::interaction_end(ev))
             }
             EventMsg::CollabWaitingBegin(ev) => {
                 self.on_collab_event(multi_agents::waiting_begin(ev))
             }
-            EventMsg::CollabWaitingEnd(ev) => self.on_collab_event(multi_agents::waiting_end(ev)),
+            EventMsg::CollabWaitingEnd(ev) => {
+                for entry in &ev.agent_statuses {
+                    self.track_collab_agent_status(
+                        entry.thread_id,
+                        entry.agent_nickname.clone(),
+                        entry.agent_role.clone(),
+                        entry.status.clone(),
+                    );
+                }
+                self.on_collab_event(multi_agents::waiting_end(ev))
+            }
             EventMsg::CollabCloseBegin(_) => {}
-            EventMsg::CollabCloseEnd(ev) => self.on_collab_event(multi_agents::close_end(ev)),
+            EventMsg::CollabCloseEnd(ev) => {
+                self.track_collab_agent_status(
+                    ev.receiver_thread_id,
+                    ev.receiver_agent_nickname.clone(),
+                    ev.receiver_agent_role.clone(),
+                    AgentStatus::Shutdown,
+                );
+                self.on_collab_event(multi_agents::close_end(ev))
+            }
             EventMsg::CollabResumeBegin(ev) => self.on_collab_event(multi_agents::resume_begin(ev)),
             EventMsg::CollabResumeEnd(ev) => self.on_collab_event(multi_agents::resume_end(ev)),
+            EventMsg::DynamicToolCallRequest(request) => {
+                self.record_model_output_json(&request.arguments);
+                self.on_dynamic_tool_call_begin(request.call_id, &request.tool);
+            }
+            EventMsg::DynamicToolCallResponse(response) => {
+                self.on_dynamic_tool_call_end(&response.call_id);
+            }
             EventMsg::ThreadRolledBack(rollback) => {
                 if from_replay {
                     self.app_event_tx.send(AppEvent::ApplyThreadRollback {
@@ -7776,8 +8433,6 @@ impl ChatWidget {
             | EventMsg::PatchApplyUpdated(_)
             | EventMsg::ReasoningContentDelta(_)
             | EventMsg::ReasoningRawContentDelta(_)
-            | EventMsg::DynamicToolCallRequest(_)
-            | EventMsg::DynamicToolCallResponse(_)
             | EventMsg::RealtimeConversationListVoicesResponse(_) => {}
             EventMsg::HookStarted(event) => self.on_hook_started(event),
             EventMsg::HookCompleted(event) => self.on_hook_completed(event),
@@ -8072,6 +8727,7 @@ impl ChatWidget {
                     self.queued_user_message_history_records.get(idx),
                 )
             })
+            .filter(|text| !text.is_empty())
             .collect();
         let pending_steers: Vec<String> = self
             .pending_steers
@@ -8079,6 +8735,7 @@ impl ChatWidget {
             .map(|steer| {
                 user_message_preview_text(&steer.user_message, Some(&steer.history_record))
             })
+            .filter(|text| !text.is_empty())
             .collect();
         let rejected_steers: Vec<String> = self
             .rejected_steers_queue
@@ -8087,6 +8744,7 @@ impl ChatWidget {
             .map(|(idx, message)| {
                 user_message_preview_text(message, self.rejected_steer_history_records.get(idx))
             })
+            .filter(|text| !text.is_empty())
             .collect();
         self.bottom_pane.set_pending_input_preview(
             queued_messages,
@@ -8336,11 +8994,13 @@ impl ChatWidget {
     }
 
     fn clean_background_terminals(&mut self) {
-        self.submit_op(AppCommand::clean_background_terminals());
+        self.submit_op(Op::CleanBackgroundActivity);
         self.unified_exec_processes.clear();
         self.sync_unified_exec_footer();
+        self.collab_agent_activities.clear();
+        self.sync_collab_agent_footer();
         self.add_info_message(
-            "Stopping all background terminals.".to_string(),
+            "Stopping background activity.".to_string(),
             /*hint*/ None,
         );
     }

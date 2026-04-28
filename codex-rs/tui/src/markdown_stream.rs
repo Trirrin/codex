@@ -1,9 +1,9 @@
 //! Collects markdown stream source at newline boundaries.
 //!
 //! `MarkdownStreamCollector` buffers incoming token deltas and exposes a commit boundary at each
-//! newline. The stream controllers (`streaming/controller.rs`) call `commit_complete_source()`
-//! after each newline-bearing delta to obtain the completed prefix for re-rendering, leaving the
-//! trailing incomplete line in the buffer for the next delta.
+//! newline. The stream controllers (`streaming/controller.rs`) commit source after each
+//! newline-bearing delta to obtain the completed prefix for live rendering, leaving the trailing
+//! incomplete line in the buffer for the next delta.
 //!
 //! On finalization, `finalize_and_drain_source()` flushes whatever remains (the last line, which
 //! may lack a trailing newline).
@@ -20,9 +20,9 @@ use crate::markdown;
 /// Newline-gated accumulator that buffers raw markdown source and commits only completed lines.
 ///
 /// The buffer tracks how many source bytes have already been committed via
-/// `committed_source_len`, so each `commit_complete_source()` call returns only the newly
-/// completed portion. This design lets the stream controller re-render the entire accumulated
-/// source while only appending new content.
+/// `committed_source_len`, so each live-preview commit returns only the newly completed portion.
+/// This design lets the stream controller re-render the entire accumulated source while only
+/// appending new content.
 ///
 /// The collector does not parse markdown in production. It only defines stable source boundaries;
 /// rendering lives in the stream controllers so width changes can re-render from one accumulated
@@ -79,12 +79,11 @@ impl MarkdownStreamCollector {
         self.buffer.push_str(delta);
     }
 
-    /// Commit newly completed raw markdown source up to the last newline.
+    /// Commit newly completed source without holding back a trailing pipe-table block.
     ///
-    /// This returns only source that has not been returned by a previous commit. Calling it after a
-    /// delta without a newline returns `None`, which prevents the live stream from rendering
-    /// incomplete markdown blocks that may change meaning when the rest of the line arrives.
-    pub fn commit_complete_source(&mut self) -> Option<String> {
+    /// The live stream controller uses this to render an open table preview row-by-row while still
+    /// retaining raw markdown for final source-backed consolidation.
+    pub fn commit_complete_source_for_live_preview(&mut self) -> Option<String> {
         let commit_end = self.buffer.rfind('\n').map(|idx| idx + 1)?;
         if commit_end <= self.committed_source_len {
             return None;
@@ -127,6 +126,7 @@ impl MarkdownStreamCollector {
         let Some(commit_end) = self.buffer.rfind('\n').map(|idx| idx + 1) else {
             return Vec::new();
         };
+        let commit_end = table_safe_commit_end(&self.buffer, commit_end);
         if commit_end <= self.committed_source_len {
             return Vec::new();
         }
@@ -192,6 +192,36 @@ impl MarkdownStreamCollector {
 }
 
 #[cfg(test)]
+fn table_safe_commit_end(buffer: &str, commit_end: usize) -> usize {
+    let completed = &buffer[..commit_end];
+    let mut table_start = commit_end;
+    let mut saw_pipe_row = false;
+
+    for line in completed.split_inclusive('\n').rev() {
+        let line_start = table_start.saturating_sub(line.len());
+        let line_without_newline = line.trim_end_matches(['\r', '\n']);
+        if is_streaming_pipe_table_row(line_without_newline) {
+            saw_pipe_row = true;
+            table_start = line_start;
+            continue;
+        }
+        break;
+    }
+
+    if saw_pipe_row {
+        table_start
+    } else {
+        commit_end
+    }
+}
+
+#[cfg(test)]
+fn is_streaming_pipe_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.matches('|').count() >= 3
+}
+
+#[cfg(test)]
 fn test_cwd() -> PathBuf {
     // These tests only need a stable absolute cwd; using temp_dir() avoids baking Unix- or
     // Windows-specific root semantics into the fixtures.
@@ -239,6 +269,37 @@ mod tests {
         c.push_delta("Line without newline");
         let out = c.finalize_and_drain();
         assert_eq!(out.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pipe_rows_without_delimiter_stream_as_plain_text() {
+        let mut c = super::MarkdownStreamCollector::new(/*width*/ None, &super::test_cwd());
+        c.push_delta("| 项目 | 状态 | 说明 |\n");
+        assert!(c.commit_complete_lines().is_empty());
+
+        c.push_delta("| 表格渲染 | 通过 | Markdown 表格正常输出 |\n");
+        assert!(c.commit_complete_lines().is_empty());
+
+        c.push_delta("After table.\n");
+        let out = c.commit_complete_lines();
+        let rendered: Vec<String> = out
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "| 项目 | 状态 | 说明 |",
+                "| 表格渲染 | 通过 | Markdown 表格正常输出 |",
+                "After table.",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -502,30 +563,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn table_header_commits_without_holdback() {
+    async fn table_commits_after_block_terminator() {
         let mut c = super::MarkdownStreamCollector::new(/*width*/ None, &super::test_cwd());
         c.push_delta("| A | B |\n");
-        let out1 = c.commit_complete_lines();
-        let out1_str = lines_to_plain_strings(&out1);
-        assert_eq!(out1_str, vec!["| A | B |".to_string()]);
+        assert!(c.commit_complete_lines().is_empty());
 
         c.push_delta("| --- | --- |\n");
-        let out = c.commit_complete_lines();
-        let out_str = lines_to_plain_strings(&out);
-        assert!(
-            !out_str.is_empty(),
-            "expected output to continue committing after delimiter: {out_str:?}"
-        );
+        assert!(c.commit_complete_lines().is_empty());
 
         c.push_delta("| 1 | 2 |\n");
-        let out2 = c.commit_complete_lines();
-        assert!(
-            !out2.is_empty(),
-            "expected output to continue committing after body row"
-        );
+        assert!(c.commit_complete_lines().is_empty());
 
         c.push_delta("\n");
-        let _ = c.commit_complete_lines();
+        let out = c.commit_complete_lines();
+        let out_str = lines_to_plain_strings(&out);
+        assert_eq!(
+            out_str,
+            vec![
+                "┌─────┬─────┐",
+                "│ A   │ B   │",
+                "├─────┼─────┤",
+                "│ 1   │ 2   │",
+                "└─────┴─────┘",
+            ]
+        );
     }
 
     #[tokio::test]

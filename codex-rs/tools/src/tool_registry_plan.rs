@@ -21,26 +21,32 @@ use crate::coalesce_loadable_tool_specs;
 use crate::collect_code_mode_exec_prompt_tool_definitions;
 use crate::collect_tool_search_source_infos;
 use crate::collect_tool_suggest_entries;
-use crate::create_apply_patch_freeform_tool;
-use crate::create_apply_patch_json_tool;
 use crate::create_close_agent_tool_v1;
 use crate::create_close_agent_tool_v2;
 use crate::create_code_mode_tool;
 use crate::create_create_goal_tool;
-use crate::create_exec_command_tool;
+use crate::create_delete_tool;
+use crate::create_edit_tool;
+use crate::create_execute_tool;
 use crate::create_followup_task_tool;
 use crate::create_get_goal_tool;
+use crate::create_glob_file_tool;
+use crate::create_grep_file_tool;
 use crate::create_image_generation_tool;
 use crate::create_list_agents_tool;
 use crate::create_list_dir_tool;
 use crate::create_list_mcp_resource_templates_tool;
 use crate::create_list_mcp_resources_tool;
+use crate::create_list_shells_tool;
 use crate::create_local_shell_tool;
+use crate::create_read_file_tool;
 use crate::create_read_mcp_resource_tool;
+use crate::create_read_shell_output_tool;
 use crate::create_report_agent_job_result_tool;
 use crate::create_request_permissions_tool;
 use crate::create_request_user_input_tool;
 use crate::create_resume_agent_tool;
+use crate::create_search_file_tool;
 use crate::create_send_input_tool_v1;
 use crate::create_send_message_tool;
 use crate::create_shell_command_tool;
@@ -48,6 +54,7 @@ use crate::create_shell_tool;
 use crate::create_spawn_agent_tool_v1;
 use crate::create_spawn_agent_tool_v2;
 use crate::create_spawn_agents_on_csv_tool;
+use crate::create_stop_shell_tool;
 use crate::create_test_sync_tool;
 use crate::create_tool_search_tool;
 use crate::create_tool_suggest_tool;
@@ -56,16 +63,16 @@ use crate::create_update_plan_tool;
 use crate::create_view_image_tool;
 use crate::create_wait_agent_tool_v1;
 use crate::create_wait_agent_tool_v2;
+use crate::create_wait_shell_output_tool;
 use crate::create_wait_tool;
 use crate::create_web_search_tool;
-use crate::create_write_stdin_tool;
+use crate::create_write_tool;
 use crate::default_namespace_description;
 use crate::dynamic_tool_to_loadable_tool_spec;
 use crate::mcp_tool_to_responses_api_tool;
 use crate::request_permissions_tool_description;
 use crate::request_user_input_tool_description;
 use crate::tool_registry_plan_types::agent_type_description;
-use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::openai_models::ConfigShellToolType;
 use std::collections::BTreeMap;
 
@@ -155,18 +162,32 @@ pub fn build_tool_registry_plan(
             }
             ConfigShellToolType::UnifiedExec => {
                 plan.push_spec(
-                    create_exec_command_tool(CommandToolOptions {
+                    create_execute_tool(CommandToolOptions {
                         allow_login_shell: config.allow_login_shell,
                         exec_permission_approvals_enabled,
                     }),
                     /*supports_parallel_tool_calls*/ true,
                     config.code_mode_enabled,
                 );
-                plan.push_spec(
-                    create_write_stdin_tool(),
-                    /*supports_parallel_tool_calls*/ false,
-                    config.code_mode_enabled,
-                );
+                for spec in [
+                    create_wait_shell_output_tool(),
+                    create_read_shell_output_tool(),
+                    create_list_shells_tool(),
+                    create_stop_shell_tool(),
+                ] {
+                    plan.push_spec(
+                        spec,
+                        /*supports_parallel_tool_calls*/ true,
+                        config.code_mode_enabled,
+                    );
+                }
+                plan.register_handler("execute", ToolHandlerKind::UnifiedExec);
+                plan.register_handler("wait_shell_output", ToolHandlerKind::UnifiedExec);
+                plan.register_handler("read_shell_output", ToolHandlerKind::UnifiedExec);
+                plan.register_handler("list_shells", ToolHandlerKind::UnifiedExec);
+                plan.register_handler("stop_shell", ToolHandlerKind::UnifiedExec);
+                // Keep old response streams and resumed conversations routable without
+                // making the old names model-visible in the current tool schema.
                 plan.register_handler("exec_command", ToolHandlerKind::UnifiedExec);
                 plan.register_handler("write_stdin", ToolHandlerKind::UnifiedExec);
             }
@@ -315,34 +336,33 @@ pub fn build_tool_registry_plan(
         plan.register_handler(TOOL_SUGGEST_TOOL_NAME, ToolHandlerKind::ToolSuggest);
     }
 
-    if config.has_environment
-        && let Some(apply_patch_tool_type) = &config.apply_patch_tool_type
-    {
-        match apply_patch_tool_type {
-            ApplyPatchToolType::Freeform => {
-                plan.push_spec(
-                    create_apply_patch_freeform_tool(),
-                    /*supports_parallel_tool_calls*/ false,
-                    config.code_mode_enabled,
-                );
-            }
-            ApplyPatchToolType::Function => {
-                plan.push_spec(
-                    create_apply_patch_json_tool(),
-                    /*supports_parallel_tool_calls*/ false,
-                    config.code_mode_enabled,
-                );
-            }
+    if config.has_environment {
+        for spec in [
+            create_read_file_tool(),
+            create_search_file_tool(),
+            create_grep_file_tool(),
+            create_glob_file_tool(),
+            create_edit_tool(),
+            create_write_tool(),
+            create_delete_tool(),
+        ] {
+            plan.push_spec(
+                spec,
+                /*supports_parallel_tool_calls*/ true,
+                config.code_mode_enabled,
+            );
         }
-        plan.register_handler("apply_patch", ToolHandlerKind::ApplyPatch);
-    }
-
-    if config.has_environment
-        && config
-            .experimental_supported_tools
-            .iter()
-            .any(|tool| tool == "list_dir")
-    {
+        for name in [
+            "read_file",
+            "search_file",
+            "grep_file",
+            "glob_file",
+            "edit",
+            "write",
+            "delete",
+        ] {
+            plan.register_handler(name, ToolHandlerKind::File);
+        }
         plan.push_spec(
             create_list_dir_tool(),
             /*supports_parallel_tool_calls*/ true,

@@ -184,8 +184,6 @@ impl ChatWidget {
     /// Empty selections clear the managed title. Non-empty selections render the
     /// current values in configured order, skip unavailable segments, and cache
     /// the last successfully written title so redundant OSC writes are avoided.
-    /// When the `activity` item is present in an animated running state, this also
-    /// schedules the next frame so the title animation keeps advancing.
     fn refresh_terminal_title_from_selections(&mut self, selections: &StatusSurfaceSelections) {
         self.last_terminal_title_requires_action =
             self.terminal_title_shows_action_required_with_selections(selections);
@@ -198,11 +196,7 @@ impl ChatWidget {
 
         let now = Instant::now();
         let title = self.terminal_title_text_for_selections(selections, now);
-        let animation_interval = self.terminal_title_animation_interval_with_selections(selections);
         if self.last_terminal_title == title {
-            if let Some(interval) = animation_interval {
-                self.frame_requester.schedule_frame_in(interval);
-            }
             return;
         }
         match title {
@@ -224,10 +218,6 @@ impl ChatWidget {
                     tracing::debug!(error = %err, "failed to clear terminal title");
                 }
             }
-        }
-
-        if let Some(interval) = animation_interval {
-            self.frame_requester.schedule_frame_in(interval);
         }
     }
 
@@ -324,20 +314,6 @@ impl ChatWidget {
             && selections
                 .terminal_title_items
                 .contains(&TerminalTitleItem::Spinner)
-    }
-
-    fn terminal_title_animation_interval_with_selections(
-        &self,
-        selections: &StatusSurfaceSelections,
-    ) -> Option<Duration> {
-        if self.config.animations
-            && self.terminal_title_shows_action_required_with_selections(selections)
-        {
-            return Some(TERMINAL_TITLE_ACTION_REQUIRED_INTERVAL);
-        }
-
-        self.should_animate_terminal_title_spinner_with_selections(selections)
-            .then_some(TERMINAL_TITLE_SPINNER_INTERVAL)
     }
 
     pub(super) fn request_status_line_branch_refresh(&mut self) {
@@ -709,10 +685,23 @@ impl ChatWidget {
             TerminalTitleStatusKind::Thinking if !self.bottom_pane.is_task_running() => {
                 "Ready".to_string()
             }
-            TerminalTitleStatusKind::Working => "Working".to_string(),
+            TerminalTitleStatusKind::Working => self
+                .current_model_activity_header()
+                .or_else(|| {
+                    let header = self.current_status.header.trim();
+                    (!header.is_empty() && header != "Working").then(|| header.to_string())
+                })
+                .unwrap_or_else(|| "Working".to_string()),
             TerminalTitleStatusKind::WaitingForBackgroundTerminal => "Waiting".to_string(),
             TerminalTitleStatusKind::Undoing => "Undoing".to_string(),
-            TerminalTitleStatusKind::Thinking => "Thinking".to_string(),
+            TerminalTitleStatusKind::Thinking => {
+                let header = self.current_status.header.trim();
+                if header.is_empty() {
+                    "Thinking".to_string()
+                } else {
+                    header.to_string()
+                }
+            }
         }
     }
 
@@ -761,17 +750,6 @@ impl ChatWidget {
 
     pub(super) fn should_animate_terminal_title_action_required(&self) -> bool {
         self.config.animations && self.terminal_title_shows_action_required()
-    }
-
-    fn should_animate_terminal_title_spinner_with_selections(
-        &self,
-        selections: &StatusSurfaceSelections,
-    ) -> bool {
-        self.config.animations
-            && selections
-                .terminal_title_items
-                .contains(&TerminalTitleItem::Spinner)
-            && self.terminal_title_has_active_progress()
     }
 
     /// Formats the last `update_plan` progress snapshot for terminal-title display.

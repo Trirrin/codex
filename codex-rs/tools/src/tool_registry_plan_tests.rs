@@ -82,14 +82,24 @@ fn test_full_toolset_specs_for_gpt5_codex_unified_exec_web_search() {
 
     let mut expected = BTreeMap::new();
     for spec in [
-        create_exec_command_tool(CommandToolOptions {
+        create_execute_tool(CommandToolOptions {
             allow_login_shell: true,
             exec_permission_approvals_enabled: false,
         }),
-        create_write_stdin_tool(),
+        create_wait_shell_output_tool(),
+        create_read_shell_output_tool(),
+        create_list_shells_tool(),
+        create_stop_shell_tool(),
         create_update_plan_tool(),
         request_user_input_tool_spec(/*default_mode_request_user_input*/ false),
-        create_apply_patch_freeform_tool(),
+        create_read_file_tool(),
+        create_search_file_tool(),
+        create_grep_file_tool(),
+        create_glob_file_tool(),
+        create_list_dir_tool(),
+        create_edit_tool(),
+        create_write_tool(),
+        create_delete_tool(),
         ToolSpec::WebSearch {
             external_web_access: Some(true),
             filters: None,
@@ -293,7 +303,11 @@ fn test_build_specs_multi_agent_v2_uses_task_names_and_hides_resume() {
     assert!(!properties.contains_key("fork_context"));
     assert_eq!(
         required,
-        Some(&vec!["task_name".to_string(), "message".to_string()])
+        Some(&vec![
+            "task_name".to_string(),
+            "message".to_string(),
+            "mode".to_string()
+        ])
     );
     let output_schema = output_schema
         .as_ref()
@@ -336,7 +350,11 @@ fn test_build_specs_multi_agent_v2_uses_task_names_and_hides_resume() {
     assert!(!properties.contains_key("items"));
     assert_eq!(
         required,
-        Some(&vec!["target".to_string(), "message".to_string()])
+        Some(&vec![
+            "target".to_string(),
+            "message".to_string(),
+            "mode".to_string()
+        ])
     );
 
     let wait_agent = find_tool(&tools, "wait_agent");
@@ -515,6 +533,7 @@ fn disabled_environment_omits_environment_backed_tools() {
 
     assert_lacks_tool_name(&tools, "exec_command");
     assert_lacks_tool_name(&tools, "write_stdin");
+    assert_lacks_tool_name(&tools, "execute");
     assert_lacks_tool_name(&tools, "apply_patch");
     assert_lacks_tool_name(&tools, "list_dir");
     assert_lacks_tool_name(&tools, VIEW_IMAGE_TOOL_NAME);
@@ -1021,8 +1040,9 @@ fn test_parallel_support_flags() {
         &[],
     );
 
-    assert!(find_tool(&tools, "exec_command").supports_parallel_tool_calls);
-    assert!(!find_tool(&tools, "write_stdin").supports_parallel_tool_calls);
+    assert!(find_tool(&tools, "execute").supports_parallel_tool_calls);
+    assert_lacks_tool_name(&tools, "exec_command");
+    assert_lacks_tool_name(&tools, "write_stdin");
 }
 
 #[test]
@@ -1842,7 +1862,7 @@ fn code_mode_augments_builtin_tool_descriptions_with_typed_sample() {
 
     assert_eq!(
         description,
-        "View a local image from the filesystem (only use if given a full filepath by the user, and the image isn't already attached to the thread context within <image ...> tags).\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: {\n  // Local filesystem path to an image file\n  path: string;\n}): Promise<{\n  // Image detail hint returned by view_image. Returns `original` when original resolution is preserved, otherwise `null`.\n  detail: string | null;\n  // Data URL for the loaded image.\n  image_url: string;\n}>; };\n```"
+        "View a local image from the filesystem (only use if given a full filepath by the user, and the image isn't already attached to the thread context within <image ...> tags).\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: {\n  // Whether to include image width, height, MIME type, and encoded byte size in code-mode output.\n  include_metadata?: boolean;\n  // Local filesystem path to an image file\n  path: string;\n}): Promise<{\n  // Image detail hint returned by view_image. Returns `original` when original resolution is preserved, otherwise `null`.\n  detail: string | null;\n  // Data URL for the loaded image.\n  image_url: string;\n  // Image metadata when include_metadata=true.\n  metadata: { height: number; mime: string; size_bytes: number; width: number; } | null;\n}>; };\n```"
     );
 }
 

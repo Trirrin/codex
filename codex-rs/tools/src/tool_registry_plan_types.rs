@@ -19,6 +19,7 @@ pub enum ToolHandlerKind {
     DynamicTool,
     FollowupTaskV2,
     Goal,
+    File,
     ListAgentsV2,
     ListDir,
     Mcp,

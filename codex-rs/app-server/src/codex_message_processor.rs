@@ -142,6 +142,8 @@ use codex_app_server_protocol::ThreadApproveGuardianDeniedActionResponse;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadArchivedNotification;
+use codex_app_server_protocol::ThreadBackgroundActivityCleanParams;
+use codex_app_server_protocol::ThreadBackgroundActivityCleanResponse;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
 use codex_app_server_protocol::ThreadClosedNotification;
@@ -1011,6 +1013,10 @@ impl CodexMessageProcessor {
                     params,
                 )
                 .await;
+            }
+            ClientRequest::ThreadBackgroundActivityClean { request_id, params } => {
+                self.thread_background_activity_clean(to_connection_request_id(request_id), params)
+                    .await;
             }
             ClientRequest::ThreadRollback { request_id, params } => {
                 self.thread_rollback(to_connection_request_id(request_id), params)
@@ -3500,6 +3506,26 @@ impl CodexMessageProcessor {
                     internal_error(format!("failed to clean background terminals: {err}"))
                 })?;
             Ok::<_, JSONRPCErrorError>(ThreadBackgroundTerminalsCleanResponse {})
+        }
+        .await;
+        self.outgoing.send_result(request_id, result).await;
+    }
+
+    async fn thread_background_activity_clean(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadBackgroundActivityCleanParams,
+    ) {
+        let ThreadBackgroundActivityCleanParams { thread_id } = params;
+
+        let result = async {
+            let (_, thread) = self.load_thread(&thread_id).await?;
+            self.submit_core_op(&request_id, thread.as_ref(), Op::CleanBackgroundActivity)
+                .await
+                .map_err(|err| {
+                    internal_error(format!("failed to clean background activity: {err}"))
+                })?;
+            Ok::<_, JSONRPCErrorError>(ThreadBackgroundActivityCleanResponse {})
         }
         .await;
         self.outgoing.send_result(request_id, result).await;

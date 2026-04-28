@@ -55,22 +55,28 @@ impl<T: HttpTransport> ModelsClient<T> {
             )
             .await?;
 
-        let header_etag = resp
-            .headers
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
-
-        let ModelsResponse { models } = serde_json::from_slice::<ModelsResponse>(&resp.body)
-            .map_err(|e| {
-                ApiError::Stream(format!(
-                    "failed to decode models response: {e}; body: {}",
-                    String::from_utf8_lossy(&resp.body)
-                ))
-            })?;
-
-        Ok((models, header_etag))
+        decode_models_response(&resp)
     }
+}
+
+pub fn decode_models_response(
+    resp: &codex_client::Response,
+) -> Result<(Vec<ModelInfo>, Option<String>), ApiError> {
+    let header_etag = resp
+        .headers
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+
+    let ModelsResponse { models } =
+        serde_json::from_slice::<ModelsResponse>(&resp.body).map_err(|e| {
+            ApiError::Stream(format!(
+                "failed to decode models response: {e}; body: {}",
+                String::from_utf8_lossy(&resp.body)
+            ))
+        })?;
+
+    Ok((models, header_etag))
 }
 
 #[cfg(test)]

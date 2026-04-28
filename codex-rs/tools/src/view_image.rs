@@ -12,10 +12,18 @@ pub struct ViewImageToolOptions {
 }
 
 pub fn create_view_image_tool(options: ViewImageToolOptions) -> ToolSpec {
-    let mut properties = BTreeMap::from([(
-        "path".to_string(),
-        JsonSchema::string(Some("Local filesystem path to an image file".to_string())),
-    )]);
+    let mut properties = BTreeMap::from([
+        (
+            "path".to_string(),
+            JsonSchema::string(Some("Local filesystem path to an image file".to_string())),
+        ),
+        (
+            "include_metadata".to_string(),
+            JsonSchema::boolean(Some(
+                "Whether to include image width, height, MIME type, and encoded byte size in code-mode output.".to_string(),
+            )),
+        ),
+    ]);
     if options.can_request_original_image_detail {
         properties.insert(
             "detail".to_string(),
@@ -47,9 +55,21 @@ fn view_image_output_schema() -> Value {
             "detail": {
                 "type": ["string", "null"],
                 "description": "Image detail hint returned by view_image. Returns `original` when original resolution is preserved, otherwise `null`."
+            },
+            "metadata": {
+                "type": ["object", "null"],
+                "description": "Image metadata when include_metadata=true.",
+                "properties": {
+                    "width": { "type": "number" },
+                    "height": { "type": "number" },
+                    "mime": { "type": "string" },
+                    "size_bytes": { "type": "number" }
+                },
+                "required": ["width", "height", "mime", "size_bytes"],
+                "additionalProperties": false
             }
         },
-        "required": ["image_url", "detail"],
+        "required": ["image_url", "detail", "metadata"],
         "additionalProperties": false
     })
 }

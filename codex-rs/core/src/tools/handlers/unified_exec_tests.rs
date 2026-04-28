@@ -219,7 +219,7 @@ fn exec_command_args_resolve_relative_additional_permissions_against_workdir() -
 }
 
 #[tokio::test]
-async fn exec_command_pre_tool_use_payload_uses_raw_command() {
+async fn execute_pre_tool_use_payload_uses_raw_command() {
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({ "cmd": "printf exec command" }).to_string(),
     };
@@ -233,7 +233,7 @@ async fn exec_command_pre_tool_use_payload_uses_raw_command() {
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "call-43".to_string(),
-            tool_name: codex_tools::ToolName::plain("exec_command"),
+            tool_name: codex_tools::ToolName::plain("execute"),
             source: crate::tools::context::ToolCallSource::Direct,
             payload,
         }),
@@ -245,7 +245,7 @@ async fn exec_command_pre_tool_use_payload_uses_raw_command() {
 }
 
 #[tokio::test]
-async fn exec_command_pre_tool_use_payload_skips_write_stdin() {
+async fn execute_pre_tool_use_payload_skips_non_execute() {
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({ "chars": "echo hi" }).to_string(),
     };
@@ -259,7 +259,7 @@ async fn exec_command_pre_tool_use_payload_skips_write_stdin() {
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "call-44".to_string(),
-            tool_name: codex_tools::ToolName::plain("write_stdin"),
+            tool_name: codex_tools::ToolName::plain("read_file"),
             source: crate::tools::context::ToolCallSource::Direct,
             payload,
         }),
@@ -278,12 +278,13 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         wall_time: std::time::Duration::from_millis(498),
         raw_output: b"three".to_vec(),
         max_output_tokens: None,
+        shell_id: None,
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
     };
-    let invocation = invocation_for_payload("exec_command", "call-43", payload).await;
+    let invocation = invocation_for_payload("execute", "call-43", payload).await;
     assert_eq!(
         UnifiedExecHandler.post_tool_use_payload(&invocation, &output),
         Some(crate::tools::registry::PostToolUsePayload {
@@ -306,12 +307,13 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         wall_time: std::time::Duration::from_millis(498),
         raw_output: b"three".to_vec(),
         max_output_tokens: None,
+        shell_id: None,
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
     };
-    let invocation = invocation_for_payload("exec_command", "call-44", payload).await;
+    let invocation = invocation_for_payload("execute", "call-44", payload).await;
 
     assert_eq!(
         UnifiedExecHandler.post_tool_use_payload(&invocation, &output),
@@ -335,12 +337,13 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         wall_time: std::time::Duration::from_millis(498),
         raw_output: b"three".to_vec(),
         max_output_tokens: None,
+        shell_id: Some("45".to_string()),
         process_id: Some(45),
         exit_code: None,
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
     };
-    let invocation = invocation_for_payload("exec_command", "call-45", payload).await;
+    let invocation = invocation_for_payload("execute", "call-45", payload).await;
     assert_eq!(
         UnifiedExecHandler.post_tool_use_payload(&invocation, &output),
         None
@@ -362,12 +365,13 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         wall_time: std::time::Duration::from_millis(498),
         raw_output: b"finished\n".to_vec(),
         max_output_tokens: None,
+        shell_id: None,
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("sleep 1; echo finished".to_string()),
     };
-    let invocation = invocation_for_payload("write_stdin", "write-stdin-call", payload).await;
+    let invocation = invocation_for_payload("execute", "write-stdin-call", payload).await;
 
     assert_eq!(
         UnifiedExecHandler.post_tool_use_payload(&invocation, &output),
@@ -391,6 +395,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         wall_time: std::time::Duration::from_millis(498),
         raw_output: b"alpha\n".to_vec(),
         max_output_tokens: None,
+        shell_id: None,
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
@@ -402,13 +407,14 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         wall_time: std::time::Duration::from_millis(498),
         raw_output: b"beta\n".to_vec(),
         max_output_tokens: None,
+        shell_id: None,
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("sleep 1; echo beta".to_string()),
     };
-    let invocation_b = invocation_for_payload("write_stdin", "write-call-b", payload.clone()).await;
-    let invocation_a = invocation_for_payload("write_stdin", "write-call-a", payload).await;
+    let invocation_b = invocation_for_payload("execute", "write-call-b", payload.clone()).await;
+    let invocation_a = invocation_for_payload("execute", "write-call-a", payload).await;
 
     let payloads = [
         UnifiedExecHandler.post_tool_use_payload(&invocation_b, &output_b),

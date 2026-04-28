@@ -411,6 +411,9 @@ pub enum Op {
     /// Use this when callers intentionally want to stop long-lived background shells.
     CleanBackgroundTerminals,
 
+    /// Terminate all running background terminal processes and close live spawned subagents.
+    CleanBackgroundActivity,
+
     /// Start a realtime conversation stream.
     RealtimeConversationStart(ConversationStartParams),
 
@@ -883,6 +886,7 @@ impl Op {
         match self {
             Self::Interrupt => "interrupt",
             Self::CleanBackgroundTerminals => "clean_background_terminals",
+            Self::CleanBackgroundActivity => "clean_background_activity",
             Self::RealtimeConversationStart(_) => "realtime_conversation_start",
             Self::RealtimeConversationAudio(_) => "realtime_conversation_audio",
             Self::RealtimeConversationText(_) => "realtime_conversation_text",
@@ -3122,6 +3126,13 @@ pub enum ExecCommandStatus {
     Declined,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecCommandRunMode {
+    Blocking,
+    Background,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ExecCommandBeginEvent {
     /// Identifier so this can be paired with the ExecCommandEnd event.
@@ -3140,6 +3151,10 @@ pub struct ExecCommandBeginEvent {
     /// Where the command originated. Defaults to Agent for backward compatibility.
     #[serde(default)]
     pub source: ExecCommandSource,
+    /// Whether a unified exec command is blocking the current turn or running in the background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub run_mode: Option<ExecCommandRunMode>,
     /// Raw input sent to a unified exec session (if this is an interaction event).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

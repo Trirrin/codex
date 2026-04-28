@@ -20,6 +20,8 @@ use crate::skills_watcher::SkillsWatcher;
 use crate::skills_watcher::SkillsWatcherEvent;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
+use crate::unified_exec::ProcessStore;
+use crate::unified_exec::SharedProcessStore;
 use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::TurnStatus;
@@ -230,6 +232,7 @@ pub(crate) struct ThreadManagerState {
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
     environment_manager: Arc<EnvironmentManager>,
+    unified_exec_process_store: SharedProcessStore,
     skills_manager: Arc<SkillsManager>,
     plugins_manager: Arc<PluginsManager>,
     mcp_manager: Arc<McpManager>,
@@ -297,6 +300,9 @@ impl ThreadManager {
                     collaboration_modes_config,
                 ),
                 environment_manager,
+                unified_exec_process_store: Arc::new(tokio::sync::Mutex::new(
+                    ProcessStore::default(),
+                )),
                 skills_manager,
                 plugins_manager,
                 mcp_manager,
@@ -372,6 +378,9 @@ impl ThreadManager {
                         CollaborationModesConfig::default(),
                     ),
                 environment_manager,
+                unified_exec_process_store: Arc::new(tokio::sync::Mutex::new(
+                    ProcessStore::default(),
+                )),
                 skills_manager,
                 plugins_manager,
                 mcp_manager,
@@ -1070,6 +1079,7 @@ impl ThreadManagerState {
             auth_manager,
             models_manager: Arc::clone(&self.models_manager),
             environment_manager: Arc::clone(&self.environment_manager),
+            unified_exec_process_store: Some(Arc::clone(&self.unified_exec_process_store)),
             skills_manager: Arc::clone(&self.skills_manager),
             plugins_manager: Arc::clone(&self.plugins_manager),
             mcp_manager: Arc::clone(&self.mcp_manager),

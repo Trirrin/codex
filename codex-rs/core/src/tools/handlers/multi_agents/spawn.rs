@@ -31,6 +31,7 @@ impl ToolHandler for Handler {
         } = invocation;
         let arguments = function_arguments(payload)?;
         let args: SpawnAgentArgs = parse_arguments(&arguments)?;
+        let mode = args.mode;
         let role_name = args
             .agent_type
             .as_deref()
@@ -108,7 +109,7 @@ impl ToolHandler for Handler {
         )
         .await
         .map_err(collab_spawn_error);
-        let (new_thread_id, new_agent_metadata, status) = match &result {
+        let (new_thread_id, new_agent_metadata, mut status) = match &result {
             Ok(spawned_agent) => (
                 Some(spawned_agent.thread_id),
                 Some(spawned_agent.metadata.clone()),
@@ -116,6 +117,13 @@ impl ToolHandler for Handler {
             ),
             Err(_) => (None, None, AgentStatus::NotFound),
         };
+        if matches!(mode, AgentToolMode::Blocking)
+            && let Some(thread_id) = new_thread_id
+        {
+            status =
+                wait_for_agent_final_status(session.clone(), thread_id, DEFAULT_WAIT_TIMEOUT_MS)
+                    .await;
+        }
         let agent_snapshot = match new_thread_id {
             Some(thread_id) => {
                 session
@@ -161,7 +169,7 @@ impl ToolHandler for Handler {
                     prompt,
                     model: effective_model,
                     reasoning_effort: effective_reasoning_effort,
-                    status,
+                    status: status.clone(),
                 }
                 .into(),
             )
@@ -177,6 +185,7 @@ impl ToolHandler for Handler {
         Ok(SpawnAgentResult {
             agent_id: new_thread_id.to_string(),
             nickname,
+            status: matches!(mode, AgentToolMode::Blocking).then_some(status),
         })
     }
 }
@@ -190,12 +199,16 @@ struct SpawnAgentArgs {
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     fork_context: bool,
+    #[serde(default)]
+    mode: AgentToolMode,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SpawnAgentResult {
     agent_id: String,
     nickname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<AgentStatus>,
 }
 
 impl ToolOutput for SpawnAgentResult {

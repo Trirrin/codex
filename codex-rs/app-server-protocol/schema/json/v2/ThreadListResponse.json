@@ -321,6 +321,13 @@
         }
       ]
     },
+    "CommandExecutionRunMode": {
+      "enum": [
+        "blocking",
+        "background"
+      ],
+      "type": "string"
+    },
     "CommandExecutionSource": {
       "enum": [
         "agent",
@@ -1120,6 +1127,16 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "runMode": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandExecutionRunMode"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "source": {

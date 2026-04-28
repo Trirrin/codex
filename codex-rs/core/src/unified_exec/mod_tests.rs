@@ -5,10 +5,14 @@ use crate::exec::ExecExpiration;
 use crate::sandboxing::ExecRequest;
 use crate::session::session::Session;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::ExecCommandToolOutput;
+use crate::unified_exec::ShellOutputRequest;
 use crate::unified_exec::WriteStdinRequest;
 use crate::unified_exec::process::OutputHandles;
+use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
 use codex_sandboxing::SandboxType;
 use codex_utils_output_truncation::approx_token_count;
 use core_test_support::get_remote_test_env;
@@ -24,6 +28,14 @@ use tokio::time::Instant;
 async fn test_session_and_turn() -> (Arc<Session>, Arc<TurnContext>) {
     let (session, turn) = make_session_and_context().await;
     (Arc::new(session), Arc::new(turn))
+}
+
+async fn test_session_and_turn_with_rx() -> (
+    Arc<Session>,
+    Arc<TurnContext>,
+    async_channel::Receiver<Event>,
+) {
+    make_session_and_context_with_rx().await
 }
 
 async fn exec_command(
@@ -103,16 +115,20 @@ async fn exec_command_with_tty(
     let context =
         UnifiedExecContext::new(Arc::clone(session), Arc::clone(turn), "call".to_string());
     let started_at = Instant::now();
+    let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+    async_watcher::start_streaming_output(&process, &context, Arc::clone(&transcript));
     let process_started_alive = !process.has_exited() && process.exit_code().is_none();
     if process_started_alive {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
+            transcript: Arc::clone(&transcript),
             call_id: context.call_id.clone(),
             process_id,
             hook_command: cmd.to_string(),
             tty,
             network_approval_id: None,
             session: Arc::downgrade(session),
+            started_at,
             last_used: started_at,
         };
         manager
@@ -158,6 +174,7 @@ async fn exec_command_with_tty(
         wall_time,
         raw_output: collected,
         max_output_tokens: None,
+        shell_id: response_process_id.map(|process_id| process_id.to_string()),
         process_id: response_process_id,
         exit_code,
         original_token_count: Some(approx_token_count(&text)),
@@ -189,6 +206,37 @@ async fn write_stdin(
             process_id,
             input,
             yield_time_ms,
+            max_output_tokens: None,
+        })
+        .await
+}
+
+async fn read_shell_output(
+    session: &Arc<Session>,
+    process_id: i32,
+) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+    session
+        .services
+        .unified_exec_manager
+        .read_shell_output(ShellOutputRequest {
+            process_id,
+            yield_time_ms: None,
+            max_output_tokens: None,
+        })
+        .await
+}
+
+async fn wait_shell_output(
+    session: &Arc<Session>,
+    process_id: i32,
+    yield_time_ms: u64,
+) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+    session
+        .services
+        .unified_exec_manager
+        .wait_shell_output(ShellOutputRequest {
+            process_id,
+            yield_time_ms: Some(yield_time_ms),
             max_output_tokens: None,
         })
         .await
@@ -258,6 +306,135 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
         out_2.truncated_output().contains("codex"),
         "expected environment variable output"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reattached_active_shell_receives_future_output() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn, rx) = test_session_and_turn_with_rx().await;
+    let open_shell = exec_command(
+        &session, &turn, "bash -i", /*yield_time_ms*/ 2_500, /*workdir*/ None,
+    )
+    .await?;
+    let process_id = open_shell.process_id.expect("expected process_id");
+    while rx.try_recv().is_ok() {}
+
+    let event_id = "reattach-test".to_string();
+    let events = session
+        .services
+        .unified_exec_manager
+        .reattach_active_shell_events(Arc::clone(&session), event_id.clone(), turn.cwd.clone())
+        .await;
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.msg,
+            EventMsg::ExecCommandBegin(begin)
+                if begin.call_id == format!("active-shell-{process_id}")
+        )),
+        "reattach should return a synthetic begin event for the active shell"
+    );
+
+    let marker = "reattached-output-marker";
+    write_stdin(
+        &session,
+        process_id,
+        format!("echo {marker}\n").as_str(),
+        /*yield_time_ms*/ 2_500,
+    )
+    .await?;
+
+    let expected_call_id = format!("active-shell-{process_id}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_reattached_output = false;
+    while Instant::now() < deadline {
+        if let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await
+            && let EventMsg::ExecCommandOutputDelta(delta) = event.msg
+            && delta.call_id == expected_call_id
+            && String::from_utf8_lossy(&delta.chunk).contains(marker)
+        {
+            saw_reattached_output = true;
+            break;
+        }
+    }
+
+    assert!(
+        saw_reattached_output,
+        "reattached session should receive future shell output"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_shell_output_returns_next_output_only() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = test_session_and_turn().await;
+    let open_shell = exec_command(
+        &session,
+        &turn,
+        "printf old; sleep 0.3; printf new; sleep 1",
+        /*yield_time_ms*/ 150,
+        /*workdir*/ None,
+    )
+    .await?;
+    let process_id = open_shell.process_id.expect("expected process_id");
+
+    let started = Instant::now();
+    let output = wait_shell_output(&session, process_id, /*yield_time_ms*/ 2_500).await?;
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "wait_shell_output should return when the next output arrives"
+    );
+    let text = output.truncated_output();
+    assert!(text.contains("new"), "expected next output: {text:?}");
+    assert!(
+        !text.contains("old"),
+        "should not return buffered history: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_shell_output_uses_session_stable_shell_id_after_exit() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = test_session_and_turn().await;
+    let open_shell = exec_command(
+        &session,
+        &turn,
+        "sleep 0.2; printf shell-output; sleep 1",
+        /*yield_time_ms*/ 750,
+        /*workdir*/ None,
+    )
+    .await?;
+    let process_id = open_shell.process_id.expect("expected process_id");
+    assert_eq!(
+        open_shell.shell_id.as_deref(),
+        Some(process_id.to_string().as_str())
+    );
+
+    write_stdin(&session, process_id, "", /*yield_time_ms*/ 2_500).await?;
+    let output = read_shell_output(&session, process_id).await?;
+
+    assert_eq!(
+        output.shell_id.as_deref(),
+        Some(process_id.to_string().as_str())
+    );
+    assert!(output.process_id.is_none());
+    assert_eq!(output.exit_code, Some(0));
+    assert!(output.truncated_output().contains("shell-output"));
+
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id(process_id)
+        .await;
 
     Ok(())
 }

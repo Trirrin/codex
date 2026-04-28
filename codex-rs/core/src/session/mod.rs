@@ -297,6 +297,7 @@ use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::turn_timing::TurnTimingState;
 use crate::turn_timing::record_turn_ttfm_metric;
+use crate::unified_exec::SharedProcessStore;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_git_utils::get_git_repo_root;
@@ -385,6 +386,7 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) models_manager: SharedModelsManager,
     pub(crate) environment_manager: Arc<EnvironmentManager>,
+    pub(crate) unified_exec_process_store: Option<SharedProcessStore>,
     pub(crate) skills_manager: Arc<SkillsManager>,
     pub(crate) plugins_manager: Arc<PluginsManager>,
     pub(crate) mcp_manager: Arc<McpManager>,
@@ -446,6 +448,7 @@ impl Codex {
             auth_manager,
             models_manager,
             environment_manager,
+            unified_exec_process_store,
             skills_manager,
             plugins_manager,
             mcp_manager,
@@ -606,6 +609,7 @@ impl Codex {
             thread_name: None,
             environments,
             original_config_do_not_use: Arc::clone(&config),
+            unified_exec_process_store,
             metrics_service_name,
             app_server_client_name: None,
             app_server_client_version: None,

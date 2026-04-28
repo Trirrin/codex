@@ -9,6 +9,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use codex_protocol::parse_command::ParsedCommand;
+use codex_protocol::protocol::ExecCommandRunMode;
 use codex_protocol::protocol::ExecCommandSource;
 
 #[derive(Clone, Debug, Default)]
@@ -27,6 +28,7 @@ pub(crate) struct ExecCall {
     pub(crate) parsed: Vec<ParsedCommand>,
     pub(crate) output: Option<CommandOutput>,
     pub(crate) source: ExecCommandSource,
+    pub(crate) run_mode: Option<ExecCommandRunMode>,
     pub(crate) start_time: Option<Instant>,
     pub(crate) duration: Option<Duration>,
     pub(crate) interaction_input: Option<String>,
@@ -52,6 +54,7 @@ impl ExecCell {
         command: Vec<String>,
         parsed: Vec<ParsedCommand>,
         source: ExecCommandSource,
+        run_mode: Option<ExecCommandRunMode>,
         interaction_input: Option<String>,
     ) -> Option<Self> {
         let call = ExecCall {
@@ -60,6 +63,7 @@ impl ExecCell {
             parsed,
             output: None,
             source,
+            run_mode,
             start_time: Some(Instant::now()),
             duration: None,
             interaction_input,
@@ -84,10 +88,14 @@ impl ExecCell {
         call_id: &str,
         output: CommandOutput,
         duration: Duration,
+        run_mode: Option<ExecCommandRunMode>,
     ) -> bool {
         let Some(call) = self.calls.iter_mut().rev().find(|c| c.call_id == call_id) else {
             return false;
         };
+        if run_mode.is_some() {
+            call.run_mode = run_mode;
+        }
         call.output = Some(output);
         call.duration = Some(duration);
         call.start_time = None;
@@ -95,7 +103,7 @@ impl ExecCell {
     }
 
     pub(crate) fn should_flush(&self) -> bool {
-        !self.is_exploring_cell() && self.calls.iter().all(|c| c.output.is_some())
+        !self.is_exploring_cell() && self.calls.iter().all(|c| c.start_time.is_none())
     }
 
     pub(crate) fn mark_failed(&mut self) {
@@ -121,14 +129,11 @@ impl ExecCell {
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        self.calls.iter().any(|c| c.output.is_none())
+        self.calls.iter().any(|c| c.start_time.is_some())
     }
 
     pub(crate) fn active_start_time(&self) -> Option<Instant> {
-        self.calls
-            .iter()
-            .find(|c| c.output.is_none())
-            .and_then(|c| c.start_time)
+        self.calls.iter().find_map(|c| c.start_time)
     }
 
     pub(crate) fn animations_enabled(&self) -> bool {
@@ -146,14 +151,19 @@ impl ExecCell {
         let Some(call) = self.calls.iter_mut().rev().find(|c| c.call_id == call_id) else {
             return false;
         };
+        if call.is_background_unified_exec_startup() {
+            return false;
+        }
         let output = call.output.get_or_insert_with(CommandOutput::default);
         output.aggregated_output.push_str(chunk);
         true
     }
 
     pub(super) fn is_exploring_call(call: &ExecCall) -> bool {
-        !matches!(call.source, ExecCommandSource::UserShell)
-            && !call.parsed.is_empty()
+        !matches!(
+            call.source,
+            ExecCommandSource::UserShell | ExecCommandSource::UnifiedExecStartup
+        ) && !call.parsed.is_empty()
             && call.parsed.iter().all(|p| {
                 matches!(
                     p,
@@ -172,5 +182,14 @@ impl ExecCall {
 
     pub(crate) fn is_unified_exec_interaction(&self) -> bool {
         matches!(self.source, ExecCommandSource::UnifiedExecInteraction)
+    }
+
+    pub(crate) fn is_unified_exec_startup(&self) -> bool {
+        matches!(self.source, ExecCommandSource::UnifiedExecStartup)
+    }
+
+    pub(crate) fn is_background_unified_exec_startup(&self) -> bool {
+        self.is_unified_exec_startup()
+            && matches!(self.run_mode, Some(ExecCommandRunMode::Background))
     }
 }

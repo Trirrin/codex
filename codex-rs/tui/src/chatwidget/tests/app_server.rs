@@ -303,6 +303,7 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
                 cwd: test_path_buf("/tmp").abs(),
                 process_id: None,
                 source: AppServerCommandExecutionSource::UserShell,
+                run_mode: None,
                 status: AppServerCommandExecutionStatus::InProgress,
                 command_actions: vec![AppServerCommandAction::Unknown {
                     command: script.to_string(),
@@ -324,6 +325,7 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
                 cwd: test_path_buf("/tmp").abs(),
                 process_id: None,
                 source: AppServerCommandExecutionSource::UserShell,
+                run_mode: None,
                 status: AppServerCommandExecutionStatus::Completed,
                 command_actions: vec![AppServerCommandAction::Unknown {
                     command: script.to_string(),
@@ -339,10 +341,10 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
     let cells = drain_insert_history(&mut rx);
     assert_eq!(
         cells.len(),
-        1,
-        "expected one completed command history cell"
+        0,
+        "completed command should update the active history cell in place"
     );
-    let blob = lines_to_single_string(cells.first().expect("command cell"));
+    let blob = active_blob(&chat);
     assert_chatwidget_snapshot!(
         "live_app_server_command_execution_strips_shell_wrapper",
         blob

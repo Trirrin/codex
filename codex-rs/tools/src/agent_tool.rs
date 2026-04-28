@@ -32,6 +32,7 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions<'_>) -> ToolSpe
     let return_value_description =
         "Returns the spawned agent id plus the user-facing nickname when available.";
     let mut properties = spawn_agent_common_properties_v1(&options.agent_type_description);
+    add_agent_mode_property(&mut properties);
     if options.hide_agent_type_model_reasoning {
         hide_spawn_agent_metadata_options(&mut properties);
     }
@@ -55,6 +56,7 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions<'_>) -> ToolSpe
     let available_models_description = (!options.hide_agent_type_model_reasoning)
         .then(|| spawn_agent_models_description(options.available_models));
     let mut properties = spawn_agent_common_properties_v2(&options.agent_type_description);
+    add_agent_mode_property(&mut properties);
     if options.hide_agent_type_model_reasoning {
         hide_spawn_agent_metadata_options(&mut properties);
     }
@@ -78,7 +80,11 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions<'_>) -> ToolSpe
         defer_loading: None,
         parameters: JsonSchema::object(
             properties,
-            Some(vec!["task_name".to_string(), "message".to_string()]),
+            Some(vec![
+                "task_name".to_string(),
+                "message".to_string(),
+                "mode".to_string(),
+            ]),
             Some(false.into()),
         ),
         output_schema: Some(spawn_agent_output_schema_v2(
@@ -88,7 +94,7 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions<'_>) -> ToolSpe
 }
 
 pub fn create_send_input_tool_v1() -> ToolSpec {
-    let properties = BTreeMap::from([
+    let mut properties = BTreeMap::from([
         (
             "target".to_string(),
             JsonSchema::string(Some("Agent id to message (from spawn_agent).".to_string())),
@@ -109,6 +115,7 @@ pub fn create_send_input_tool_v1() -> ToolSpec {
             )),
         ),
     ]);
+    add_agent_mode_property(&mut properties);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "send_input".to_string(),
@@ -116,7 +123,11 @@ pub fn create_send_input_tool_v1() -> ToolSpec {
             .to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["target".to_string(), "mode".to_string()]),
+            Some(false.into()),
+        ),
         output_schema: Some(send_input_output_schema()),
     })
 }
@@ -153,7 +164,7 @@ pub fn create_send_message_tool() -> ToolSpec {
 }
 
 pub fn create_followup_task_tool() -> ToolSpec {
-    let properties = BTreeMap::from([
+    let mut properties = BTreeMap::from([
         (
             "target".to_string(),
             JsonSchema::string(Some(
@@ -174,6 +185,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
             )),
         ),
     ]);
+    add_agent_mode_property(&mut properties);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "followup_task".to_string(),
@@ -181,7 +193,15 @@ pub fn create_followup_task_tool() -> ToolSpec {
             .to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(properties, Some(vec!["target".to_string(), "message".to_string()]), Some(false.into())),
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec![
+                "target".to_string(),
+                "message".to_string(),
+                "mode".to_string(),
+            ]),
+            Some(false.into()),
+        ),
         output_schema: None,
     })
 }
@@ -325,11 +345,25 @@ fn spawn_agent_output_schema_v1() -> Value {
             "nickname": {
                 "type": ["string", "null"],
                 "description": "User-facing nickname for the spawned agent when available."
+            },
+            "status": {
+                "description": "Final status when mode is blocking.",
+                "anyOf": [agent_status_output_schema(), { "type": "null" }]
             }
         },
         "required": ["agent_id", "nickname"],
         "additionalProperties": false
     })
+}
+
+fn add_agent_mode_property(properties: &mut BTreeMap<String, JsonSchema>) {
+    properties.insert(
+        "mode".to_string(),
+        JsonSchema::string(Some(
+            "Execution mode: \"background\" returns immediately after starting the agent; \"blocking\" waits for the target agent to reach a final status."
+                .to_string(),
+        )),
+    );
 }
 
 fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
@@ -357,6 +391,10 @@ fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
             "nickname": {
                 "type": ["string", "null"],
                 "description": "User-facing nickname for the spawned agent when available."
+            },
+            "status": {
+                "description": "Final status when mode is blocking.",
+                "anyOf": [agent_status_output_schema(), { "type": "null" }]
             }
         },
         "required": ["task_name", "nickname"],
@@ -371,6 +409,10 @@ fn send_input_output_schema() -> Value {
             "submission_id": {
                 "type": "string",
                 "description": "Identifier for the queued input submission."
+            },
+            "status": {
+                "description": "Final status when mode is blocking.",
+                "anyOf": [agent_status_output_schema(), { "type": "null" }]
             }
         },
         "required": ["submission_id"],

@@ -57,11 +57,19 @@ impl ToolHandler for Handler {
             .send_input(receiver_thread_id, input_items)
             .await
             .map_err(|err| collab_agent_error(receiver_thread_id, err));
-        let status = session
+        let mut status = session
             .services
             .agent_control
             .get_status(receiver_thread_id)
             .await;
+        if matches!(args.mode, AgentToolMode::Blocking) {
+            status = wait_for_agent_final_status(
+                session.clone(),
+                receiver_thread_id,
+                DEFAULT_WAIT_TIMEOUT_MS,
+            )
+            .await;
+        }
         session
             .send_event(
                 &turn,
@@ -72,14 +80,17 @@ impl ToolHandler for Handler {
                     receiver_agent_nickname: receiver_agent.agent_nickname,
                     receiver_agent_role: receiver_agent.agent_role,
                     prompt,
-                    status,
+                    status: status.clone(),
                 }
                 .into(),
             )
             .await;
         let submission_id = result?;
 
-        Ok(SendInputResult { submission_id })
+        Ok(SendInputResult {
+            submission_id,
+            status: matches!(args.mode, AgentToolMode::Blocking).then_some(status),
+        })
     }
 }
 
@@ -90,11 +101,15 @@ struct SendInputArgs {
     items: Option<Vec<UserInput>>,
     #[serde(default)]
     interrupt: bool,
+    #[serde(default)]
+    mode: AgentToolMode,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SendInputResult {
     submission_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<AgentStatus>,
 }
 
 impl ToolOutput for SendInputResult {

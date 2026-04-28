@@ -934,6 +934,7 @@ fn command_execution_started_event(turn_id: &str, item: &ThreadItem) -> Option<V
         cwd,
         process_id,
         source,
+        run_mode,
         command_actions,
         ..
     } = item
@@ -955,6 +956,7 @@ fn command_execution_started_event(turn_id: &str, item: &ThreadItem) -> Option<V
                 .map(codex_app_server_protocol::CommandAction::into_core)
                 .collect(),
             source: source.to_core(),
+            run_mode: run_mode.map(codex_app_server_protocol::CommandExecutionRunMode::to_core),
             interaction_input: None,
         }),
     }])
@@ -968,6 +970,7 @@ fn command_execution_completed_event(turn_id: &str, item: &ThreadItem) -> Option
         cwd,
         process_id,
         source,
+        run_mode: _,
         status,
         command_actions,
         aggregated_output,
@@ -1075,6 +1078,7 @@ mod tests {
     use codex_app_server_protocol::CodexErrorInfo;
     use codex_app_server_protocol::CommandAction;
     use codex_app_server_protocol::CommandExecutionOutputDeltaNotification;
+    use codex_app_server_protocol::CommandExecutionRunMode;
     use codex_app_server_protocol::CommandExecutionSource;
     use codex_app_server_protocol::CommandExecutionStatus;
     use codex_app_server_protocol::GuardianWarningNotification;
@@ -1203,6 +1207,7 @@ mod tests {
             cwd: test_path_buf("/tmp").abs(),
             process_id: None,
             source: CommandExecutionSource::UserShell,
+            run_mode: None,
             status: CommandExecutionStatus::InProgress,
             command_actions: vec![CommandAction::Unknown {
                 command: "printf hello world".to_string(),
@@ -1233,6 +1238,33 @@ mod tests {
         );
         assert_eq!(begin.cwd.as_path(), test_path_buf("/tmp").as_path());
         assert_eq!(begin.source, ExecCommandSource::UserShell);
+        assert_eq!(begin.run_mode, None);
+
+        let background_item = ThreadItem::CommandExecution {
+            id: "cmd-bg".to_string(),
+            command: "sleep 100".to_string(),
+            cwd: test_path_buf("/tmp").abs(),
+            process_id: Some("123".to_string()),
+            source: CommandExecutionSource::UnifiedExecStartup,
+            run_mode: Some(CommandExecutionRunMode::Background),
+            status: CommandExecutionStatus::InProgress,
+            command_actions: Vec::new(),
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+        };
+        let events =
+            command_execution_started_event("turn-1", &background_item).expect("background start");
+        let [event] = events.as_slice() else {
+            panic!("expected one background start event");
+        };
+        let EventMsg::ExecCommandBegin(background_begin) = &event.msg else {
+            panic!("expected exec begin event");
+        };
+        assert_eq!(
+            background_begin.run_mode,
+            Some(codex_protocol::protocol::ExecCommandRunMode::Background)
+        );
 
         let (_, delta_events) =
             server_notification_thread_events(ServerNotification::CommandExecutionOutputDelta(
@@ -1259,6 +1291,7 @@ mod tests {
             cwd: test_path_buf("/tmp").abs(),
             process_id: None,
             source: CommandExecutionSource::UserShell,
+            run_mode: None,
             status: CommandExecutionStatus::Completed,
             command_actions: vec![CommandAction::Unknown {
                 command: "printf hello world".to_string(),
@@ -1296,6 +1329,7 @@ mod tests {
             cwd: test_path_buf("/tmp").abs(),
             process_id: None,
             source: CommandExecutionSource::UserShell,
+            run_mode: None,
             status: CommandExecutionStatus::InProgress,
             command_actions: vec![],
             aggregated_output: None,
@@ -1344,6 +1378,7 @@ mod tests {
                     cwd: test_path_buf("/tmp").abs(),
                     process_id: None,
                     source: CommandExecutionSource::UserShell,
+                    run_mode: None,
                     status: CommandExecutionStatus::Completed,
                     command_actions: vec![CommandAction::Unknown {
                         command: "printf hello world".to_string(),

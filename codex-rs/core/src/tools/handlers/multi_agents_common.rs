@@ -21,14 +21,29 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch::Receiver;
+use tokio::time::Instant;
+use tokio::time::timeout_at;
 
 /// Minimum wait timeout to prevent tight polling loops from burning CPU.
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = 3600 * 1000;
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub(crate) enum AgentToolMode {
+    Blocking,
+    #[default]
+    Background,
+}
 
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
     match payload {
@@ -130,6 +145,58 @@ pub(crate) fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionC
             FunctionCallError::RespondToModel("collab manager unavailable".to_string())
         }
         err => FunctionCallError::RespondToModel(format!("collab tool failed: {err}")),
+    }
+}
+
+pub(crate) async fn wait_for_agent_final_status(
+    session: Arc<Session>,
+    thread_id: ThreadId,
+    timeout_ms: i64,
+) -> AgentStatus {
+    let timeout_ms = timeout_ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    match session
+        .services
+        .agent_control
+        .subscribe_status(thread_id)
+        .await
+    {
+        Ok(status_rx) => {
+            match timeout_at(
+                deadline,
+                wait_for_final_status(session.clone(), thread_id, status_rx),
+            )
+            .await
+            .ok()
+            .flatten()
+            {
+                Some((_, status)) => status,
+                None => session.services.agent_control.get_status(thread_id).await,
+            }
+        }
+        Err(_) => session.services.agent_control.get_status(thread_id).await,
+    }
+}
+
+async fn wait_for_final_status(
+    session: Arc<Session>,
+    thread_id: ThreadId,
+    mut status_rx: Receiver<AgentStatus>,
+) -> Option<(ThreadId, AgentStatus)> {
+    let mut status = status_rx.borrow().clone();
+    if crate::agent::status::is_final(&status) {
+        return Some((thread_id, status));
+    }
+
+    loop {
+        if status_rx.changed().await.is_err() {
+            let latest = session.services.agent_control.get_status(thread_id).await;
+            return crate::agent::status::is_final(&latest).then_some((thread_id, latest));
+        }
+        status = status_rx.borrow().clone();
+        if crate::agent::status::is_final(&status) {
+            return Some((thread_id, status));
+        }
     }
 }
 

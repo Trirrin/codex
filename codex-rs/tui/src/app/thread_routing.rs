@@ -674,6 +674,12 @@ impl App {
                     .await?;
                 Ok(true)
             }
+            AppCommandView::CleanBackgroundActivity => {
+                app_server
+                    .thread_background_activity_clean(thread_id)
+                    .await?;
+                Ok(true)
+            }
             AppCommandView::RealtimeConversationStart(params) => {
                 app_server
                     .thread_realtime_start(thread_id, params.clone())

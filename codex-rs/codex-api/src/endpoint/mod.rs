@@ -10,6 +10,7 @@ mod session;
 pub use compact::CompactClient;
 pub use memories::MemoriesClient;
 pub use models::ModelsClient;
+pub use models::decode_models_response;
 pub use realtime_call::RealtimeCallClient;
 pub use realtime_call::RealtimeCallResponse;
 pub use realtime_websocket::RealtimeEventParser;

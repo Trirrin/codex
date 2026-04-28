@@ -335,6 +335,11 @@ client_request_definitions! {
         params: v2::ThreadBackgroundTerminalsCleanParams,
         response: v2::ThreadBackgroundTerminalsCleanResponse,
     },
+    #[experimental("thread/backgroundActivity/clean")]
+    ThreadBackgroundActivityClean => "thread/backgroundActivity/clean" {
+        params: v2::ThreadBackgroundActivityCleanParams,
+        response: v2::ThreadBackgroundActivityCleanResponse,
+    },
     ThreadRollback => "thread/rollback" {
         params: v2::ThreadRollbackParams,
         response: v2::ThreadRollbackResponse,
@@ -1854,6 +1859,27 @@ mod tests {
         assert_eq!(
             json!({
                 "method": "thread/backgroundTerminals/clean",
+                "id": 8,
+                "params": {
+                    "threadId": "thr_123"
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_thread_background_activity_clean() -> Result<()> {
+        let request = ClientRequest::ThreadBackgroundActivityClean {
+            request_id: RequestId::Integer(8),
+            params: v2::ThreadBackgroundActivityCleanParams {
+                thread_id: "thr_123".to_string(),
+            },
+        };
+        assert_eq!(
+            json!({
+                "method": "thread/backgroundActivity/clean",
                 "id": 8,
                 "params": {
                     "threadId": "thr_123"

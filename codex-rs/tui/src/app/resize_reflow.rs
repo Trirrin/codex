@@ -124,17 +124,23 @@ impl App {
     /// The buffer stores display lines, not cells, because the cap is measured in terminal rows.
     /// This mirrors terminal scrollback behavior and avoids making startup replay cheaper or more
     /// expensive than a later resize rebuild of the same transcript.
-    pub(super) fn finish_initial_history_replay_buffer(&mut self, tui: &mut tui::Tui) {
+    pub(super) fn finish_initial_history_replay_buffer(
+        &mut self,
+        tui: &mut tui::Tui,
+    ) -> Result<()> {
         let Some(buffer) = self.initial_history_replay_buffer.take() else {
-            return;
+            return Ok(());
         };
 
         if buffer.retained_lines.is_empty() {
-            return;
+            return Ok(());
         }
 
         let retained_lines = buffer.retained_lines.into_iter().collect::<Vec<_>>();
         tui.insert_history_lines(retained_lines);
+        self.schedule_immediate_resize_reflow(tui);
+        self.maybe_run_resize_reflow(tui)?;
+        Ok(())
     }
 
     pub(super) fn insert_history_cell_lines_with_initial_replay_buffer(

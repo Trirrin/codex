@@ -7,6 +7,10 @@ use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use crate::tools::events::ToolEmitter;
+use crate::tools::events::ToolEventCtx;
+use crate::tools::events::ToolEventFailure;
+use crate::tools::events::ToolEventStage;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::implicit_granted_permissions;
@@ -19,7 +23,9 @@ use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+use crate::unified_exec::ActiveShell;
 use crate::unified_exec::ExecCommandRequest;
+use crate::unified_exec::ShellOutputRequest;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
@@ -29,8 +35,12 @@ use crate::unified_exec::resolve_max_tokens;
 use codex_features::Feature;
 use codex_otel::SessionTelemetry;
 use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
+use codex_protocol::exec_output::ExecToolCallOutput;
+use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandRunMode;
+use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::TerminalInteractionEvent;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_tools::UnifiedExecShellMode;
@@ -46,6 +56,8 @@ pub struct UnifiedExecHandler;
 pub(crate) struct ExecCommandArgs {
     cmd: String,
     #[serde(default)]
+    mode: Option<ExecuteMode>,
+    #[serde(default)]
     pub(crate) workdir: Option<String>,
     #[serde(default)]
     shell: Option<String>,
@@ -53,7 +65,7 @@ pub(crate) struct ExecCommandArgs {
     login: Option<bool>,
     #[serde(default = "default_tty")]
     tty: bool,
-    #[serde(default = "default_exec_yield_time_ms")]
+    #[serde(default = "default_write_stdin_yield_time_ms")]
     yield_time_ms: u64,
     #[serde(default)]
     max_output_tokens: Option<usize>,
@@ -69,14 +81,36 @@ pub(crate) struct ExecCommandArgs {
 
 #[derive(Debug, Deserialize)]
 struct WriteStdinArgs {
-    // The model is trained on `session_id`.
-    session_id: i32,
-    #[serde(default)]
+    #[serde(alias = "session_id")]
+    process_id: i32,
     chars: String,
-    #[serde(default = "default_write_stdin_yield_time_ms")]
+    #[serde(default = "default_exec_yield_time_ms")]
     yield_time_ms: u64,
     #[serde(default)]
     max_output_tokens: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShellOutputArgs {
+    shell_id: String,
+    #[serde(default)]
+    yield_time_ms: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StopShellArgs {
+    shell_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+enum ExecuteMode {
+    #[default]
+    Blocking,
+    Background,
 }
 
 fn default_exec_yield_time_ms() -> u64 {
@@ -118,6 +152,17 @@ impl ToolHandler for UnifiedExecHandler {
             return true;
         };
 
+        if matches!(
+            invocation.tool_name.name.as_str(),
+            "read_shell_output" | "wait_shell_output" | "list_shells"
+        ) {
+            return false;
+        }
+
+        if invocation.tool_name.name.as_str() == "stop_shell" {
+            return true;
+        }
+
         let Ok(params) = parse_arguments::<ExecCommandArgs>(arguments) else {
             return true;
         };
@@ -134,9 +179,8 @@ impl ToolHandler for UnifiedExecHandler {
     }
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
-        if invocation.tool_name.namespace.is_some()
-            || invocation.tool_name.name.as_str() != "exec_command"
-        {
+        let name = invocation.tool_name.name.as_str();
+        if invocation.tool_name.namespace.is_some() || !matches!(name, "execute" | "exec_command") {
             return None;
         }
 
@@ -160,6 +204,12 @@ impl ToolHandler for UnifiedExecHandler {
         let ToolPayload::Function { .. } = &invocation.payload else {
             return None;
         };
+        if matches!(
+            invocation.tool_name.name.as_str(),
+            "read_shell_output" | "wait_shell_output" | "list_shells" | "stop_shell"
+        ) {
+            return None;
+        }
 
         let command = result.hook_command.clone()?;
         let tool_use_id = if result.event_call_id.is_empty() {
@@ -207,7 +257,8 @@ impl ToolHandler for UnifiedExecHandler {
         let context = UnifiedExecContext::new(session.clone(), turn.clone(), call_id.clone());
 
         let response = match tool_name.name.as_str() {
-            "exec_command" => {
+            "execute" | "exec_command" => {
+                let legacy_exec_command = tool_name.name.as_str() == "exec_command";
                 let cwd = resolve_workdir_base_path(&arguments, &context.turn.cwd)?;
                 let args: ExecCommandArgs = parse_arguments_with_base_path(&arguments, &cwd)?;
                 let hook_command = args.cmd.clone();
@@ -230,6 +281,7 @@ impl ToolHandler for UnifiedExecHandler {
                 let command_for_display = codex_shell_command::parse_command::shlex_join(&command);
 
                 let ExecCommandArgs {
+                    mode,
                     workdir,
                     tty,
                     yield_time_ms,
@@ -240,6 +292,15 @@ impl ToolHandler for UnifiedExecHandler {
                     prefix_rule,
                     ..
                 } = args;
+                let mode = mode.unwrap_or(if legacy_exec_command {
+                    ExecuteMode::Background
+                } else {
+                    ExecuteMode::Blocking
+                });
+                let run_mode = match mode {
+                    ExecuteMode::Blocking => ExecCommandRunMode::Blocking,
+                    ExecuteMode::Background => ExecCommandRunMode::Background,
+                };
                 let max_output_tokens =
                     effective_max_output_tokens(max_output_tokens, turn.truncation_policy);
 
@@ -323,6 +384,7 @@ impl ToolHandler for UnifiedExecHandler {
                         wall_time: std::time::Duration::ZERO,
                         raw_output: output.into_text().into_bytes(),
                         max_output_tokens: Some(max_output_tokens),
+                        shell_id: None,
                         process_id: None,
                         exit_code: None,
                         original_token_count: None,
@@ -337,6 +399,7 @@ impl ToolHandler for UnifiedExecHandler {
                             command,
                             hook_command: hook_command.clone(),
                             process_id,
+                            run_mode,
                             yield_time_ms,
                             max_output_tokens: Some(max_output_tokens),
                             workdir,
@@ -354,7 +417,12 @@ impl ToolHandler for UnifiedExecHandler {
                     )
                     .await
                 {
-                    Ok(response) => response,
+                    Ok(response) => match mode {
+                        ExecuteMode::Background => response,
+                        ExecuteMode::Blocking => {
+                            wait_for_process_exit(manager, response, max_output_tokens).await?
+                        }
+                    },
                     Err(UnifiedExecError::SandboxDenied { output, .. }) => {
                         let output_text = output.aggregated_output.text;
                         let original_token_count = approx_token_count(&output_text);
@@ -364,8 +432,9 @@ impl ToolHandler for UnifiedExecHandler {
                             wall_time: output.duration,
                             raw_output: output_text.into_bytes(),
                             max_output_tokens: Some(max_output_tokens),
+                            shell_id: None,
                             // Sandbox denial is terminal, so there is no live
-                            // process for write_stdin to resume.
+                            // process for background follow-up polling to resume.
                             process_id: None,
                             exit_code: Some(output.exit_code),
                             original_token_count: Some(original_token_count),
@@ -374,10 +443,204 @@ impl ToolHandler for UnifiedExecHandler {
                     }
                     Err(err) => {
                         return Err(FunctionCallError::RespondToModel(format!(
-                            "exec_command failed for `{command_for_display}`: {err:?}"
+                            "execute failed for `{command_for_display}`: {err:?}"
                         )));
                     }
                 }
+            }
+            "read_shell_output" => {
+                let args: ShellOutputArgs = parse_arguments(&arguments)?;
+                let process_id = parse_shell_id(&args.shell_id)?;
+                let max_output_tokens =
+                    effective_max_output_tokens(args.max_output_tokens, turn.truncation_policy);
+                let emitter = shell_output_tool_emitter(
+                    "read_shell_output",
+                    &args.shell_id,
+                    &context.turn.cwd,
+                );
+                let event_ctx = ToolEventCtx::new(
+                    context.session.as_ref(),
+                    context.turn.as_ref(),
+                    &context.call_id,
+                    /*turn_diff_tracker*/ None,
+                );
+                emitter.emit(event_ctx, ToolEventStage::Begin).await;
+                let response = match manager
+                    .read_shell_output(ShellOutputRequest {
+                        process_id,
+                        yield_time_ms: None,
+                        max_output_tokens: Some(max_output_tokens),
+                    })
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(err) => {
+                        let message = format!(
+                            "read_shell_output failed for shell {}: {err}",
+                            args.shell_id
+                        );
+                        let event_ctx = ToolEventCtx::new(
+                            context.session.as_ref(),
+                            context.turn.as_ref(),
+                            &context.call_id,
+                            /*turn_diff_tracker*/ None,
+                        );
+                        emitter
+                            .emit(
+                                event_ctx,
+                                ToolEventStage::Failure(ToolEventFailure::Message(message.clone())),
+                            )
+                            .await;
+                        return Err(FunctionCallError::RespondToModel(message));
+                    }
+                };
+                let event_ctx = ToolEventCtx::new(
+                    context.session.as_ref(),
+                    context.turn.as_ref(),
+                    &context.call_id,
+                    /*turn_diff_tracker*/ None,
+                );
+                emitter
+                    .emit(
+                        event_ctx,
+                        ToolEventStage::Success(exec_output_from_response(&response)),
+                    )
+                    .await;
+                response
+            }
+            "wait_shell_output" => {
+                let args: ShellOutputArgs = parse_arguments(&arguments)?;
+                let process_id = parse_shell_id(&args.shell_id)?;
+                let max_output_tokens =
+                    effective_max_output_tokens(args.max_output_tokens, turn.truncation_policy);
+                let emitter = shell_output_tool_emitter(
+                    "wait_shell_output",
+                    &args.shell_id,
+                    &context.turn.cwd,
+                );
+                let event_ctx = ToolEventCtx::new(
+                    context.session.as_ref(),
+                    context.turn.as_ref(),
+                    &context.call_id,
+                    /*turn_diff_tracker*/ None,
+                );
+                emitter.emit(event_ctx, ToolEventStage::Begin).await;
+                let response = match manager
+                    .wait_shell_output(ShellOutputRequest {
+                        process_id,
+                        yield_time_ms: args.yield_time_ms,
+                        max_output_tokens: Some(max_output_tokens),
+                    })
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(err) => {
+                        let message = format!(
+                            "wait_shell_output failed for shell {}: {err}",
+                            args.shell_id
+                        );
+                        let event_ctx = ToolEventCtx::new(
+                            context.session.as_ref(),
+                            context.turn.as_ref(),
+                            &context.call_id,
+                            /*turn_diff_tracker*/ None,
+                        );
+                        emitter
+                            .emit(
+                                event_ctx,
+                                ToolEventStage::Failure(ToolEventFailure::Message(message.clone())),
+                            )
+                            .await;
+                        return Err(FunctionCallError::RespondToModel(message));
+                    }
+                };
+                let event_ctx = ToolEventCtx::new(
+                    context.session.as_ref(),
+                    context.turn.as_ref(),
+                    &context.call_id,
+                    /*turn_diff_tracker*/ None,
+                );
+                emitter
+                    .emit(
+                        event_ctx,
+                        ToolEventStage::Success(exec_output_from_response(&response)),
+                    )
+                    .await;
+                response
+            }
+            "list_shells" => {
+                let emitter = shell_management_tool_emitter("list_shells", None, &context.turn.cwd);
+                let event_ctx = ToolEventCtx::new(
+                    context.session.as_ref(),
+                    context.turn.as_ref(),
+                    &context.call_id,
+                    /*turn_diff_tracker*/ None,
+                );
+                emitter.emit(event_ctx, ToolEventStage::Begin).await;
+                let response = shell_list_response(manager.active_shells().await);
+                let event_ctx = ToolEventCtx::new(
+                    context.session.as_ref(),
+                    context.turn.as_ref(),
+                    &context.call_id,
+                    /*turn_diff_tracker*/ None,
+                );
+                emitter
+                    .emit(
+                        event_ctx,
+                        ToolEventStage::Success(exec_output_from_response(&response)),
+                    )
+                    .await;
+                response
+            }
+            "stop_shell" => {
+                let args: StopShellArgs = parse_arguments(&arguments)?;
+                let process_id = parse_shell_id(&args.shell_id)?;
+                let emitter = shell_management_tool_emitter(
+                    "stop_shell",
+                    Some(&args.shell_id),
+                    &context.turn.cwd,
+                );
+                let event_ctx = ToolEventCtx::new(
+                    context.session.as_ref(),
+                    context.turn.as_ref(),
+                    &context.call_id,
+                    /*turn_diff_tracker*/ None,
+                );
+                emitter.emit(event_ctx, ToolEventStage::Begin).await;
+                let stopped = match manager.terminate_process(process_id).await {
+                    Ok(stopped) => stopped,
+                    Err(err) => {
+                        let message =
+                            format!("stop_shell failed for shell {}: {err}", args.shell_id);
+                        let event_ctx = ToolEventCtx::new(
+                            context.session.as_ref(),
+                            context.turn.as_ref(),
+                            &context.call_id,
+                            /*turn_diff_tracker*/ None,
+                        );
+                        emitter
+                            .emit(
+                                event_ctx,
+                                ToolEventStage::Failure(ToolEventFailure::Message(message.clone())),
+                            )
+                            .await;
+                        return Err(FunctionCallError::RespondToModel(message));
+                    }
+                };
+                let response = shell_stop_response(stopped);
+                let event_ctx = ToolEventCtx::new(
+                    context.session.as_ref(),
+                    context.turn.as_ref(),
+                    &context.call_id,
+                    /*turn_diff_tracker*/ None,
+                );
+                emitter
+                    .emit(
+                        event_ctx,
+                        ToolEventStage::Success(exec_output_from_response(&response)),
+                    )
+                    .await;
+                response
             }
             "write_stdin" => {
                 let args: WriteStdinArgs = parse_arguments(&arguments)?;
@@ -385,25 +648,29 @@ impl ToolHandler for UnifiedExecHandler {
                     effective_max_output_tokens(args.max_output_tokens, turn.truncation_policy);
                 let response = manager
                     .write_stdin(WriteStdinRequest {
-                        process_id: args.session_id,
+                        process_id: args.process_id,
                         input: &args.chars,
                         yield_time_ms: args.yield_time_ms,
                         max_output_tokens: Some(max_output_tokens),
                     })
                     .await
                     .map_err(|err| {
-                        FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
+                        FunctionCallError::RespondToModel(format!(
+                            "write_stdin failed for process {}: {err}",
+                            args.process_id
+                        ))
                     })?;
-
-                let interaction = TerminalInteractionEvent {
-                    call_id: response.event_call_id.clone(),
-                    process_id: args.session_id.to_string(),
-                    stdin: args.chars.clone(),
-                };
-                session
-                    .send_event(turn.as_ref(), EventMsg::TerminalInteraction(interaction))
+                context
+                    .session
+                    .send_event(
+                        context.turn.as_ref(),
+                        EventMsg::TerminalInteraction(TerminalInteractionEvent {
+                            call_id: response.event_call_id.clone(),
+                            process_id: args.process_id.to_string(),
+                            stdin: args.chars,
+                        }),
+                    )
                     .await;
-
                 response
             }
             other => {
@@ -417,12 +684,170 @@ impl ToolHandler for UnifiedExecHandler {
     }
 }
 
+fn shell_output_tool_emitter(
+    tool_name: &str,
+    shell_id: &str,
+    cwd: &codex_utils_absolute_path::AbsolutePathBuf,
+) -> ToolEmitter {
+    ToolEmitter::unified_exec(
+        &[
+            "bash".to_string(),
+            "-lc".to_string(),
+            format!("{tool_name} {shell_id}"),
+        ],
+        cwd.clone(),
+        ExecCommandSource::UnifiedExecInteraction,
+        Some(shell_id.to_string()),
+        None,
+    )
+}
+
+fn shell_management_tool_emitter(
+    tool_name: &str,
+    shell_id: Option<&str>,
+    cwd: &codex_utils_absolute_path::AbsolutePathBuf,
+) -> ToolEmitter {
+    let command = shell_id.map_or_else(
+        || tool_name.to_string(),
+        |shell_id| format!("{tool_name} {shell_id}"),
+    );
+    ToolEmitter::unified_exec(
+        &["bash".to_string(), "-lc".to_string(), command],
+        cwd.clone(),
+        ExecCommandSource::UnifiedExecInteraction,
+        shell_id.map(str::to_string),
+        None,
+    )
+}
+
+fn shell_list_response(shells: Vec<ActiveShell>) -> ExecCommandToolOutput {
+    let output = if shells.is_empty() {
+        "No active shells.".to_string()
+    } else {
+        let mut lines = vec![format!("{} active shell(s):", shells.len())];
+        lines.extend(shells.into_iter().map(|shell| {
+            format!(
+                "- shell_id: {}, runtime: {}, command: {}",
+                shell.shell_id,
+                format_duration(shell.runtime),
+                shell.command
+            )
+        }));
+        lines.join("\n")
+    };
+    text_tool_output(output, None, None)
+}
+
+fn shell_stop_response(shell: ActiveShell) -> ExecCommandToolOutput {
+    text_tool_output(
+        format!(
+            "Stopped shell {} after {}: {}",
+            shell.shell_id,
+            format_duration(shell.runtime),
+            shell.command
+        ),
+        Some(shell.shell_id.to_string()),
+        None,
+    )
+}
+
+fn text_tool_output(
+    output: String,
+    shell_id: Option<String>,
+    process_id: Option<i32>,
+) -> ExecCommandToolOutput {
+    let original_token_count = approx_token_count(&output);
+    ExecCommandToolOutput {
+        event_call_id: String::new(),
+        chunk_id: generate_chunk_id(),
+        wall_time: std::time::Duration::ZERO,
+        raw_output: output.into_bytes(),
+        max_output_tokens: None,
+        shell_id,
+        process_id,
+        exit_code: Some(0),
+        original_token_count: Some(original_token_count),
+        hook_command: None,
+    }
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
+    }
+}
+
+fn exec_output_from_response(response: &ExecCommandToolOutput) -> ExecToolCallOutput {
+    let output = String::from_utf8_lossy(&response.raw_output).to_string();
+    ExecToolCallOutput {
+        exit_code: response.exit_code.unwrap_or(0),
+        stdout: StreamOutput::new(output.clone()),
+        stderr: StreamOutput::new(String::new()),
+        aggregated_output: StreamOutput::new(output),
+        duration: response.wall_time,
+        timed_out: false,
+    }
+}
+
+fn parse_shell_id(shell_id: &str) -> Result<i32, FunctionCallError> {
+    shell_id.parse::<i32>().map_err(|_| {
+        FunctionCallError::RespondToModel(format!(
+            "invalid shell_id `{shell_id}`: expected the id returned by execute mode=\"background\""
+        ))
+    })
+}
+
 fn emit_unified_exec_tty_metric(session_telemetry: &SessionTelemetry, tty: bool) {
     session_telemetry.counter(
         TOOL_CALL_UNIFIED_EXEC_METRIC,
         /*inc*/ 1,
         &[("tty", if tty { "true" } else { "false" })],
     );
+}
+
+async fn wait_for_process_exit(
+    manager: &UnifiedExecProcessManager,
+    mut response: ExecCommandToolOutput,
+    max_output_tokens: usize,
+) -> Result<ExecCommandToolOutput, FunctionCallError> {
+    let Some(mut process_id) = response.process_id else {
+        return Ok(response);
+    };
+
+    loop {
+        let next = manager
+            .write_stdin(WriteStdinRequest {
+                process_id,
+                input: "",
+                yield_time_ms: default_exec_yield_time_ms(),
+                max_output_tokens: Some(max_output_tokens),
+            })
+            .await
+            .map_err(|err| {
+                FunctionCallError::RespondToModel(format!("execute blocking wait failed: {err}"))
+            })?;
+        response.raw_output.extend(next.raw_output);
+        response.wall_time += next.wall_time;
+        response.exit_code = next.exit_code;
+        response.shell_id = next.shell_id.clone();
+        response.process_id = next.process_id;
+        response.original_token_count = response
+            .original_token_count
+            .zip(next.original_token_count)
+            .map(|(left, right)| left + right)
+            .or(response.original_token_count)
+            .or(next.original_token_count);
+        if let Some(next_process_id) = next.process_id {
+            process_id = next_process_id;
+        } else {
+            return Ok(response);
+        }
+    }
 }
 
 pub(crate) fn get_command(

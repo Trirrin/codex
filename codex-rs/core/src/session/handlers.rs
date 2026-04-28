@@ -86,6 +86,23 @@ pub async fn clean_background_terminals(sess: &Arc<Session>) {
     sess.close_unified_exec_processes().await;
 }
 
+pub async fn clean_background_activity(sess: &Arc<Session>) {
+    sess.close_unified_exec_processes().await;
+    if let Ok(thread_ids) = sess
+        .services
+        .agent_control
+        .list_live_agent_subtree_thread_ids(sess.conversation_id)
+        .await
+    {
+        for thread_id in thread_ids
+            .into_iter()
+            .filter(|thread_id| *thread_id != sess.conversation_id)
+        {
+            let _ = sess.services.agent_control.close_agent(thread_id).await;
+        }
+    }
+}
+
 pub async fn realtime_conversation_list_voices(sess: &Session, sub_id: String) {
     sess.send_event_raw(Event {
         id: sub_id,
@@ -1038,6 +1055,10 @@ pub(super) async fn submission_loop(
                 }
                 Op::CleanBackgroundTerminals => {
                     clean_background_terminals(&sess).await;
+                    false
+                }
+                Op::CleanBackgroundActivity => {
+                    clean_background_activity(&sess).await;
                     false
                 }
                 Op::RealtimeConversationStart(params) => {

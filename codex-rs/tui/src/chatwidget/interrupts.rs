@@ -191,6 +191,7 @@ mod tests {
             cwd: AbsolutePathBuf::current_dir().expect("current dir"),
             parsed_cmd: Vec::new(),
             source: ExecCommandSource::Agent,
+            run_mode: None,
             interaction_input: None,
         }
     }
