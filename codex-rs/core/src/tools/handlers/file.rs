@@ -18,17 +18,20 @@ use codex_utils_output_truncation::formatted_truncate_text;
 use regex_lite::RegexBuilder;
 use serde::Deserialize;
 use serde::Serialize;
+use similar::ChangeTag;
 use similar::TextDiff;
 use std::collections::HashMap;
 use tokio::fs;
 
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+use crate::turn_diff_tracker::FileObservationError;
 use crate::unified_exec::resolve_max_tokens;
 
 pub struct FileHandler;
@@ -143,6 +146,8 @@ enum GlobEntryType {
 struct EditArgs {
     path: String,
     #[serde(default)]
+    apply_mode: EditApplyMode,
+    #[serde(default)]
     old_text: Option<String>,
     #[serde(default)]
     new_text: Option<String>,
@@ -150,6 +155,19 @@ struct EditArgs {
     occurrence: Option<usize>,
     #[serde(default)]
     ops: Vec<EditOperation>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum EditApplyMode {
+    #[default]
+    Sequential,
+    Snapshot,
+}
+
+struct EditRequest {
+    apply_mode: EditApplyMode,
+    operations: Vec<EditOperation>,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +204,11 @@ enum EditOperation {
         old_text: String,
         #[serde(default)]
         occurrence: Option<usize>,
+    },
+    ReplaceOccurrences {
+        old_text: String,
+        new_text: String,
+        occurrences: Vec<usize>,
     },
 }
 
@@ -241,6 +264,23 @@ fn default_true() -> bool {
     true
 }
 
+fn read_file_display_command(args: &ReadFileArgs) -> String {
+    let mut parts = vec!["read_file".to_string()];
+    if let Some(start_line) = args.start_line {
+        parts.push(format!("--start-line={start_line}"));
+    } else if args.offset != 0 {
+        let offset = args.offset;
+        parts.push(format!("--offset={offset}"));
+    }
+    if let Some(end_line) = args.end_line {
+        parts.push(format!("--end-line={end_line}"));
+    } else if args.start_line.is_some() || args.offset != 0 || args.limit != DEFAULT_LIMIT {
+        let limit = args.limit;
+        parts.push(format!("--limit={limit}"));
+    }
+    parts.join(" ")
+}
+
 #[derive(Serialize)]
 struct SearchMatch {
     path: String,
@@ -261,6 +301,12 @@ struct GrepMatch {
 struct GrepContextLine {
     line: usize,
     text: String,
+}
+
+struct FileLineObservation {
+    path: PathBuf,
+    content_hash: String,
+    lines: Vec<usize>,
 }
 
 #[derive(Serialize)]
@@ -304,6 +350,7 @@ impl ToolHandler for FileHandler {
             session,
             payload,
             turn,
+            tracker,
             tool_name,
             call_id,
             ..
@@ -319,7 +366,7 @@ impl ToolHandler for FileHandler {
                 let args: ReadFileArgs = parse_arguments(&arguments)?;
                 let path = resolve_path(turn.cwd.as_path(), &args.path);
                 let parsed = vec![ParsedCommand::Read {
-                    cmd: "read_file".to_string(),
+                    cmd: read_file_display_command(&args),
                     name: args.path.clone(),
                     path: path.clone(),
                 }];
@@ -335,20 +382,10 @@ impl ToolHandler for FileHandler {
                     ensure_read_allowed(turn.as_ref(), &path)?;
                     let text = fs::read_to_string(&path).await.map_err(io_error)?;
                     let lines = read_lines(&text, &args)?;
-                    let output = if args.include_line_numbers {
-                        lines
-                            .into_iter()
-                            .map(|(line_number, line)| format!("{line_number}:{line}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    } else {
-                        lines
-                            .into_iter()
-                            .map(|(_, line)| line.to_string())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    };
+                    let observed_ranges = numbered_line_ranges(&lines);
+                    let output = format_read_lines(&lines, args.include_line_numbers);
                     let output = truncate(output, args.max_output_tokens);
+                    record_observed_ranges(&tracker, &path, &text, observed_ranges).await;
                     Ok(FunctionToolOutput::from_text(output, Some(true)))
                 }
                 .await;
@@ -456,6 +493,7 @@ impl ToolHandler for FileHandler {
                             FunctionCallError::RespondToModel(format!("invalid regex: {err}"))
                         })?;
                     let warning = glob_filter_warning(&args.include, &args.exclude);
+                    let mut observations = Vec::new();
                     let output = match args.output_format {
                         OutputFormat::Text => {
                             let mut matches = Vec::new();
@@ -476,6 +514,7 @@ impl ToolHandler for FileHandler {
                                     root,
                                     &options,
                                     &mut matches,
+                                    &mut observations,
                                 )
                                 .await?;
                                 if matches.len() >= args.limit {
@@ -503,6 +542,7 @@ impl ToolHandler for FileHandler {
                                     root,
                                     &options,
                                     &mut matches,
+                                    &mut observations,
                                 )
                                 .await?;
                                 if matches.len() >= args.limit {
@@ -513,6 +553,7 @@ impl ToolHandler for FileHandler {
                                 .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?
                         }
                     };
+                    record_file_line_observations(&tracker, observations).await;
                     Ok(FunctionToolOutput::from_text(output, Some(true)))
                 }
                 .await;
@@ -595,16 +636,39 @@ impl ToolHandler for FileHandler {
                 let args: EditArgs = parse_arguments(&arguments)?;
                 let path = resolve_path(turn.cwd.as_path(), &args.path);
                 ensure_write_allowed(turn.as_ref(), &path).await?;
-                let operations = edit_operations(args)?;
+                let request = edit_request(args)?;
+                let warning = sequential_edit_warning(&request.operations, request.apply_mode);
                 let text = fs::read_to_string(&path).await.map_err(io_error)?;
-                let edited = apply_edit_operations(&text, &operations)?;
-                let diff = unified_update_diff(&path, &text, &edited);
+                let observation_plan = edit_observation_plan(&text, &request)?;
+                let previous_hash = content_hash(&text);
+                ensure_ranges_observed_for_edit(
+                    &tracker,
+                    &path,
+                    &previous_hash,
+                    &observation_plan.required_ranges,
+                )
+                .await?;
+                let applied = apply_edit_operations(&text, &request)?;
+                let edited = applied.text;
+                let diff = edit_output(&path, &text, &edited, warning, &applied.hits);
+                let changed_ranges = changed_line_ranges(&text, &edited);
                 let changes = single_update_change(&path, &text, &edited);
                 emit_patch_begin(session.as_ref(), turn.as_ref(), &call_id, &changes).await;
-                let result = fs::write(&path, edited)
+                let result = fs::write(&path, &edited)
                     .await
                     .map_err(io_error)
                     .map(|_| FunctionToolOutput::from_text(diff, Some(true)));
+                if result.is_ok() {
+                    record_edit_observation(
+                        &tracker,
+                        &path,
+                        &previous_hash,
+                        &edited,
+                        &observation_plan.final_line_origins,
+                        changed_ranges,
+                    )
+                    .await;
+                }
                 emit_patch_end(
                     session.as_ref(),
                     turn.as_ref(),
@@ -651,17 +715,16 @@ impl ToolHandler for FileHandler {
                     };
                     ensure_expected_hash(previous, expected_hash)?;
                 }
-                let changes = single_write_change(&path, previous.as_deref(), &args.content);
+                let content = args.content;
+                let changes = single_write_change(&path, previous.as_deref(), &content);
                 emit_patch_begin(session.as_ref(), turn.as_ref(), &call_id, &changes).await;
-                let result = fs::write(&path, args.content)
-                    .await
-                    .map_err(io_error)
-                    .map(|_| {
-                        FunctionToolOutput::from_text(
-                            format!("wrote {}", path.display()),
-                            Some(true),
-                        )
-                    });
+                let result = fs::write(&path, &content).await.map_err(io_error).map(|_| {
+                    FunctionToolOutput::from_text(format!("wrote {}", path.display()), Some(true))
+                });
+                if result.is_ok() {
+                    record_observed_ranges(&tracker, &path, &content, whole_file_range(&content))
+                        .await;
+                }
                 emit_patch_end(
                     session.as_ref(),
                     turn.as_ref(),
@@ -1026,6 +1089,131 @@ fn read_lines<'a>(
         .collect())
 }
 
+fn format_read_lines(lines: &[(usize, &str)], include_line_numbers: bool) -> String {
+    if include_line_numbers {
+        lines
+            .iter()
+            .map(|(line_number, line)| format!("{line_number}:{line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        lines
+            .iter()
+            .map(|(_, line)| (*line).to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn numbered_line_ranges(lines: &[(usize, &str)]) -> Vec<(usize, usize)> {
+    lines
+        .iter()
+        .map(|(line_number, _)| (*line_number, *line_number))
+        .collect()
+}
+
+async fn record_observed_ranges(
+    tracker: &SharedTurnDiffTracker,
+    path: &Path,
+    text: &str,
+    ranges: Vec<(usize, usize)>,
+) {
+    tracker
+        .lock()
+        .await
+        .record_file_observation(path, content_hash(text), ranges);
+}
+
+async fn record_file_line_observations(
+    tracker: &SharedTurnDiffTracker,
+    observations: Vec<FileLineObservation>,
+) {
+    let mut tracker = tracker.lock().await;
+    for observation in observations {
+        let ranges = observation
+            .lines
+            .into_iter()
+            .map(|line| (line, line))
+            .collect::<Vec<_>>();
+        tracker.record_file_observation(&observation.path, observation.content_hash, ranges);
+    }
+}
+
+async fn record_edit_observation(
+    tracker: &SharedTurnDiffTracker,
+    path: &Path,
+    previous_hash: &str,
+    edited: &str,
+    line_origins: &[Option<usize>],
+    ranges: Vec<(usize, usize)>,
+) {
+    tracker.lock().await.record_file_edit_observation(
+        path,
+        previous_hash,
+        content_hash(edited),
+        line_origins,
+        ranges,
+    );
+}
+
+fn whole_file_range(text: &str) -> Vec<(usize, usize)> {
+    let line_count = file_line_count(text);
+    if line_count == 0 {
+        Vec::new()
+    } else {
+        vec![(1, line_count)]
+    }
+}
+
+async fn ensure_ranges_observed_for_edit(
+    tracker: &SharedTurnDiffTracker,
+    path: &Path,
+    content_hash: &str,
+    ranges: &[(usize, usize)],
+) -> Result<(), FunctionCallError> {
+    tracker
+        .lock()
+        .await
+        .verify_file_observation(path, content_hash, ranges)
+        .map_err(|err| observation_error(path, err))
+}
+
+fn observation_error(path: &Path, err: FileObservationError) -> FunctionCallError {
+    let message = match err {
+        FileObservationError::NotObserved => format!(
+            "refusing to edit `{}` because the target lines have not been read or searched this turn",
+            path.display()
+        ),
+        FileObservationError::Stale {
+            observed_hash,
+            current_hash,
+        } => format!(
+            "refusing to edit `{}` because it changed since it was read or searched: observed {observed_hash}, actual {current_hash}",
+            path.display()
+        ),
+        FileObservationError::MissingLines { ranges } => format!(
+            "refusing to edit `{}` because lines {} have not been read or searched this turn",
+            path.display(),
+            format_line_ranges(&ranges)
+        ),
+    };
+    FunctionCallError::RespondToModel(message)
+}
+
+fn format_line_ranges(ranges: &[(usize, usize)]) -> String {
+    ranges
+        .iter()
+        .map(|(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn ensure_expected_hash(text: &str, expected_hash: &str) -> Result<(), FunctionCallError> {
     let actual_hash = content_hash(text);
     if expected_hash != actual_hash {
@@ -1111,6 +1299,7 @@ async fn collect_grep_text_matches(
     root: &Path,
     options: &GrepCollectOptions<'_>,
     matches: &mut Vec<String>,
+    observations: &mut Vec<FileLineObservation>,
 ) -> Result<(), FunctionCallError> {
     let mut files = Vec::new();
     collect_files(turn, root, options.filters, usize::MAX, &mut files).await?;
@@ -1119,6 +1308,7 @@ async fn collect_grep_text_matches(
             continue;
         };
         let lines = text.lines().collect::<Vec<_>>();
+        let mut observed_lines = Vec::new();
         for (index, line) in lines.iter().enumerate() {
             if !options.regex.is_match(line) {
                 continue;
@@ -1126,17 +1316,16 @@ async fn collect_grep_text_matches(
             let start = index.saturating_sub(options.context);
             let end = (index + options.context + 1).min(lines.len());
             for (line_index, line) in lines[start..end].iter().enumerate() {
-                matches.push(format!(
-                    "{}:{}:{}",
-                    file.display(),
-                    start + line_index + 1,
-                    line
-                ));
+                let line_number = start + line_index + 1;
+                matches.push(format!("{}:{}:{}", file.display(), line_number, line));
+                observed_lines.push(line_number);
             }
             if matches.len() >= options.limit {
+                push_file_line_observation(observations, file, &text, observed_lines);
                 return Ok(());
             }
         }
+        push_file_line_observation(observations, file, &text, observed_lines);
     }
     Ok(())
 }
@@ -1146,6 +1335,7 @@ async fn collect_grep_structured_matches(
     root: &Path,
     options: &GrepCollectOptions<'_>,
     matches: &mut Vec<GrepMatch>,
+    observations: &mut Vec<FileLineObservation>,
 ) -> Result<(), FunctionCallError> {
     let mut files = Vec::new();
     collect_files(turn, root, options.filters, usize::MAX, &mut files).await?;
@@ -1154,6 +1344,7 @@ async fn collect_grep_structured_matches(
             continue;
         };
         let lines = text.lines().collect::<Vec<_>>();
+        let mut observed_lines = Vec::new();
         for (index, line) in lines.iter().enumerate() {
             if !options.regex.is_match(line) {
                 continue;
@@ -1162,20 +1353,29 @@ async fn collect_grep_structured_matches(
             let context_before = lines[before_start..index]
                 .iter()
                 .enumerate()
-                .map(|(context_index, line)| GrepContextLine {
-                    line: before_start + context_index + 1,
-                    text: (*line).to_string(),
+                .map(|(context_index, line)| {
+                    let line_number = before_start + context_index + 1;
+                    observed_lines.push(line_number);
+                    GrepContextLine {
+                        line: line_number,
+                        text: (*line).to_string(),
+                    }
                 })
                 .collect();
             let after_end = (index + options.context + 1).min(lines.len());
             let context_after = lines[index + 1..after_end]
                 .iter()
                 .enumerate()
-                .map(|(context_index, line)| GrepContextLine {
-                    line: index + context_index + 2,
-                    text: (*line).to_string(),
+                .map(|(context_index, line)| {
+                    let line_number = index + context_index + 2;
+                    observed_lines.push(line_number);
+                    GrepContextLine {
+                        line: line_number,
+                        text: (*line).to_string(),
+                    }
                 })
                 .collect();
+            observed_lines.push(index + 1);
             matches.push(GrepMatch {
                 path: file.display().to_string(),
                 line: index + 1,
@@ -1184,11 +1384,29 @@ async fn collect_grep_structured_matches(
                 context_after,
             });
             if matches.len() >= options.limit {
+                push_file_line_observation(observations, file, &text, observed_lines);
                 return Ok(());
             }
         }
+        push_file_line_observation(observations, file, &text, observed_lines);
     }
     Ok(())
+}
+
+fn push_file_line_observation(
+    observations: &mut Vec<FileLineObservation>,
+    path: PathBuf,
+    text: &str,
+    lines: Vec<usize>,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    observations.push(FileLineObservation {
+        path,
+        content_hash: content_hash(text),
+        lines,
+    });
 }
 
 async fn collect_glob_matches(
@@ -1368,101 +1586,654 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     regex_lite::Regex::new(&regex).is_ok_and(|regex| regex.is_match(text))
 }
 
-fn edit_operations(args: EditArgs) -> Result<Vec<EditOperation>, FunctionCallError> {
-    if !args.ops.is_empty() {
+fn edit_request(args: EditArgs) -> Result<EditRequest, FunctionCallError> {
+    let operations = if !args.ops.is_empty() {
         if args.old_text.is_some() || args.new_text.is_some() || args.occurrence.is_some() {
             return Err(FunctionCallError::RespondToModel(
                 "use either ops or legacy old_text/new_text fields, not both".to_string(),
             ));
         }
-        return Ok(args.ops);
+        args.ops
+    } else {
+        let old_text = args.old_text.ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "old_text is required when ops is omitted".to_string(),
+            )
+        })?;
+        let new_text = args.new_text.ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "new_text is required when ops is omitted".to_string(),
+            )
+        })?;
+        vec![EditOperation::Replace {
+            old_text,
+            new_text,
+            occurrence: args.occurrence,
+        }]
+    };
+
+    Ok(EditRequest {
+        apply_mode: args.apply_mode,
+        operations,
+    })
+}
+
+fn sequential_edit_warning(
+    operations: &[EditOperation],
+    apply_mode: EditApplyMode,
+) -> Option<String> {
+    if apply_mode != EditApplyMode::Sequential {
+        return None;
     }
 
-    let old_text = args.old_text.ok_or_else(|| {
-        FunctionCallError::RespondToModel("old_text is required when ops is omitted".to_string())
-    })?;
-    let new_text = args.new_text.ok_or_else(|| {
-        FunctionCallError::RespondToModel("new_text is required when ops is omitted".to_string())
-    })?;
-    Ok(vec![EditOperation::Replace {
-        old_text,
-        new_text,
-        occurrence: args.occurrence,
-    }])
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for (index, operation) in operations.iter().enumerate() {
+        let old_text = match operation {
+            EditOperation::Replace { old_text, .. }
+            | EditOperation::DeleteText { old_text, .. }
+            | EditOperation::ReplaceOccurrences { old_text, .. } => old_text.as_str(),
+            EditOperation::InsertBefore { .. }
+            | EditOperation::InsertAfter { .. }
+            | EditOperation::ReplaceRange { .. }
+            | EditOperation::DeleteRange { .. } => continue,
+        };
+        if seen.insert(old_text, index + 1).is_some() {
+            return Some(format!(
+                "warning: op {} occurrence resolved against modified buffer in sequential mode. Use apply_mode=\"snapshot\" for simultaneous replacement.",
+                index + 1
+            ));
+        }
+    }
+    None
+}
+
+struct EditObservationPlan {
+    required_ranges: Vec<(usize, usize)>,
+    final_line_origins: Vec<Option<usize>>,
+}
+
+fn edit_observation_plan(
+    text: &str,
+    request: &EditRequest,
+) -> Result<EditObservationPlan, FunctionCallError> {
+    match request.apply_mode {
+        EditApplyMode::Sequential => edit_sequential_observation_plan(text, &request.operations),
+        EditApplyMode::Snapshot => edit_snapshot_observation_plan(text, &request.operations),
+    }
+}
+
+fn edit_sequential_observation_plan(
+    text: &str,
+    operations: &[EditOperation],
+) -> Result<EditObservationPlan, FunctionCallError> {
+    let mut required_ranges = Vec::new();
+    let mut current_text = text.to_string();
+    let mut line_origins = original_line_origins(text);
+    for (index, operation) in operations.iter().enumerate() {
+        let observed_ranges = edit_operation_observed_ranges(&current_text, operation)
+            .map_err(|err| prefix_edit_operation_error(err, index, operations.len()))?;
+        for (start_line, end_line) in &observed_ranges {
+            required_ranges.extend(original_ranges_for_current_lines(
+                &line_origins,
+                *start_line,
+                *end_line,
+            ));
+        }
+        update_line_origins(&mut line_origins, operation, &observed_ranges);
+        current_text = apply_edit_operation(&current_text, operation, index)
+            .map_err(|err| prefix_edit_operation_error(err, index, operations.len()))?
+            .text;
+    }
+    merge_line_ranges(&mut required_ranges);
+    Ok(EditObservationPlan {
+        required_ranges,
+        final_line_origins: line_origins,
+    })
+}
+
+fn edit_snapshot_observation_plan(
+    text: &str,
+    operations: &[EditOperation],
+) -> Result<EditObservationPlan, FunctionCallError> {
+    let resolved = resolve_snapshot_edits(text, operations)?;
+    let mut required_ranges = resolved
+        .iter()
+        .map(|edit| byte_range_to_line_range(text, edit.range.start, edit.range.end))
+        .collect::<Vec<_>>();
+    merge_line_ranges(&mut required_ranges);
+    let edited = apply_resolved_edits(text, &resolved);
+    Ok(EditObservationPlan {
+        required_ranges,
+        final_line_origins: vec![None; file_line_count(&edited)],
+    })
+}
+
+fn prefix_edit_operation_error(
+    err: FunctionCallError,
+    index: usize,
+    operation_count: usize,
+) -> FunctionCallError {
+    match err {
+        FunctionCallError::RespondToModel(message) if operation_count > 1 => {
+            FunctionCallError::RespondToModel(format!("op {}: {message}", index + 1))
+        }
+        err => err,
+    }
+}
+
+fn original_line_origins(text: &str) -> Vec<Option<usize>> {
+    (1..=file_line_count(text)).map(Some).collect()
+}
+
+fn original_ranges_for_current_lines(
+    line_origins: &[Option<usize>],
+    start_line: usize,
+    end_line: usize,
+) -> Vec<(usize, usize)> {
+    let mut ranges = line_origins[start_line - 1..end_line]
+        .iter()
+        .filter_map(|line| *line)
+        .map(|line| (line, line))
+        .collect::<Vec<_>>();
+    merge_line_ranges(&mut ranges);
+    ranges
+}
+
+fn merge_line_ranges(ranges: &mut Vec<(usize, usize)>) {
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges.drain(..) {
+        let Some((_, last_end)) = merged.last_mut() else {
+            merged.push((start, end));
+            continue;
+        };
+        if start <= last_end.saturating_add(1) {
+            *last_end = (*last_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    *ranges = merged;
+}
+
+fn update_line_origins(
+    line_origins: &mut Vec<Option<usize>>,
+    operation: &EditOperation,
+    observed_ranges: &[(usize, usize)],
+) {
+    let Some(&(start_line, end_line)) = observed_ranges.first() else {
+        return;
+    };
+
+    match operation {
+        EditOperation::Replace {
+            old_text, new_text, ..
+        } => {
+            update_text_replacement_origins(line_origins, start_line, end_line, old_text, new_text)
+        }
+        EditOperation::DeleteText { old_text, .. } => {
+            update_text_replacement_origins(line_origins, start_line, end_line, old_text, "")
+        }
+        EditOperation::ReplaceOccurrences {
+            old_text, new_text, ..
+        } => {
+            for (start_line, end_line) in observed_ranges.iter().rev() {
+                update_text_replacement_origins(
+                    line_origins,
+                    *start_line,
+                    *end_line,
+                    old_text,
+                    new_text,
+                );
+            }
+        }
+        EditOperation::DeleteRange { .. } => {
+            line_origins.splice(start_line - 1..end_line, Vec::new());
+        }
+        EditOperation::ReplaceRange { new_text, .. } => {
+            replace_line_origins(line_origins, start_line, end_line, new_text)
+        }
+        EditOperation::InsertBefore { text, .. } => {
+            let insert_count = inserted_line_count(text);
+            line_origins.splice(start_line - 1..start_line - 1, vec![None; insert_count]);
+        }
+        EditOperation::InsertAfter { text, .. } => {
+            let insert_count = inserted_line_count(text);
+            line_origins.splice(end_line..end_line, vec![None; insert_count]);
+        }
+    }
+}
+
+fn update_text_replacement_origins(
+    line_origins: &mut Vec<Option<usize>>,
+    start_line: usize,
+    end_line: usize,
+    old_text: &str,
+    new_text: &str,
+) {
+    if start_line == end_line && !old_text.contains('\n') && !new_text.contains('\n') {
+        return;
+    }
+    replace_line_origins(line_origins, start_line, end_line, new_text);
+}
+
+fn replace_line_origins(
+    line_origins: &mut Vec<Option<usize>>,
+    start_line: usize,
+    end_line: usize,
+    new_text: &str,
+) {
+    let origin = line_origins[start_line - 1];
+    let replacement = vec![origin; line_count_for_fragment(new_text)];
+    line_origins.splice(start_line - 1..end_line, replacement);
+}
+
+fn inserted_line_count(text: &str) -> usize {
+    text.as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+}
+
+fn line_count_for_fragment(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.split_inclusive('\n').count()
+    }
+}
+
+fn file_line_count(text: &str) -> usize {
+    text.split_inclusive('\n').count()
+}
+
+fn changed_line_ranges(old: &str, new: &str) -> Vec<(usize, usize)> {
+    let new_line_count = file_line_count(new);
+    let mut new_line = 1usize;
+    let mut ranges = Vec::new();
+    for change in TextDiff::from_lines(old, new).iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                new_line += 1;
+            }
+            ChangeTag::Insert => {
+                ranges.push((new_line, new_line));
+                new_line += 1;
+            }
+            ChangeTag::Delete => {
+                if new_line_count != 0 {
+                    let line = new_line.min(new_line_count);
+                    ranges.push((line, line));
+                }
+            }
+        }
+    }
+    merge_line_ranges(&mut ranges);
+    ranges
+}
+
+fn edit_operation_observed_ranges(
+    text: &str,
+    operation: &EditOperation,
+) -> Result<Vec<(usize, usize)>, FunctionCallError> {
+    match operation {
+        EditOperation::Replace {
+            old_text,
+            occurrence,
+            ..
+        }
+        | EditOperation::DeleteText {
+            old_text,
+            occurrence,
+        } => Ok(vec![text_occurrence_line_range(
+            text,
+            old_text,
+            *occurrence,
+            "old_text",
+        )?]),
+        EditOperation::ReplaceOccurrences {
+            old_text,
+            occurrences,
+            ..
+        } => occurrences
+            .iter()
+            .map(|occurrence| {
+                text_occurrence_line_range(text, old_text, Some(*occurrence), "old_text")
+            })
+            .collect(),
+        EditOperation::InsertBefore {
+            anchor, occurrence, ..
+        }
+        | EditOperation::InsertAfter {
+            anchor, occurrence, ..
+        } => Ok(vec![text_occurrence_line_range(
+            text,
+            anchor,
+            *occurrence,
+            "anchor",
+        )?]),
+        EditOperation::ReplaceRange {
+            start_line,
+            end_line,
+            ..
+        }
+        | EditOperation::DeleteRange {
+            start_line,
+            end_line,
+        } => Ok(vec![validate_line_range(text, *start_line, *end_line)?]),
+    }
+}
+
+fn text_occurrence_line_range(
+    text: &str,
+    needle: &str,
+    occurrence: Option<usize>,
+    field_name: &str,
+) -> Result<(usize, usize), FunctionCallError> {
+    let range = text_occurrence_byte_range(text, needle, occurrence, field_name)?;
+    Ok(byte_range_to_line_range(text, range.start, range.end))
+}
+
+fn text_occurrence_byte_range(
+    text: &str,
+    needle: &str,
+    occurrence: Option<usize>,
+    field_name: &str,
+) -> Result<std::ops::Range<usize>, FunctionCallError> {
+    let occurrence = resolve_occurrence(text, needle, occurrence, field_name)?;
+    let start = occurrence_start(text, needle, occurrence)
+        .ok_or_else(|| FunctionCallError::RespondToModel(format!("{field_name} was not found")))?;
+    Ok(start..start + needle.len())
+}
+
+fn occurrence_start(text: &str, needle: &str, occurrence: usize) -> Option<usize> {
+    let mut start = 0;
+    for _ in 1..occurrence {
+        let index = text[start..].find(needle)?;
+        start += index + needle.len();
+    }
+    text[start..].find(needle).map(|index| start + index)
+}
+
+fn byte_range_to_line_range(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let start_line = line_number_at_byte(text, start);
+    let end_line = line_number_at_byte(text, end.saturating_sub(1).max(start));
+    (start_line, end_line)
+}
+
+fn line_number_at_byte(text: &str, byte_index: usize) -> usize {
+    text.as_bytes()
+        .iter()
+        .take(byte_index.min(text.len()))
+        .filter(|byte| **byte == b'\n')
+        .count()
+        + 1
+}
+
+fn validate_line_range(
+    text: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Result<(usize, usize), FunctionCallError> {
+    if start_line == 0 || end_line == 0 {
+        return Err(FunctionCallError::RespondToModel(
+            "line ranges must be one-based".to_string(),
+        ));
+    }
+    if start_line > end_line {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "start_line {start_line} must be less than or equal to end_line {end_line}"
+        )));
+    }
+    let line_count = file_line_count(text);
+    if end_line > line_count {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "line range {start_line}-{end_line} is out of range; file has {line_count} lines"
+        )));
+    }
+    Ok((start_line, end_line))
+}
+
+struct AppliedEdit {
+    text: String,
+    hits: Vec<EditHit>,
+}
+
+#[derive(Clone)]
+struct ResolvedEdit {
+    op_index: usize,
+    range: std::ops::Range<usize>,
+    replacement: String,
+}
+
+struct EditHit {
+    op_index: usize,
+    range: std::ops::Range<usize>,
 }
 
 fn apply_edit_operations(
     text: &str,
+    request: &EditRequest,
+) -> Result<AppliedEdit, FunctionCallError> {
+    match request.apply_mode {
+        EditApplyMode::Sequential => apply_sequential_edit_operations(text, &request.operations),
+        EditApplyMode::Snapshot => {
+            let resolved = resolve_snapshot_edits(text, &request.operations)?;
+            Ok(AppliedEdit {
+                text: apply_resolved_edits(text, &resolved),
+                hits: edit_hits(&resolved),
+            })
+        }
+    }
+}
+
+fn apply_sequential_edit_operations(
+    text: &str,
     operations: &[EditOperation],
-) -> Result<String, FunctionCallError> {
+) -> Result<AppliedEdit, FunctionCallError> {
     let mut edited = text.to_string();
+    let mut hits = Vec::new();
     for (index, operation) in operations.iter().enumerate() {
-        edited = apply_edit_operation(&edited, operation).map_err(|err| match err {
+        let applied = apply_edit_operation(&edited, operation, index).map_err(|err| match err {
             FunctionCallError::RespondToModel(message) if operations.len() > 1 => {
                 FunctionCallError::RespondToModel(format!("op {}: {message}", index + 1))
             }
             err => err,
         })?;
+        edited = applied.text;
+        hits.extend(applied.hits);
     }
-    Ok(edited)
+    Ok(AppliedEdit { text: edited, hits })
 }
 
 fn apply_edit_operation(
     text: &str,
     operation: &EditOperation,
-) -> Result<String, FunctionCallError> {
+    op_index: usize,
+) -> Result<AppliedEdit, FunctionCallError> {
+    let resolved = resolve_operation_edits(text, operation, op_index)?;
+    ensure_non_overlapping(&resolved)?;
+    Ok(AppliedEdit {
+        text: apply_resolved_edits(text, &resolved),
+        hits: edit_hits(&resolved),
+    })
+}
+
+fn resolve_snapshot_edits(
+    text: &str,
+    operations: &[EditOperation],
+) -> Result<Vec<ResolvedEdit>, FunctionCallError> {
+    let mut edits = Vec::new();
+    for (index, operation) in operations.iter().enumerate() {
+        edits.extend(
+            resolve_operation_edits(text, operation, index)
+                .map_err(|err| prefix_edit_operation_error(err, index, operations.len()))?,
+        );
+    }
+    ensure_non_overlapping(&edits)?;
+    Ok(edits)
+}
+
+fn resolve_operation_edits(
+    text: &str,
+    operation: &EditOperation,
+    op_index: usize,
+) -> Result<Vec<ResolvedEdit>, FunctionCallError> {
     match operation {
         EditOperation::Replace {
             old_text,
             new_text,
             occurrence,
-        } => {
-            let occurrence = resolve_occurrence(text, old_text, *occurrence, "old_text")?;
-            Ok(replace_occurrence(text, old_text, new_text, occurrence))
-        }
+        } => Ok(vec![ResolvedEdit {
+            op_index,
+            range: text_occurrence_byte_range(text, old_text, *occurrence, "old_text")?,
+            replacement: new_text.clone(),
+        }]),
         EditOperation::InsertBefore {
             anchor,
             text: insert_text,
             occurrence,
-        } => {
-            let occurrence = resolve_occurrence(text, anchor, *occurrence, "anchor")?;
-            Ok(replace_occurrence(
-                text,
-                anchor,
-                &format!("{insert_text}{anchor}"),
-                occurrence,
-            ))
-        }
+        } => Ok(vec![ResolvedEdit {
+            op_index,
+            range: text_occurrence_byte_range(text, anchor, *occurrence, "anchor")?,
+            replacement: format!("{insert_text}{anchor}"),
+        }]),
         EditOperation::InsertAfter {
             anchor,
             text: insert_text,
             occurrence,
-        } => {
-            let occurrence = resolve_occurrence(text, anchor, *occurrence, "anchor")?;
-            Ok(replace_occurrence(
-                text,
-                anchor,
-                &format!("{anchor}{insert_text}"),
-                occurrence,
-            ))
-        }
+        } => Ok(vec![ResolvedEdit {
+            op_index,
+            range: text_occurrence_byte_range(text, anchor, *occurrence, "anchor")?,
+            replacement: format!("{anchor}{insert_text}"),
+        }]),
         EditOperation::ReplaceRange {
             start_line,
             end_line,
             new_text,
-        } => replace_line_range(text, *start_line, *end_line, new_text),
+        } => Ok(vec![ResolvedEdit {
+            op_index,
+            range: line_byte_range(text, *start_line, *end_line)?,
+            replacement: new_text.clone(),
+        }]),
         EditOperation::DeleteRange {
             start_line,
             end_line,
-        } => replace_line_range(text, *start_line, *end_line, ""),
+        } => Ok(vec![ResolvedEdit {
+            op_index,
+            range: line_byte_range(text, *start_line, *end_line)?,
+            replacement: String::new(),
+        }]),
         EditOperation::DeleteText {
             old_text,
             occurrence,
+        } => Ok(vec![ResolvedEdit {
+            op_index,
+            range: text_occurrence_byte_range(text, old_text, *occurrence, "old_text")?,
+            replacement: String::new(),
+        }]),
+        EditOperation::ReplaceOccurrences {
+            old_text,
+            new_text,
+            occurrences,
         } => {
-            let occurrence = resolve_occurrence(text, old_text, *occurrence, "old_text")?;
-            Ok(replace_occurrence(text, old_text, "", occurrence))
+            if occurrences.is_empty() {
+                return Err(FunctionCallError::RespondToModel(
+                    "occurrences must not be empty".to_string(),
+                ));
+            }
+            occurrences
+                .iter()
+                .map(|occurrence| {
+                    Ok(ResolvedEdit {
+                        op_index,
+                        range: text_occurrence_byte_range(
+                            text,
+                            old_text,
+                            Some(*occurrence),
+                            "old_text",
+                        )?,
+                        replacement: new_text.clone(),
+                    })
+                })
+                .collect()
         }
     }
+}
+
+fn line_byte_range(
+    text: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Result<std::ops::Range<usize>, FunctionCallError> {
+    validate_line_range(text, start_line, end_line)?;
+    let mut start = 0;
+    for line in text.split_inclusive('\n').take(start_line - 1) {
+        start += line.len();
+    }
+    let mut end = start;
+    for line in text
+        .split_inclusive('\n')
+        .skip(start_line - 1)
+        .take(end_line - start_line + 1)
+    {
+        end += line.len();
+    }
+    Ok(start..end)
+}
+
+fn ensure_non_overlapping(edits: &[ResolvedEdit]) -> Result<(), FunctionCallError> {
+    let mut indexes = (0..edits.len()).collect::<Vec<_>>();
+    indexes.sort_unstable_by_key(|index| {
+        let range = &edits[*index].range;
+        (range.start, range.end)
+    });
+
+    for pair in indexes.windows(2) {
+        let previous = &edits[pair[0]];
+        let current = &edits[pair[1]];
+        if ranges_overlap(&previous.range, &current.range) {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "op {} overlaps op {}; no changes written.\nop {}: bytes {}..{}\nop {}: bytes {}..{}",
+                current.op_index + 1,
+                previous.op_index + 1,
+                previous.op_index + 1,
+                previous.range.start,
+                previous.range.end,
+                current.op_index + 1,
+                current.range.start,
+                current.range.end
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn ranges_overlap(a: &std::ops::Range<usize>, b: &std::ops::Range<usize>) -> bool {
+    (a.start < b.end && b.start < a.end)
+        || (a.start == a.end && b.start == b.end && a.start == b.start)
+}
+
+fn apply_resolved_edits(text: &str, edits: &[ResolvedEdit]) -> String {
+    let mut edited = text.to_string();
+    let mut indexes = (0..edits.len()).collect::<Vec<_>>();
+    indexes.sort_unstable_by_key(|index| edits[*index].range.start);
+    for index in indexes.into_iter().rev() {
+        let edit = &edits[index];
+        edited.replace_range(edit.range.clone(), &edit.replacement);
+    }
+    edited
+}
+
+fn edit_hits(edits: &[ResolvedEdit]) -> Vec<EditHit> {
+    edits
+        .iter()
+        .map(|edit| EditHit {
+            op_index: edit.op_index,
+            range: edit.range.clone(),
+        })
+        .collect()
 }
 
 fn resolve_occurrence(
@@ -1490,60 +2261,26 @@ fn resolve_occurrence(
     }
 }
 
-fn replace_line_range(
-    text: &str,
-    start_line: usize,
-    end_line: usize,
-    new_text: &str,
-) -> Result<String, FunctionCallError> {
-    if start_line == 0 || end_line == 0 {
-        return Err(FunctionCallError::RespondToModel(
-            "line ranges must be one-based".to_string(),
-        ));
+fn edit_output(
+    path: &Path,
+    old: &str,
+    new: &str,
+    warning: Option<String>,
+    hits: &[EditHit],
+) -> String {
+    let mut output = unified_update_diff(path, old, new);
+    if !hits.is_empty() {
+        output.push_str("\nMatched ranges:");
+        for hit in hits {
+            output.push_str(&format!(
+                "\nop {}: bytes {}..{}",
+                hit.op_index + 1,
+                hit.range.start,
+                hit.range.end
+            ));
+        }
     }
-    if start_line > end_line {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "start_line {start_line} must be less than or equal to end_line {end_line}"
-        )));
-    }
-
-    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
-    if end_line > lines.len() {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "line range {start_line}-{end_line} is out of range; file has {} lines",
-            lines.len()
-        )));
-    }
-
-    let mut edited = String::new();
-    for line in &lines[..start_line - 1] {
-        edited.push_str(line);
-    }
-    edited.push_str(new_text);
-    for line in &lines[end_line..] {
-        edited.push_str(line);
-    }
-    Ok(edited)
-}
-
-fn replace_occurrence(text: &str, old_text: &str, new_text: &str, occurrence: usize) -> String {
-    let mut start = 0;
-    for _ in 1..occurrence {
-        let Some(index) = text[start..].find(old_text) else {
-            return text.to_string();
-        };
-        start += index + old_text.len();
-    }
-    let Some(index) = text[start..].find(old_text) else {
-        return text.to_string();
-    };
-    let absolute = start + index;
-    format!(
-        "{}{}{}",
-        &text[..absolute],
-        new_text,
-        &text[absolute + old_text.len()..]
-    )
+    text_output_with_warnings(warning, output)
 }
 
 fn truncate(text: String, max_output_tokens: Option<usize>) -> String {
@@ -1579,6 +2316,21 @@ mod tests {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> ToolInvocation {
+        invocation_with_tracker(
+            root,
+            tool_name,
+            arguments,
+            Arc::new(Mutex::new(TurnDiffTracker::new())),
+        )
+        .await
+    }
+
+    async fn invocation_with_tracker(
+        root: &TempDir,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        tracker: SharedTurnDiffTracker,
+    ) -> ToolInvocation {
         let (session, mut turn) = make_session_and_context().await;
         turn.cwd = root.path().abs();
         let sandbox_policy = SandboxPolicy::WorkspaceWrite {
@@ -1599,7 +2351,7 @@ mod tests {
             session: session.into(),
             turn: turn.into(),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
-            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            tracker,
             call_id: format!("call-{tool_name}"),
             tool_name: codex_tools::ToolName::plain(tool_name),
             source: ToolCallSource::Direct,
@@ -1614,6 +2366,37 @@ mod tests {
             panic!("expected one text output item");
         };
         text.clone()
+    }
+
+    #[test]
+    fn read_file_display_command_keeps_range_arguments() {
+        let args = ReadFileArgs {
+            path: "sample.txt".to_string(),
+            offset: 0,
+            limit: DEFAULT_LIMIT,
+            start_line: Some(85),
+            end_line: Some(97),
+            include_line_numbers: false,
+            max_output_tokens: None,
+        };
+        assert_eq!(
+            read_file_display_command(&args),
+            "read_file --start-line=85 --end-line=97"
+        );
+
+        let args = ReadFileArgs {
+            path: "sample.txt".to_string(),
+            offset: 0,
+            limit: 80,
+            start_line: Some(1),
+            end_line: None,
+            include_line_numbers: false,
+            max_output_tokens: None,
+        };
+        assert_eq!(
+            read_file_display_command(&args),
+            "read_file --start-line=1 --limit=80"
+        );
     }
 
     #[tokio::test]
@@ -1829,9 +2612,22 @@ mod tests {
             )
             .await?;
 
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({ "path": "nested/sample.txt", "start_line": 1, "end_line": 1 }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+
         let edit_output = FileHandler
             .handle(
-                invocation(
+                invocation_with_tracker(
                     &root,
                     "edit",
                     json!({
@@ -1840,6 +2636,7 @@ mod tests {
                         "new_text": "omega",
                         "occurrence": 2
                     }),
+                    tracker,
                 )
                 .await,
             )
@@ -2091,9 +2888,22 @@ mod tests {
         )
         .await?;
 
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
         FileHandler
             .handle(
-                invocation(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({ "path": "sample.txt", "start_line": 1, "end_line": 5 }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+
+        FileHandler
+            .handle(
+                invocation_with_tracker(
                     &root,
                     "edit",
                     json!({
@@ -2122,6 +2932,7 @@ mod tests {
                             }
                         ]
                     }),
+                    tracker,
                 )
                 .await,
             )
@@ -2132,6 +2943,233 @@ mod tests {
             edited,
             "use beta;\nuse omega;\nfn main() {\n    omega();\n}\n"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_ops_snapshot_resolves_occurrences_against_original_text() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        fs::write(
+            root.path().join("sample.txt"),
+            "source: ExecCommandSource::Agent,\nsource: ExecCommandSource::Agent,\n",
+        )
+        .await?;
+
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({ "path": "sample.txt", "start_line": 1, "end_line": 2 }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+
+        let output = FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "apply_mode": "snapshot",
+                        "ops": [
+                            {
+                                "type": "replace",
+                                "old_text": "source: ExecCommandSource::Agent,",
+                                "new_text": "auto_review_approved: false,\nsource: ExecCommandSource::Agent,",
+                                "occurrence": 2
+                            },
+                            {
+                                "type": "replace",
+                                "old_text": "source: ExecCommandSource::Agent,",
+                                "new_text": "auto_review_approved: false,\nsource: ExecCommandSource::Agent,",
+                                "occurrence": 1
+                            }
+                        ]
+                    }),
+                    tracker,
+                )
+                .await,
+            )
+            .await?;
+
+        assert_eq!(
+            fs::read_to_string(root.path().join("sample.txt")).await?,
+            "auto_review_approved: false,\nsource: ExecCommandSource::Agent,\nauto_review_approved: false,\nsource: ExecCommandSource::Agent,\n"
+        );
+        let output = output_text(output);
+        assert!(output.contains("Matched ranges:"));
+        assert!(output.contains("op 1: bytes"));
+        assert!(output.contains("op 2: bytes"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_ops_replace_occurrences_replaces_selected_original_occurrences()
+    -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        fs::write(
+            root.path().join("sample.txt"),
+            "alpha beta alpha beta alpha",
+        )
+        .await?;
+
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({ "path": "sample.txt", "start_line": 1, "end_line": 1 }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "apply_mode": "snapshot",
+                        "ops": [
+                            {
+                                "type": "replace_occurrences",
+                                "old_text": "alpha",
+                                "new_text": "omega",
+                                "occurrences": [1, 3]
+                            }
+                        ]
+                    }),
+                    tracker,
+                )
+                .await,
+            )
+            .await?;
+
+        assert_eq!(
+            fs::read_to_string(root.path().join("sample.txt")).await?,
+            "omega beta alpha beta omega"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_ops_snapshot_rejects_overlapping_ranges_without_writing() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        fs::write(root.path().join("sample.txt"), "abcdef").await?;
+
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({ "path": "sample.txt", "start_line": 1, "end_line": 1 }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+
+        let err = match FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "apply_mode": "snapshot",
+                        "ops": [
+                            { "type": "replace", "old_text": "abcde", "new_text": "ABCDE" },
+                            { "type": "replace", "old_text": "f", "new_text": "F" },
+                            { "type": "replace", "old_text": "cde", "new_text": "CDE" }
+                        ]
+                    }),
+                    tracker,
+                )
+                .await,
+            )
+            .await
+        {
+            Ok(_) => panic!("overlapping snapshot ops should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            fs::read_to_string(root.path().join("sample.txt")).await?,
+            "abcdef"
+        );
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(
+                "op 3 overlaps op 1; no changes written.\nop 1: bytes 0..5\nop 3: bytes 2..5"
+                    .to_string()
+            )
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_ops_sequential_warns_when_old_text_is_reused() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        fs::write(root.path().join("sample.txt"), "foo foo").await?;
+
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({ "path": "sample.txt", "start_line": 1, "end_line": 1 }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+
+        let output = FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "ops": [
+                            {
+                                "type": "replace",
+                                "old_text": "foo",
+                                "new_text": "barfoo",
+                                "occurrence": 1
+                            },
+                            {
+                                "type": "replace",
+                                "old_text": "foo",
+                                "new_text": "baz",
+                                "occurrence": 1
+                            }
+                        ]
+                    }),
+                    tracker,
+                )
+                .await,
+            )
+            .await?;
+
+        assert_eq!(
+            fs::read_to_string(root.path().join("sample.txt")).await?,
+            "barbaz foo"
+        );
+        assert!(output_text(output).starts_with(
+            "warning: op 2 occurrence resolved against modified buffer in sequential mode. Use apply_mode=\"snapshot\" for simultaneous replacement."
+        ));
         Ok(())
     }
 
@@ -2207,6 +3245,412 @@ mod tests {
                 "old_text occurs 2 times; specify occurrence".to_string()
             )
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_requires_observed_lines_and_fresh_hash() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let path = root.path().join("sample.txt");
+        fs::write(&path, "alpha\nbeta\ngamma\n").await?;
+
+        let err = match FileHandler
+            .handle(
+                invocation(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "beta",
+                        "new_text": "omega"
+                    }),
+                )
+                .await,
+            )
+            .await
+        {
+            Ok(_) => panic!("edit should require prior read or search"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(format!(
+                "refusing to edit `{}` because the target lines have not been read or searched this turn",
+                path.display()
+            ))
+        );
+
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({
+                        "path": "sample.txt",
+                        "start_line": 1,
+                        "end_line": 1
+                    }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+        let err = match FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "beta",
+                        "new_text": "omega"
+                    }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await
+        {
+            Ok(_) => panic!("edit should reject unread lines"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(format!(
+                "refusing to edit `{}` because lines 2 have not been read or searched this turn",
+                path.display()
+            ))
+        );
+
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({
+                        "path": "sample.txt",
+                        "start_line": 2,
+                        "end_line": 2
+                    }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+        fs::write(&path, "alpha\nBETA\ngamma\n").await?;
+        let err = match FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "BETA",
+                        "new_text": "omega"
+                    }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await
+        {
+            Ok(_) => panic!("edit should reject stale observations"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(format!(
+                "refusing to edit `{}` because it changed since it was read or searched: observed {}, actual {}",
+                path.display(),
+                content_hash("alpha\nbeta\ngamma\n"),
+                content_hash("alpha\nBETA\ngamma\n")
+            ))
+        );
+
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({
+                        "path": "sample.txt",
+                        "start_line": 2,
+                        "end_line": 2
+                    }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "BETA",
+                        "new_text": "omega"
+                    }),
+                    tracker,
+                )
+                .await,
+            )
+            .await?;
+        assert_eq!(fs::read_to_string(path).await?, "alpha\nomega\ngamma\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_preserves_observed_lines_when_hash_is_unchanged() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let path = root.path().join("sample.txt");
+        fs::write(&path, "alpha\nbeta\ngamma\n").await?;
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({ "path": "sample.txt", "start_line": 1, "end_line": 3 }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "beta",
+                        "new_text": "omega"
+                    }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "gamma",
+                        "new_text": "delta"
+                    }),
+                    tracker,
+                )
+                .await,
+            )
+            .await?;
+
+        assert_eq!(fs::read_to_string(path).await?, "alpha\nomega\ndelta\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_diff_lines_can_be_edited_again_without_reread() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let path = root.path().join("sample.txt");
+        fs::write(&path, "alpha\nbeta\ngamma\n").await?;
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({ "path": "sample.txt", "start_line": 2, "end_line": 2 }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "beta",
+                        "new_text": "omega"
+                    }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "omega",
+                        "new_text": "theta"
+                    }),
+                    tracker,
+                )
+                .await,
+            )
+            .await?;
+
+        assert_eq!(fs::read_to_string(path).await?, "alpha\ntheta\ngamma\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_observation_after_edit_still_rejects_external_changes() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let path = root.path().join("sample.txt");
+        fs::write(&path, "alpha\nbeta\ngamma\n").await?;
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({ "path": "sample.txt", "start_line": 2, "end_line": 2 }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "beta",
+                        "new_text": "omega"
+                    }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+        fs::write(&path, "alpha\nOMEGA\ngamma\n").await?;
+        let err = match FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "OMEGA",
+                        "new_text": "theta"
+                    }),
+                    tracker,
+                )
+                .await,
+            )
+            .await
+        {
+            Ok(_) => panic!("external change should stale the edit observation"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(format!(
+                "refusing to edit `{}` because it changed since it was read or searched: observed {}, actual {}",
+                path.display(),
+                content_hash("alpha\nomega\ngamma\n"),
+                content_hash("alpha\nOMEGA\ngamma\n")
+            ))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_observes_the_written_file_for_followup_edit() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let path = root.path().join("sample.txt");
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "write",
+                    json!({
+                        "path": "sample.txt",
+                        "content": "alpha\nbeta\ngamma\n"
+                    }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "gamma",
+                        "new_text": "delta"
+                    }),
+                    tracker,
+                )
+                .await,
+            )
+            .await?;
+
+        assert_eq!(fs::read_to_string(path).await?, "alpha\nbeta\ndelta\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grep_observation_allows_matching_line_edit() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let path = root.path().join("sample.txt");
+        fs::write(&path, "alpha\nbeta\ngamma\n").await?;
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "grep_file",
+                    json!({
+                        "pattern": "beta"
+                    }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "beta",
+                        "new_text": "omega"
+                    }),
+                    tracker,
+                )
+                .await,
+            )
+            .await?;
+
+        assert_eq!(fs::read_to_string(path).await?, "alpha\nomega\ngamma\n");
         Ok(())
     }
 

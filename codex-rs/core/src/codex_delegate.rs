@@ -50,6 +50,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use codex_login::AuthManager;
 use codex_models_manager::manager::SharedModelsManager;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::InitialHistory;
 
@@ -72,6 +73,32 @@ pub(crate) async fn run_codex_thread_interactive(
     subagent_source: SubAgentSource,
     initial_history: Option<InitialHistory>,
 ) -> Result<Codex, CodexErr> {
+    run_codex_thread_interactive_with_dynamic_tools(
+        config,
+        auth_manager,
+        models_manager,
+        parent_session,
+        parent_ctx,
+        cancel_token,
+        subagent_source,
+        Vec::new(),
+        initial_history,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_codex_thread_interactive_with_dynamic_tools(
+    config: Config,
+    auth_manager: Arc<AuthManager>,
+    models_manager: SharedModelsManager,
+    parent_session: Arc<Session>,
+    parent_ctx: Arc<TurnContext>,
+    cancel_token: CancellationToken,
+    subagent_source: SubAgentSource,
+    dynamic_tools: Vec<DynamicToolSpec>,
+    initial_history: Option<InitialHistory>,
+) -> Result<Codex, CodexErr> {
     let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let CodexSpawnOk { codex, .. } = Box::pin(Codex::spawn(CodexSpawnArgs {
@@ -87,7 +114,7 @@ pub(crate) async fn run_codex_thread_interactive(
         conversation_history: initial_history.unwrap_or(InitialHistory::New),
         session_source: SessionSource::SubAgent(subagent_source.clone()),
         agent_control: parent_session.services.agent_control.clone(),
-        dynamic_tools: Vec::new(),
+        dynamic_tools,
         persist_extended_history: false,
         metrics_service_name: None,
         inherited_shell_snapshot: None,

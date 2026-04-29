@@ -195,6 +195,9 @@ impl ThreadHistoryBuilder {
             EventMsg::CollabAgentSpawnBegin(payload) => {
                 self.handle_collab_agent_spawn_begin(payload)
             }
+            EventMsg::CollabAgentSpawnUpdate(payload) => {
+                self.handle_collab_agent_spawn_update(payload)
+            }
             EventMsg::CollabAgentSpawnEnd(payload) => self.handle_collab_agent_spawn_end(payload),
             EventMsg::CollabAgentInteractionBegin(payload) => {
                 self.handle_collab_agent_interaction_begin(payload)
@@ -611,8 +614,37 @@ impl ThreadHistoryBuilder {
             model: Some(payload.model.clone()),
             reasoning_effort: Some(payload.reasoning_effort),
             agents_states: HashMap::new(),
+            tool_progress: None,
         };
         self.upsert_item_in_current_turn(item);
+    }
+
+    fn handle_collab_agent_spawn_update(
+        &mut self,
+        payload: &codex_protocol::protocol::CollabAgentSpawnUpdateEvent,
+    ) {
+        let receiver_id = payload.new_thread_id.to_string();
+        let agents_states = [(
+            receiver_id.clone(),
+            CollabAgentState::from(payload.status.clone()),
+        )]
+        .into_iter()
+        .collect();
+        self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
+            id: payload.call_id.clone(),
+            tool: CollabAgentTool::SpawnAgent,
+            status: CollabAgentToolCallStatus::InProgress,
+            sender_thread_id: payload.sender_thread_id.to_string(),
+            receiver_thread_ids: vec![receiver_id],
+            prompt: Some(payload.prompt.clone()),
+            model: Some(payload.model.clone()),
+            reasoning_effort: Some(payload.reasoning_effort),
+            agents_states,
+            tool_progress: payload
+                .tool_summary
+                .as_ref()
+                .map(|summary| summary.output.clone()),
+        });
     }
 
     fn handle_collab_agent_spawn_end(
@@ -646,6 +678,10 @@ impl ThreadHistoryBuilder {
             model: Some(payload.model.clone()),
             reasoning_effort: Some(payload.reasoning_effort),
             agents_states,
+            tool_progress: payload
+                .tool_summary
+                .as_ref()
+                .map(|summary| summary.output.clone()),
         });
     }
 
@@ -663,6 +699,7 @@ impl ThreadHistoryBuilder {
             model: None,
             reasoning_effort: None,
             agents_states: HashMap::new(),
+            tool_progress: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -687,6 +724,7 @@ impl ThreadHistoryBuilder {
             model: None,
             reasoning_effort: None,
             agents_states: [(receiver_id, received_status)].into_iter().collect(),
+            tool_progress: None,
         });
     }
 
@@ -708,6 +746,7 @@ impl ThreadHistoryBuilder {
             model: None,
             reasoning_effort: None,
             agents_states: HashMap::new(),
+            tool_progress: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -743,6 +782,7 @@ impl ThreadHistoryBuilder {
             model: None,
             reasoning_effort: None,
             agents_states,
+            tool_progress: None,
         });
     }
 
@@ -760,6 +800,7 @@ impl ThreadHistoryBuilder {
             model: None,
             reasoning_effort: None,
             agents_states: HashMap::new(),
+            tool_progress: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -786,6 +827,7 @@ impl ThreadHistoryBuilder {
             model: None,
             reasoning_effort: None,
             agents_states,
+            tool_progress: None,
         });
     }
 
@@ -803,6 +845,7 @@ impl ThreadHistoryBuilder {
             model: None,
             reasoning_effort: None,
             agents_states: HashMap::new(),
+            tool_progress: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -832,6 +875,7 @@ impl ThreadHistoryBuilder {
             model: None,
             reasoning_effort: None,
             agents_states,
+            tool_progress: None,
         });
     }
 
@@ -2769,6 +2813,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                tool_progress: None,
             }
         );
     }
@@ -2796,6 +2841,8 @@ mod tests {
                 model: "gpt-5.4-mini".into(),
                 reasoning_effort: codex_protocol::openai_models::ReasoningEffort::Medium,
                 status: AgentStatus::Running,
+                mode: codex_protocol::protocol::CollabAgentToolCallMode::Background,
+                tool_summary: None,
             }),
         ];
 
@@ -2826,6 +2873,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                tool_progress: None,
             }
         );
     }
@@ -2894,6 +2942,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                tool_progress: None,
             }
         );
     }

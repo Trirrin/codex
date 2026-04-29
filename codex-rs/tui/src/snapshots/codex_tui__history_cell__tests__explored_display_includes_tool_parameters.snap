@@ -2,4 +2,4 @@
 source: tui/src/history_cell.rs
 expression: rendered
 ---
-• Search 1 file, Read 2 files
+• Read 2 files, Grep 1 search, Glob 1 pattern

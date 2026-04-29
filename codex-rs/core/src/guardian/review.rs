@@ -36,7 +36,6 @@ use super::approval_request::guardian_request_target_item_id;
 use super::approval_request::guardian_request_turn_id;
 use super::approval_request::guardian_reviewed_action;
 use super::prompt::guardian_output_schema;
-use super::prompt::parse_guardian_assessment;
 use super::review_session::GuardianReviewSessionOutcome;
 use super::review_session::GuardianReviewSessionParams;
 use super::review_session::build_guardian_review_session_config;
@@ -453,24 +452,25 @@ async fn run_guardian_review(
         GuardianAssessmentOutcome::Allow => true,
         GuardianAssessmentOutcome::Deny => false,
     };
-    let verdict = if approved { "approved" } else { "denied" };
-    let user_authorization = match assessment.user_authorization {
-        GuardianUserAuthorization::Unknown => "unknown",
-        GuardianUserAuthorization::Low => "low",
-        GuardianUserAuthorization::Medium => "medium",
-        GuardianUserAuthorization::High => "high",
-    };
-    let warning = format!(
-        "Automatic approval review {verdict} (risk: {}, authorization: {user_authorization}): {}",
-        guardian_risk_level_str(assessment.risk_level),
-        assessment.rationale
-    );
-    session
-        .send_event(
-            turn.as_ref(),
-            EventMsg::GuardianWarning(WarningEvent { message: warning }),
-        )
-        .await;
+    if !approved {
+        let user_authorization = match assessment.user_authorization {
+            GuardianUserAuthorization::Unknown => "unknown",
+            GuardianUserAuthorization::Low => "low",
+            GuardianUserAuthorization::Medium => "medium",
+            GuardianUserAuthorization::High => "high",
+        };
+        let warning = format!(
+            "Automatic approval review denied (risk: {}, authorization: {user_authorization}): {}",
+            guardian_risk_level_str(assessment.risk_level),
+            assessment.rationale
+        );
+        session
+            .send_event(
+                turn.as_ref(),
+                EventMsg::GuardianWarning(WarningEvent { message: warning }),
+            )
+            .await;
+    }
     let status = if approved {
         GuardianAssessmentStatus::Approved
     } else {
@@ -701,31 +701,24 @@ pub(super) async fn run_guardian_review_session(
     .await;
 
     match session_outcome {
-        GuardianReviewSessionOutcome::Completed(Ok(last_agent_message)) => match last_agent_message
-        {
-            Some(last_agent_message) => {
-                match parse_guardian_assessment(Some(&last_agent_message)) {
-                    Ok(assessment) => (
-                        GuardianReviewOutcome::Completed(assessment),
-                        session_analytics_result,
-                    ),
-                    Err(err) => (
-                        GuardianReviewOutcome::Error(GuardianReviewError::parse(err)),
-                        session_analytics_result,
-                    ),
-                }
-            }
-            None => (
-                GuardianReviewOutcome::Error(GuardianReviewError::session(anyhow::anyhow!(
-                    "guardian review completed without an assessment payload"
-                ))),
-                session_analytics_result,
-            ),
-        },
-        GuardianReviewSessionOutcome::Completed(Err(err)) => (
-            GuardianReviewOutcome::Error(GuardianReviewError::session(err)),
+        GuardianReviewSessionOutcome::Completed(Ok(assessment)) => (
+            GuardianReviewOutcome::Completed(assessment),
             session_analytics_result,
         ),
+        GuardianReviewSessionOutcome::Completed(Err(err)) => {
+            let error = if err
+                .to_string()
+                .starts_with("guardian_decision arguments were invalid")
+            {
+                GuardianReviewError::parse(err)
+            } else {
+                GuardianReviewError::session(err)
+            };
+            (
+                GuardianReviewOutcome::Error(error),
+                session_analytics_result,
+            )
+        }
         GuardianReviewSessionOutcome::PromptBuildFailed(err) => (
             GuardianReviewOutcome::Error(GuardianReviewError::prompt_build(err)),
             session_analytics_result,

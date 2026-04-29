@@ -100,11 +100,11 @@ fn execute_tool_matches_expected_spec() {
 
     let description = if cfg!(windows) {
         format!(
-            "Runs a command in a PTY. Defaults to mode=\"blocking\"; use mode=\"background\" to keep it running.{}",
+            "Runs a command in a PTY. Defaults to mode=\"blocking\"; use mode=\"background\" to keep it running. Plain rg/grep/cat file inspection must use the existing file tools instead.{}",
             windows_shell_guidance_description()
         )
     } else {
-        "Runs a command in a PTY. Defaults to mode=\"blocking\"; use mode=\"background\" to keep it running."
+        "Runs a command in a PTY. Defaults to mode=\"blocking\"; use mode=\"background\" to keep it running. Plain rg/grep/cat file inspection must use the existing file tools instead."
             .to_string()
     };
 

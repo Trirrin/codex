@@ -8,6 +8,8 @@ Today this crate is intentionally small. It currently owns the shared tool
 schema and Responses API tool primitives that no longer need to live in
 `core/src/tools/spec.rs` or `core/src/client_common.rs`:
 
+Keep new additions focused on reusable tool primitives with clear consumers.
+
 - `JsonSchema`
 - `AdditionalProperties`
 - `ToolDefinition`

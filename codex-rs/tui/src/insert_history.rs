@@ -32,6 +32,7 @@ use ratatui::layout::Size;
 use ratatui::prelude::Backend;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
+use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 
@@ -95,6 +96,8 @@ where
 
     // Pre-wrap lines for terminal scrollback. Three paths:
     //
+    // - Background-filled lines that already fit are kept intact, preserving
+    //   trailing styled padding used by full-width diff rows.
     // - URL-only-ish lines are kept intact (no hard newlines inserted) so that
     //   terminal emulators can match them as clickable links. The
     //   terminal will character-wrap these lines at the viewport
@@ -109,12 +112,13 @@ where
     let mut wrapped_rows = 0usize;
 
     for line in &lines {
-        let line_wrapped =
-            if line_contains_url_like(line) && !line_has_mixed_url_and_non_url_tokens(line) {
-                vec![line.clone()]
-            } else {
-                adaptive_wrap_line(line, RtOptions::new(wrap_width))
-            };
+        let line_wrapped = if line.style.bg.is_some() && line.width() <= wrap_width
+            || line_contains_url_like(line) && !line_has_mixed_url_and_non_url_tokens(line)
+        {
+            vec![line.clone()]
+        } else {
+            adaptive_wrap_line(line, RtOptions::new(wrap_width))
+        };
         wrapped_rows += line_wrapped
             .iter()
             .map(|wrapped_line| wrapped_line.width().max(1).div_ceil(wrap_width))
@@ -247,17 +251,17 @@ fn write_history_line<W: Write>(writer: &mut W, line: &Line, wrap_width: usize) 
         ))
     )?;
     queue!(writer, Clear(ClearType::UntilNewLine))?;
-    // Merge line-level style into each span so that ANSI colors reflect
-    // line styles (e.g., blockquotes with green fg).
+    // Apply line-level style as the base style so span overrides still match
+    // ratatui's normal rendering semantics.
     let merged_spans: Vec<Span> = line
         .spans
         .iter()
         .map(|s| Span {
-            style: s.style.patch(line.style),
+            style: line.style.patch(s.style),
             content: s.content.clone(),
         })
         .collect();
-    write_spans(writer, merged_spans.iter())
+    write_spans_with_initial_style(writer, merged_spans.iter(), line.style)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,12 +371,24 @@ impl ModifierDiff {
     }
 }
 
-fn write_spans<'a, I>(mut writer: &mut impl Write, content: I) -> io::Result<()>
+#[cfg(test)]
+fn write_spans<'a, I>(writer: &mut impl Write, content: I) -> io::Result<()>
 where
     I: IntoIterator<Item = &'a Span<'a>>,
 {
-    let mut fg = Color::Reset;
-    let mut bg = Color::Reset;
+    write_spans_with_initial_style(writer, content, Style::default())
+}
+
+fn write_spans_with_initial_style<'a, I>(
+    mut writer: &mut impl Write,
+    content: I,
+    initial_style: Style,
+) -> io::Result<()>
+where
+    I: IntoIterator<Item = &'a Span<'a>>,
+{
+    let mut fg = initial_style.fg.unwrap_or(Color::Reset);
+    let mut bg = initial_style.bg.unwrap_or(Color::Reset);
     let mut last_modifier = Modifier::empty();
     for span in content {
         let mut modifier = Modifier::empty();
@@ -600,6 +616,45 @@ mod tests {
                 );
             }
             break 'rows;
+        }
+    }
+
+    #[test]
+    fn vt100_line_background_fills_row_and_reset_spans_clear_margins() {
+        let width: u16 = 12;
+        let height: u16 = 6;
+        let backend = VT100Backend::new(width, height);
+        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        let viewport = Rect::new(0, height - 1, width, 1);
+        term.set_viewport_area(viewport);
+
+        let mut line: Line<'static> = Line::from(vec![
+            Span::styled("  ", Style::reset()),
+            Span::raw("12 +    "),
+            Span::styled("  ", Style::reset()),
+        ]);
+        line.style = Style::default().bg(Color::Green);
+
+        insert_history_lines(&mut term, vec![line]).expect("insert history");
+
+        let screen = term.backend().vt100().screen();
+        let rows: Vec<String> = screen.rows(0, width).collect();
+        let row = rows
+            .iter()
+            .position(|row| row.contains("12 +"))
+            .unwrap_or_else(|| panic!("expected rendered diff row, have rows: {rows:?}"));
+
+        for col in 0..2 {
+            let cell = screen.cell(row as u16, col).unwrap();
+            assert_eq!(cell.bgcolor(), vt100::Color::Default);
+        }
+        for col in 2..10 {
+            let cell = screen.cell(row as u16, col).unwrap();
+            assert_ne!(cell.bgcolor(), vt100::Color::Default);
+        }
+        for col in 10..width {
+            let cell = screen.cell(row as u16, col).unwrap();
+            assert_eq!(cell.bgcolor(), vt100::Color::Default);
         }
     }
 

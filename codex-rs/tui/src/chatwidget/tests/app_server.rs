@@ -15,6 +15,7 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
             prompt: "Explore the repo".to_string(),
             model: "gpt-5".to_string(),
             reasoning_effort: ReasoningEffortConfig::High,
+            mode: CollabAgentToolCallMode::Background,
         }),
     });
     chat.handle_codex_event(Event {
@@ -29,6 +30,8 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
             model: "gpt-5".to_string(),
             reasoning_effort: ReasoningEffortConfig::High,
             status: AgentStatus::PendingInit,
+            mode: CollabAgentToolCallMode::Background,
+            tool_summary: None,
         }),
     });
 
@@ -40,7 +43,7 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
         .join("\n");
 
     assert!(
-        rendered.contains("Spawned Robie [explorer] (gpt-5 high)"),
+        rendered.contains("Started Subagent Robie [explorer] (gpt-5 high) in background"),
         "expected spawn line to include agent metadata and requested model, got {rendered:?}"
     );
 }
@@ -388,6 +391,7 @@ async fn live_app_server_collab_wait_items_render_history() {
                 model: None,
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
+                tool_progress: None,
             },
         }),
         /*replay_kind*/ None,
@@ -425,6 +429,7 @@ async fn live_app_server_collab_wait_items_render_history() {
                         },
                     ),
                 ]),
+                tool_progress: None,
             },
         }),
         /*replay_kind*/ None,
@@ -460,6 +465,7 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
                 model: Some("gpt-5".to_string()),
                 reasoning_effort: Some(ReasoningEffortConfig::High),
                 agents_states: HashMap::new(),
+                tool_progress: None,
             },
         }),
         /*replay_kind*/ None,
@@ -485,6 +491,7 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
                         message: None,
                     },
                 )]),
+                tool_progress: None,
             },
         }),
         /*replay_kind*/ None,
@@ -499,6 +506,445 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
         "app_server_collab_spawn_completed_renders_requested_model_and_effort",
         combined
     );
+}
+
+#[tokio::test]
+async fn live_app_server_blocking_spawn_updates_active_cell_with_tool_progress() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b90000000003").expect("valid thread id");
+    let spawned_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b91781b41a8f").expect("valid thread id");
+    chat.set_collab_agent_metadata(
+        spawned_thread_id,
+        Some("Pascal".to_string()),
+        Some("explorer".to_string()),
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::CollabAgentToolCall {
+                id: "spawn-blocking-1".to_string(),
+                tool: AppServerCollabAgentTool::SpawnAgent,
+                status: AppServerCollabAgentToolCallStatus::InProgress,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![spawned_thread_id.to_string()],
+                prompt: Some("Explore the repo".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                reasoning_effort: Some(ReasoningEffortConfig::High),
+                agents_states: HashMap::from([(
+                    spawned_thread_id.to_string(),
+                    AppServerCollabAgentState {
+                        status: AppServerCollabAgentStatus::Running,
+                        message: None,
+                    },
+                )]),
+                tool_progress: Some(vec![
+                    "Search CollabAgentSpawn".to_string(),
+                    "Read codex-rs/tui/src/chatwidget.rs".to_string(),
+                ]),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    assert!(drain_insert_history(&mut rx).is_empty());
+    let active = active_blob(&chat);
+    assert!(
+        active.contains("Starting Subagent Pascal [explorer] (gpt-5.5 high)"),
+        "expected active blocking spawn title, got {active:?}"
+    );
+    assert!(
+        active.contains("Search 1 pattern, Read 1 file"),
+        "expected grouped active tool progress, got {active:?}"
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::CollabAgentToolCall {
+                id: "spawn-blocking-1".to_string(),
+                tool: AppServerCollabAgentTool::SpawnAgent,
+                status: AppServerCollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![spawned_thread_id.to_string()],
+                prompt: Some("Explore the repo".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                reasoning_effort: Some(ReasoningEffortConfig::High),
+                agents_states: HashMap::from([(
+                    spawned_thread_id.to_string(),
+                    AppServerCollabAgentState {
+                        status: AppServerCollabAgentStatus::Completed,
+                        message: None,
+                    },
+                )]),
+                tool_progress: Some(vec!["Read codex-rs/tui/src/chatwidget.rs".to_string()]),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    let final_row = lines_to_single_string(&cells[0]);
+    assert!(
+        final_row.contains("Started Subagent Pascal [explorer] (gpt-5.5 high)"),
+        "expected final blocking spawn row, got {final_row:?}"
+    );
+    assert!(
+        !final_row.contains("in background"),
+        "blocking spawn must not render as background: {final_row:?}"
+    );
+    assert!(
+        final_row.contains("Read 1 file"),
+        "expected grouped final tool progress, got {final_row:?}"
+    );
+}
+
+#[tokio::test]
+async fn background_spawn_pending_init_footer_renders_running() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b90000000004").expect("valid thread id");
+    let spawned_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b91781b41a90").expect("valid thread id");
+
+    chat.handle_codex_event(Event {
+        id: "spawn-end".into(),
+        msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+            call_id: "call-spawn".to_string(),
+            sender_thread_id,
+            new_thread_id: Some(spawned_thread_id),
+            new_agent_nickname: Some("Pascal".to_string()),
+            new_agent_role: Some("explorer".to_string()),
+            prompt: "Explore the repo".to_string(),
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: ReasoningEffortConfig::High,
+            status: AgentStatus::PendingInit,
+            mode: CollabAgentToolCallMode::Background,
+            tool_summary: None,
+        }),
+    });
+    let _ = drain_insert_history(&mut rx);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let details = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(
+        details.contains("status: running"),
+        "background spawn must not expose stale PendingInit state, got {details:?}"
+    );
+    assert!(
+        !details.contains("status: pending"),
+        "background spawn footer got stuck pending: {details:?}"
+    );
+    assert!(
+        details.contains("runtime:"),
+        "background spawn footer details must include runtime, got {details:?}"
+    );
+}
+
+#[tokio::test]
+async fn background_spawn_footer_details_show_tool_output() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b90000000005").expect("valid thread id");
+    let spawned_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b91781b41a91").expect("valid thread id");
+    chat.thread_id = Some(sender_thread_id);
+    chat.set_collab_agent_metadata(
+        spawned_thread_id,
+        Some("Pascal".to_string()),
+        Some("explorer".to_string()),
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::CollabAgentToolCall {
+                id: "spawn-background-1".to_string(),
+                tool: AppServerCollabAgentTool::SpawnAgent,
+                status: AppServerCollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![spawned_thread_id.to_string()],
+                prompt: Some("Explore the repo".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                reasoning_effort: Some(ReasoningEffortConfig::High),
+                agents_states: HashMap::from([(
+                    spawned_thread_id.to_string(),
+                    AppServerCollabAgentState {
+                        status: AppServerCollabAgentStatus::Running,
+                        message: None,
+                    },
+                )]),
+                tool_progress: Some(vec![
+                    "Read codex-rs/tui/src/chatwidget.rs".to_string(),
+                    "Search CollabAgentSpawn in codex-rs/tui/src".to_string(),
+                ]),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    let _ = drain_insert_history(&mut rx);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let details = render_bottom_popup(&chat, /*width*/ 120);
+    assert!(
+        details.contains("output:"),
+        "expected output section, got {details:?}"
+    );
+    assert!(
+        details.contains("Read codex-rs/tui/src/chatwidget.rs"),
+        "expected read output line, got {details:?}"
+    );
+    assert!(
+        details.contains("Search CollabAgentSpawn in codex-rs/tui/src"),
+        "expected search output line, got {details:?}"
+    );
+}
+
+#[tokio::test]
+async fn background_spawn_footer_details_collect_child_thread_tool_output() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b90000000006").expect("valid thread id");
+    let spawned_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b91781b41a92").expect("valid thread id");
+    chat.thread_id = Some(sender_thread_id);
+    chat.set_collab_agent_metadata(
+        spawned_thread_id,
+        Some("Newton".to_string()),
+        Some("explorer".to_string()),
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::CollabAgentToolCall {
+                id: "spawn-background-1".to_string(),
+                tool: AppServerCollabAgentTool::SpawnAgent,
+                status: AppServerCollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![spawned_thread_id.to_string()],
+                prompt: Some("Explore the repo".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                reasoning_effort: Some(ReasoningEffortConfig::High),
+                agents_states: HashMap::from([(
+                    spawned_thread_id.to_string(),
+                    AppServerCollabAgentState {
+                        status: AppServerCollabAgentStatus::Running,
+                        message: None,
+                    },
+                )]),
+                tool_progress: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    let _ = drain_insert_history(&mut rx);
+
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: spawned_thread_id.to_string(),
+            turn_id: "turn-child-1".to_string(),
+            item: AppServerThreadItem::DynamicToolCall {
+                id: "read-1".to_string(),
+                namespace: None,
+                tool: "read_file".to_string(),
+                arguments: json!({"path":"codex-rs/tui/src/chatwidget.rs"}),
+                status: codex_app_server_protocol::DynamicToolCallStatus::InProgress,
+                content_items: None,
+                success: None,
+                duration_ms: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: spawned_thread_id.to_string(),
+            turn_id: "turn-child-1".to_string(),
+            item: AppServerThreadItem::DynamicToolCall {
+                id: "search-1".to_string(),
+                namespace: None,
+                tool: "grep_file".to_string(),
+                arguments: json!({"pattern":"CollabAgentSpawn", "root":"codex-rs/tui/src"}),
+                status: codex_app_server_protocol::DynamicToolCallStatus::InProgress,
+                content_items: None,
+                success: None,
+                duration_ms: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: spawned_thread_id.to_string(),
+            turn_id: "turn-child-1".to_string(),
+            item: AppServerThreadItem::CommandExecution {
+                id: "cmd-read-1".to_string(),
+                command: "read_file /tmp/project/codex-rs/tui/Cargo.toml".to_string(),
+                cwd: test_path_buf("/tmp/project").abs(),
+                process_id: None,
+                source: AppServerCommandExecutionSource::Agent,
+                run_mode: None,
+                status: AppServerCommandExecutionStatus::InProgress,
+                command_actions: Vec::new(),
+                aggregated_output: None,
+                exit_code: None,
+                duration_ms: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: spawned_thread_id.to_string(),
+            turn_id: "turn-child-1".to_string(),
+            item: AppServerThreadItem::CommandExecution {
+                id: "cmd-list-1".to_string(),
+                command: "list_dir /tmp/project/codex-rs/tui".to_string(),
+                cwd: test_path_buf("/tmp/project").abs(),
+                process_id: None,
+                source: AppServerCommandExecutionSource::Agent,
+                run_mode: None,
+                status: AppServerCommandExecutionStatus::InProgress,
+                command_actions: Vec::new(),
+                aggregated_output: None,
+                exit_code: None,
+                duration_ms: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let details = render_bottom_popup(&chat, /*width*/ 120);
+    assert!(
+        details.contains("runtime:"),
+        "expected runtime in details, got {details:?}"
+    );
+    assert!(
+        details.contains("output:"),
+        "expected child tool output section, got {details:?}"
+    );
+    assert!(
+        details.contains("Read codex-rs/tui/src/chatwidget.rs"),
+        "expected child read output line, got {details:?}"
+    );
+    assert!(
+        details.contains("Search CollabAgentSpawn in codex-rs/tui/src"),
+        "expected child search output line, got {details:?}"
+    );
+    assert!(
+        details.contains("Read /tmp/project/codex-rs/tui/Cargo.toml"),
+        "expected command execution read output line, got {details:?}"
+    );
+    assert!(
+        details.contains("List /tmp/project/codex-rs/tui"),
+        "expected command execution list output line, got {details:?}"
+    );
+    assert!(
+        !details.contains("Execute read_file") && !details.contains("Execute list_dir"),
+        "tool command output should not be flattened to Execute: {details:?}"
+    );
+}
+
+#[tokio::test]
+async fn live_app_server_background_spawn_completion_notifies_model() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b90000000004").expect("valid thread id");
+    let spawned_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b91781b41a90").expect("valid thread id");
+    chat.thread_id = Some(sender_thread_id);
+    chat.set_collab_agent_metadata(
+        spawned_thread_id,
+        Some("Pascal".to_string()),
+        Some("explorer".to_string()),
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::CollabAgentToolCall {
+                id: "spawn-background-1".to_string(),
+                tool: AppServerCollabAgentTool::SpawnAgent,
+                status: AppServerCollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![spawned_thread_id.to_string()],
+                prompt: Some("Explore the repo".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                reasoning_effort: Some(ReasoningEffortConfig::High),
+                agents_states: HashMap::from([(
+                    spawned_thread_id.to_string(),
+                    AppServerCollabAgentState {
+                        status: AppServerCollabAgentStatus::Running,
+                        message: None,
+                    },
+                )]),
+                tool_progress: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    let _ = drain_insert_history(&mut rx);
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-2".to_string(),
+            item: AppServerThreadItem::CollabAgentToolCall {
+                id: "wait-background-1".to_string(),
+                tool: AppServerCollabAgentTool::Wait,
+                status: AppServerCollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![spawned_thread_id.to_string()],
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: HashMap::from([(
+                    spawned_thread_id.to_string(),
+                    AppServerCollabAgentState {
+                        status: AppServerCollabAgentStatus::Completed,
+                        message: Some("done".to_string()),
+                    },
+                )]),
+                tool_progress: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => {
+            let text = match items.as_slice() {
+                [UserInput::Text { text, .. }] => text,
+                other => panic!("expected hidden text message, got {other:?}"),
+            };
+            assert!(
+                text.contains("Background subagent Pascal")
+                    && text.contains("completed")
+                    && text.contains(&spawned_thread_id.to_string()),
+                "expected background completion notice, got {text:?}"
+            );
+        }
+        other => panic!("expected hidden Op::UserTurn, got {other:?}"),
+    }
 }
 
 #[tokio::test]

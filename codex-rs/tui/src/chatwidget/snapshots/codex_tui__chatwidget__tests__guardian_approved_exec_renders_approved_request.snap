@@ -5,12 +5,11 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
 
 
 
+• Ran rm -f /tmp/guardian-approved.sqlite
+  └ Approved by Auto reviewer.
+  └ (no output)
 
-
-✔ Auto-reviewer approved codex to run rm -f /tmp/guardian-approved.sqlite this
-  time
-
+• Working (0s • esc to interrupt)
 
 › Ask Codex to do anything
-
   gpt-5.5 default · /tmp/project

@@ -9,6 +9,9 @@ use codex_analytics::GuardianReviewAnalyticsResult;
 use codex_analytics::GuardianReviewSessionKind;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+use codex_protocol::dynamic_tools::DynamicToolResponse;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -26,7 +29,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::codex_delegate::run_codex_thread_interactive;
+use crate::codex_delegate::run_codex_thread_interactive_with_dynamic_tools;
 use crate::config::Config;
 use crate::config::Constrained;
 use crate::config::ManagedFeatures;
@@ -46,16 +49,30 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use super::GUARDIAN_REVIEW_TIMEOUT;
 use super::GUARDIAN_REVIEWER_NAME;
 use super::GuardianApprovalRequest;
+use super::GuardianAssessment;
 use super::prompt::GuardianPromptMode;
 use super::prompt::GuardianTranscriptCursor;
 use super::prompt::build_guardian_prompt_items;
 use super::prompt::guardian_policy_prompt;
 use super::prompt::guardian_policy_prompt_with_config;
+use super::prompt::parse_guardian_assessment;
+use super::prompt::parse_guardian_assessment_value;
 
 const GUARDIAN_INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const GUARDIAN_DECISION_TOOL_NAME: &str = "guardian_decision";
+
+fn guardian_decision_tool(input_schema: Value) -> DynamicToolSpec {
+    DynamicToolSpec {
+        namespace: None,
+        name: GUARDIAN_DECISION_TOOL_NAME.to_string(),
+        description: "Record the final automatic approval review decision.".to_string(),
+        input_schema,
+        defer_loading: false,
+    }
+}
 #[derive(Debug)]
 pub(crate) enum GuardianReviewSessionOutcome {
-    Completed(anyhow::Result<Option<String>>),
+    Completed(anyhow::Result<GuardianAssessment>),
     PromptBuildFailed(anyhow::Error),
     SessionFailed(anyhow::Error),
     TimedOut,
@@ -556,7 +573,7 @@ async fn spawn_guardian_review_session(
         ),
         None => (None, 0, None),
     };
-    let codex = Box::pin(run_codex_thread_interactive(
+    let codex = Box::pin(run_codex_thread_interactive_with_dynamic_tools(
         spawn_config,
         params.parent_session.services.auth_manager.clone(),
         params.parent_session.services.models_manager.clone(),
@@ -564,6 +581,7 @@ async fn spawn_guardian_review_session(
         Arc::clone(&params.parent_turn),
         cancel_token.clone(),
         SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_string()),
+        vec![guardian_decision_tool(params.schema.clone())],
         initial_history,
     ))
     .await?;
@@ -693,7 +711,7 @@ async fn run_review_on_session(
             effort: params.reasoning_effort,
             summary: Some(params.reasoning_summary),
             service_tier: None,
-            final_output_json_schema: Some(params.schema.clone()),
+            final_output_json_schema: None,
             collaboration_mode: None,
             personality: params.personality,
         })),
@@ -765,6 +783,7 @@ async fn wait_for_guardian_review(
     let timeout = tokio::time::sleep_until(deadline);
     tokio::pin!(timeout);
     let mut last_error_message: Option<String> = None;
+    let mut assessment: Option<GuardianAssessment> = None;
 
     loop {
         tokio::select! {
@@ -785,21 +804,72 @@ async fn wait_for_guardian_review(
             event = review_session.codex.next_event() => {
                 match event {
                     Ok(event) => match event.msg {
+                        EventMsg::DynamicToolCallRequest(request)
+                            if request.namespace.is_none()
+                                && request.tool == GUARDIAN_DECISION_TOOL_NAME =>
+                        {
+                            let (success, text) = match parse_guardian_assessment_value(request.arguments) {
+                                Ok(parsed_assessment) => {
+                                    assessment = Some(parsed_assessment);
+                                    (true, "Decision recorded.".to_string())
+                                }
+                                Err(err) => {
+                                    let message = format!(
+                                        "guardian_decision arguments were invalid: {err}"
+                                    );
+                                    last_error_message = Some(message.clone());
+                                    (false, message)
+                                }
+                            };
+                            if let Err(err) = review_session
+                                .codex
+                                .submit(Op::DynamicToolResponse {
+                                    id: request.call_id,
+                                    response: DynamicToolResponse {
+                                        content_items: vec![DynamicToolCallOutputContentItem::InputText { text }],
+                                        success,
+                                    },
+                                })
+                                .await
+                            {
+                                last_error_message = Some(format!(
+                                    "failed to record guardian_decision response: {err}"
+                                ));
+                            }
+                        }
                         EventMsg::TurnComplete(turn_complete) => {
                             analytics_result.time_to_first_token_ms = turn_complete
                                 .time_to_first_token_ms
                                 .and_then(|ms| u64::try_from(ms).ok());
-                            if turn_complete.last_agent_message.is_none()
-                                && let Some(error_message) = last_error_message
-                            {
+                            if let Some(assessment) = assessment {
                                 return (
-                                    GuardianReviewSessionOutcome::Completed(Err(anyhow!(error_message))),
+                                    GuardianReviewSessionOutcome::Completed(Ok(assessment)),
                                     true,
                                     true,
                                 );
                             }
+                            if let Some(last_agent_message) = turn_complete.last_agent_message {
+                                match parse_guardian_assessment(Some(&last_agent_message)) {
+                                    Ok(assessment) => {
+                                        return (
+                                            GuardianReviewSessionOutcome::Completed(Ok(assessment)),
+                                            true,
+                                            true,
+                                        );
+                                    }
+                                    Err(err) => {
+                                        last_error_message = Some(format!(
+                                            "guardian final message was not a valid decision: {err}"
+                                        ));
+                                    }
+                                }
+                            }
+                            let message = last_error_message.unwrap_or_else(|| {
+                                "guardian review completed without calling guardian_decision"
+                                    .to_string()
+                            });
                             return (
-                                GuardianReviewSessionOutcome::Completed(Ok(turn_complete.last_agent_message)),
+                                GuardianReviewSessionOutcome::Completed(Err(anyhow!(message))),
                                 true,
                                 true,
                             );

@@ -28,10 +28,16 @@ use codex_app_server_protocol::AdditionalFileSystemPermissions;
 use codex_app_server_protocol::AdditionalNetworkPermissions;
 use codex_app_server_protocol::AdditionalPermissionProfile;
 use codex_app_server_protocol::AgentMessageDeltaNotification;
+use codex_app_server_protocol::CollabAgentState;
+use codex_app_server_protocol::CollabAgentStatus;
+use codex_app_server_protocol::CollabAgentTool;
+use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::ConfigWarningNotification;
+use codex_app_server_protocol::DynamicToolCallStatus;
 use codex_app_server_protocol::FileChangeRequestApprovalParams;
 use codex_app_server_protocol::FileUpdateChange;
+use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpServerStartupState;
@@ -3310,6 +3316,79 @@ async fn side_thread_ignores_global_mcp_startup_notifications() {
 }
 
 #[tokio::test]
+async fn background_subagent_child_notifications_update_primary_footer_output() {
+    let mut app = make_test_app().await;
+    let app_server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+        .await
+        .expect("embedded app server");
+    let parent_thread_id = ThreadId::new();
+    let child_thread_id = ThreadId::new();
+    app.primary_thread_id = Some(parent_thread_id);
+    app.chat_widget.handle_thread_session(test_thread_session(
+        parent_thread_id,
+        test_path_buf("/tmp/project"),
+    ));
+    app.chat_widget.set_collab_agent_metadata(
+        child_thread_id,
+        Some("Sagan".to_string()),
+        Some("explorer".to_string()),
+    );
+
+    app.chat_widget.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: parent_thread_id.to_string(),
+            turn_id: "parent-turn".to_string(),
+            item: ThreadItem::CollabAgentToolCall {
+                id: "spawn-1".to_string(),
+                tool: CollabAgentTool::SpawnAgent,
+                status: CollabAgentToolCallStatus::Completed,
+                sender_thread_id: parent_thread_id.to_string(),
+                receiver_thread_ids: vec![child_thread_id.to_string()],
+                prompt: Some("Explore the repo".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                reasoning_effort: None,
+                agents_states: std::collections::HashMap::from([(
+                    child_thread_id.to_string(),
+                    CollabAgentState {
+                        status: CollabAgentStatus::Running,
+                        message: None,
+                    },
+                )]),
+                tool_progress: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    app.handle_app_server_event(
+        &app_server,
+        codex_app_server_client::AppServerEvent::ServerNotification(
+            ServerNotification::ItemStarted(ItemStartedNotification {
+                thread_id: child_thread_id.to_string(),
+                turn_id: "child-turn".to_string(),
+                item: ThreadItem::DynamicToolCall {
+                    id: "read-1".to_string(),
+                    namespace: None,
+                    tool: "read_file".to_string(),
+                    arguments: serde_json::json!({"path":"codex-rs/tui/src/chatwidget.rs"}),
+                    status: DynamicToolCallStatus::InProgress,
+                    content_items: None,
+                    success: None,
+                    duration_ms: None,
+                },
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        app.chat_widget
+            .background_subagent_output_for_test(child_thread_id),
+        Some(vec!["Read codex-rs/tui/src/chatwidget.rs".to_string()])
+    );
+}
+
+#[tokio::test]
 async fn side_restore_user_message_puts_inline_question_back_in_composer() {
     let mut app = make_test_app().await;
     let user_message = crate::chatwidget::UserMessage::from("side question");
@@ -4645,6 +4724,7 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
                             model: None,
                             reasoning_effort: None,
                             agents_states: HashMap::new(),
+                            tool_progress: None,
                         },
                     },
                 ),

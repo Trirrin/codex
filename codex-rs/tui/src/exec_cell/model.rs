@@ -27,6 +27,7 @@ pub(crate) struct ExecCall {
     pub(crate) command: Vec<String>,
     pub(crate) parsed: Vec<ParsedCommand>,
     pub(crate) output: Option<CommandOutput>,
+    pub(crate) auto_review_approved: bool,
     pub(crate) source: ExecCommandSource,
     pub(crate) run_mode: Option<ExecCommandRunMode>,
     pub(crate) start_time: Option<Instant>,
@@ -34,10 +35,34 @@ pub(crate) struct ExecCall {
     pub(crate) interaction_input: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ExploredToolsDisplay {
+    #[default]
+    Compact,
+    Detailed,
+}
+
+impl ExploredToolsDisplay {
+    pub(crate) fn from_compact_explored_tools(compact_explored_tools: bool) -> Self {
+        if compact_explored_tools {
+            Self::Compact
+        } else {
+            Self::Detailed
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecCellDisplayOptions {
+    pub(crate) animations_enabled: bool,
+    pub(crate) explored_tools_display: ExploredToolsDisplay,
+}
+
 #[derive(Debug)]
 pub(crate) struct ExecCell {
     pub(crate) calls: Vec<ExecCall>,
     animations_enabled: bool,
+    explored_tools_display: ExploredToolsDisplay,
 }
 
 impl ExecCell {
@@ -45,6 +70,7 @@ impl ExecCell {
         Self {
             calls: vec![call],
             animations_enabled,
+            explored_tools_display: ExploredToolsDisplay::default(),
         }
     }
 
@@ -62,6 +88,7 @@ impl ExecCell {
             command,
             parsed,
             output: None,
+            auto_review_approved: false,
             source,
             run_mode,
             start_time: Some(Instant::now()),
@@ -72,6 +99,7 @@ impl ExecCell {
             Some(Self {
                 calls: [self.calls.clone(), vec![call]].concat(),
                 animations_enabled: self.animations_enabled,
+                explored_tools_display: self.explored_tools_display,
             })
         } else {
             None
@@ -140,6 +168,15 @@ impl ExecCell {
         self.animations_enabled
     }
 
+    pub(crate) fn explored_tools_display(&self) -> ExploredToolsDisplay {
+        self.explored_tools_display
+    }
+
+    pub(crate) fn with_explored_tools_display(mut self, display: ExploredToolsDisplay) -> Self {
+        self.explored_tools_display = display;
+        self
+    }
+
     pub(crate) fn iter_calls(&self) -> impl Iterator<Item = &ExecCall> {
         self.calls.iter()
     }
@@ -156,6 +193,14 @@ impl ExecCell {
         }
         let output = call.output.get_or_insert_with(CommandOutput::default);
         output.aggregated_output.push_str(chunk);
+        true
+    }
+
+    pub(crate) fn mark_auto_review_approved(&mut self, call_id: &str) -> bool {
+        let Some(call) = self.calls.iter_mut().rev().find(|c| c.call_id == call_id) else {
+            return false;
+        };
+        call.auto_review_approved = true;
         true
     }
 

@@ -1,6 +1,5 @@
 ---
 source: tui/src/chatwidget/tests/status_and_layout.rs
-assertion_line: 2969
 expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
 ---
 
@@ -23,7 +22,7 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
   ↳ Hello, world! 13
   ↳ Hello, world! 14
   ↳ Hello, world! 15
-
+  ↳ Hello, world! 16
+  ↳ Hello, world! 17
 › Ask Codex to do anything
-
   gpt-5.5 default · /tmp/project

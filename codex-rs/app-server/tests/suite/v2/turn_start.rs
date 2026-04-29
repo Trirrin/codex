@@ -2644,6 +2644,7 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
             model: Some(REQUESTED_MODEL.to_string()),
             reasoning_effort: Some(REQUESTED_REASONING_EFFORT),
             agents_states: HashMap::new(),
+            tool_progress: None,
         }
     );
 
@@ -2672,6 +2673,7 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
         model,
         reasoning_effort,
         agents_states,
+        tool_progress,
     } = spawn_completed
     else {
         unreachable!("loop ensures we break on collab agent tool call items");
@@ -2688,6 +2690,7 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
     assert_eq!(prompt, Some(CHILD_PROMPT.to_string()));
     assert_eq!(model, Some(REQUESTED_MODEL.to_string()));
     assert_eq!(reasoning_effort, Some(REQUESTED_REASONING_EFFORT));
+    assert_eq!(tool_progress, None);
     let agent_state = agents_states
         .get(&receiver_thread_id)
         .expect("spawn completion should include child agent state");
@@ -2856,6 +2859,7 @@ config_file = "./custom-role.toml"
         model,
         reasoning_effort,
         agents_states,
+        tool_progress,
     } = spawn_completed
     else {
         unreachable!("loop ensures we break on collab agent tool call items");
@@ -2872,6 +2876,7 @@ config_file = "./custom-role.toml"
     assert_eq!(prompt, Some(CHILD_PROMPT.to_string()));
     assert_eq!(model, Some(ROLE_MODEL.to_string()));
     assert_eq!(reasoning_effort, Some(ROLE_REASONING_EFFORT));
+    assert_eq!(tool_progress, None);
     let agent_state = agents_states
         .get(&receiver_thread_id)
         .expect("spawn completion should include child agent state");

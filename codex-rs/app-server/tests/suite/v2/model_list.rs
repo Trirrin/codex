@@ -3,7 +3,6 @@ use std::time::Duration;
 use anyhow::Result;
 use app_test_support::McpProcess;
 use app_test_support::to_response;
-use app_test_support::write_models_cache;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::Model;
@@ -45,11 +44,7 @@ fn model_from_preset(preset: &ModelPreset) -> Model {
             .collect(),
         default_reasoning_effort: preset.default_reasoning_effort,
         input_modalities: preset.input_modalities.clone(),
-        // `write_models_cache()` round-trips through a simplified ModelInfo fixture that does not
-        // preserve personality placeholders in base instructions, so app-server list results from
-        // cache report `supports_personality = false`.
-        // todo(sayan): fix, maybe make roundtrip use ModelInfo only
-        supports_personality: false,
+        supports_personality: preset.supports_personality,
         additional_speed_tiers: preset.additional_speed_tiers.clone(),
         is_default: preset.is_default,
     }
@@ -75,7 +70,6 @@ fn expected_visible_models() -> Vec<Model> {
 #[tokio::test]
 async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_models_cache(codex_home.path())?;
     let mut mcp = McpProcess::new(codex_home.path()).await?;
 
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
@@ -109,7 +103,6 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
 #[tokio::test]
 async fn list_models_includes_hidden_models() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_models_cache(codex_home.path())?;
     let mut mcp = McpProcess::new(codex_home.path()).await?;
 
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
@@ -141,7 +134,6 @@ async fn list_models_includes_hidden_models() -> Result<()> {
 #[tokio::test]
 async fn list_models_pagination_works() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_models_cache(codex_home.path())?;
     let mut mcp = McpProcess::new(codex_home.path()).await?;
 
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
@@ -190,7 +182,6 @@ async fn list_models_pagination_works() -> Result<()> {
 #[tokio::test]
 async fn list_models_rejects_invalid_cursor() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_models_cache(codex_home.path())?;
     let mut mcp = McpProcess::new(codex_home.path()).await?;
 
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;

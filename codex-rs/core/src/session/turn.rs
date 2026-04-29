@@ -1529,6 +1529,7 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
         | EventMsg::ReasoningContentDelta(_)
         | EventMsg::ReasoningRawContentDelta(_)
         | EventMsg::CollabAgentSpawnBegin(_)
+        | EventMsg::CollabAgentSpawnUpdate(_)
         | EventMsg::CollabAgentSpawnEnd(_)
         | EventMsg::CollabAgentInteractionBegin(_)
         | EventMsg::CollabAgentInteractionEnd(_)

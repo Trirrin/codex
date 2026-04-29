@@ -522,6 +522,18 @@ pub(crate) fn parse_guardian_assessment(text: Option<&str>) -> anyhow::Result<Gu
             anyhow::bail!("guardian assessment was not valid JSON");
         };
 
+    Ok(guardian_assessment_from_payload(parsed_payload))
+}
+
+pub(crate) fn parse_guardian_assessment_value(value: Value) -> anyhow::Result<GuardianAssessment> {
+    Ok(guardian_assessment_from_payload(serde_json::from_value(
+        value,
+    )?))
+}
+
+fn guardian_assessment_from_payload(
+    parsed_payload: GuardianAssessmentPayload,
+) -> GuardianAssessment {
     let outcome = parsed_payload.outcome;
     let risk_level = parsed_payload.risk_level.unwrap_or(match outcome {
         super::GuardianAssessmentOutcome::Allow => GuardianRiskLevel::Low,
@@ -539,14 +551,14 @@ pub(crate) fn parse_guardian_assessment(text: Option<&str>) -> anyhow::Result<Gu
             }
         });
 
-    Ok(GuardianAssessment {
+    GuardianAssessment {
         risk_level,
         user_authorization: parsed_payload
             .user_authorization
             .unwrap_or(GuardianUserAuthorization::Unknown),
         outcome,
         rationale,
-    })
+    }
 }
 
 #[derive(Deserialize)]
@@ -557,8 +569,7 @@ struct GuardianAssessmentPayload {
     rationale: Option<String>,
 }
 
-/// JSON schema supplied as `final_output_json_schema` to guide a structured
-/// final answer from the guardian review session.
+/// JSON schema supplied as the `guardian_decision` tool input schema.
 ///
 /// Keep this next to `guardian_output_contract_prompt()` so the prompt text and
 /// output schema stay aligned.
@@ -590,11 +601,11 @@ pub(crate) fn guardian_output_schema() -> Value {
 /// Prompt fragment that describes the exact JSON contract paired with
 /// `guardian_output_schema()`.
 fn guardian_output_contract_prompt() -> &'static str {
-    r#"You may use read-only tool checks to gather any additional context you need before deciding. When you are ready to answer, your final message must be strict JSON.
+    r#"You may use read-only tool checks to gather any additional context you need before deciding. When you are ready to decide, call the `guardian_decision` tool exactly once. Do not provide the decision as final JSON.
 
-For low-risk actions, give the final answer directly: {"outcome":"allow"}.
+For low-risk actions, call `guardian_decision` directly with {"outcome":"allow"}.
 
-For anything else, use this JSON schema:
+For anything else, call `guardian_decision` with:
 {
   "risk_level": "low" | "medium" | "high" | "critical",
   "user_authorization": "unknown" | "low" | "medium" | "high",

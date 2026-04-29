@@ -1121,6 +1121,36 @@ pub(crate) async fn apply_bespoke_event_handling(
                 model: Some(begin_event.model),
                 reasoning_effort: Some(begin_event.reasoning_effort),
                 agents_states: HashMap::new(),
+                tool_progress: None,
+            };
+            let notification = ItemStartedNotification {
+                thread_id: conversation_id.to_string(),
+                turn_id: event_turn_id.clone(),
+                item,
+            };
+            outgoing
+                .send_server_notification(ServerNotification::ItemStarted(notification))
+                .await;
+        }
+        EventMsg::CollabAgentSpawnUpdate(update_event) => {
+            let receiver_id = update_event.new_thread_id.to_string();
+            let agents_states = [(
+                receiver_id.clone(),
+                V2CollabAgentStatus::from(update_event.status),
+            )]
+            .into_iter()
+            .collect();
+            let item = ThreadItem::CollabAgentToolCall {
+                id: update_event.call_id,
+                tool: CollabAgentTool::SpawnAgent,
+                status: V2CollabToolCallStatus::InProgress,
+                sender_thread_id: update_event.sender_thread_id.to_string(),
+                receiver_thread_ids: vec![receiver_id],
+                prompt: Some(update_event.prompt),
+                model: Some(update_event.model),
+                reasoning_effort: Some(update_event.reasoning_effort),
+                agents_states,
+                tool_progress: update_event.tool_summary.map(|summary| summary.output),
             };
             let notification = ItemStartedNotification {
                 thread_id: conversation_id.to_string(),
@@ -1160,6 +1190,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 model: Some(end_event.model),
                 reasoning_effort: Some(end_event.reasoning_effort),
                 agents_states,
+                tool_progress: end_event.tool_summary.map(|summary| summary.output),
             };
             let notification = ItemCompletedNotification {
                 thread_id: conversation_id.to_string(),
@@ -1182,6 +1213,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 model: None,
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
+                tool_progress: None,
             };
             let notification = ItemStartedNotification {
                 thread_id: conversation_id.to_string(),
@@ -1210,6 +1242,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 model: None,
                 reasoning_effort: None,
                 agents_states: [(receiver_id, received_status)].into_iter().collect(),
+                tool_progress: None,
             };
             let notification = ItemCompletedNotification {
                 thread_id: conversation_id.to_string(),
@@ -1236,6 +1269,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 model: None,
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
+                tool_progress: None,
             };
             let notification = ItemStartedNotification {
                 thread_id: conversation_id.to_string(),
@@ -1274,6 +1308,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 model: None,
                 reasoning_effort: None,
                 agents_states,
+                tool_progress: None,
             };
             let notification = ItemCompletedNotification {
                 thread_id: conversation_id.to_string(),
@@ -1295,6 +1330,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 model: None,
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
+                tool_progress: None,
             };
             let notification = ItemStartedNotification {
                 thread_id: conversation_id.to_string(),
@@ -1337,6 +1373,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 model: None,
                 reasoning_effort: None,
                 agents_states,
+                tool_progress: None,
             };
             let notification = ItemCompletedNotification {
                 thread_id: conversation_id.to_string(),
@@ -3010,6 +3047,7 @@ fn collab_resume_begin_item(
         model: None,
         reasoning_effort: None,
         agents_states: HashMap::new(),
+        tool_progress: None,
     }
 }
 
@@ -3036,6 +3074,7 @@ fn collab_resume_end_item(end_event: codex_protocol::protocol::CollabResumeEndEv
         model: None,
         reasoning_effort: None,
         agents_states,
+        tool_progress: None,
     }
 }
 
@@ -4168,6 +4207,7 @@ mod tests {
             model: None,
             reasoning_effort: None,
             agents_states: HashMap::new(),
+            tool_progress: None,
         };
         assert_eq!(item, expected);
     }
@@ -4200,6 +4240,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            tool_progress: None,
         };
         assert_eq!(item, expected);
     }

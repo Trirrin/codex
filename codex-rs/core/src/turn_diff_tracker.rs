@@ -22,6 +22,53 @@ struct BaselineFileInfo {
     oid: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservedFileInfo {
+    content_hash: String,
+    ranges: Vec<ObservedLineRange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservedLineRange {
+    start: usize,
+    end: usize,
+}
+
+impl ObservedLineRange {
+    fn contains(&self, line: usize) -> bool {
+        self.start <= line && line <= self.end
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FileObservationError {
+    NotObserved,
+    Stale {
+        observed_hash: String,
+        current_hash: String,
+    },
+    MissingLines {
+        ranges: Vec<(usize, usize)>,
+    },
+}
+
+fn merge_observed_ranges(ranges: &mut Vec<ObservedLineRange>) {
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<ObservedLineRange> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        let Some(last) = merged.last_mut() else {
+            merged.push(range);
+            continue;
+        };
+        if range.start <= last.end.saturating_add(1) {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    *ranges = merged;
+}
+
 /// Tracks sets of changes to files and exposes the overall unified diff.
 /// Internally, the way this works is now:
 /// 1. Maintain an in-memory baseline snapshot of files when they are first seen.
@@ -40,11 +87,133 @@ pub struct TurnDiffTracker {
     temp_name_to_current_path: HashMap<String, PathBuf>,
     /// Cache of known git worktree roots to avoid repeated filesystem walks.
     git_root_cache: Vec<PathBuf>,
+    /// File lines exposed to the model by read/search tools during this turn.
+    observed_files: HashMap<PathBuf, ObservedFileInfo>,
 }
 
 impl TurnDiffTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn record_file_observation(
+        &mut self,
+        path: &Path,
+        content_hash: String,
+        ranges: impl IntoIterator<Item = (usize, usize)>,
+    ) {
+        let mut ranges = ranges
+            .into_iter()
+            .filter_map(|(start, end)| {
+                if start == 0 || end < start {
+                    None
+                } else {
+                    Some(ObservedLineRange { start, end })
+                }
+            })
+            .collect::<Vec<_>>();
+        if ranges.is_empty() {
+            return;
+        }
+
+        let entry = self
+            .observed_files
+            .entry(path.to_path_buf())
+            .or_insert_with(|| ObservedFileInfo {
+                content_hash: content_hash.clone(),
+                ranges: Vec::new(),
+            });
+        if entry.content_hash != content_hash {
+            entry.content_hash = content_hash;
+            entry.ranges.clear();
+        }
+
+        entry.ranges.append(&mut ranges);
+        merge_observed_ranges(&mut entry.ranges);
+    }
+
+    pub fn verify_file_observation(
+        &self,
+        path: &Path,
+        current_hash: &str,
+        ranges: &[(usize, usize)],
+    ) -> Result<(), FileObservationError> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let Some(observed) = self.observed_files.get(path) else {
+            return Err(FileObservationError::NotObserved);
+        };
+        if observed.content_hash != current_hash {
+            return Err(FileObservationError::Stale {
+                observed_hash: observed.content_hash.clone(),
+                current_hash: current_hash.to_string(),
+            });
+        }
+
+        let missing = ranges
+            .iter()
+            .copied()
+            .filter(|(start, end)| {
+                !observed
+                    .ranges
+                    .iter()
+                    .any(|range| range.start <= *start && range.end >= *end)
+            })
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(FileObservationError::MissingLines { ranges: missing })
+        }
+    }
+
+    pub fn record_file_edit_observation(
+        &mut self,
+        path: &Path,
+        previous_hash: &str,
+        content_hash: String,
+        line_origins: &[Option<usize>],
+        ranges: impl IntoIterator<Item = (usize, usize)>,
+    ) {
+        let mut next_ranges = Vec::new();
+        if let Some(observed) = self.observed_files.get(path)
+            && observed.content_hash == previous_hash
+        {
+            next_ranges.extend(
+                line_origins
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, origin)| {
+                        let origin = (*origin)?;
+                        observed
+                            .ranges
+                            .iter()
+                            .any(|range| range.contains(origin))
+                            .then_some((index + 1, index + 1))
+                    }),
+            );
+        }
+
+        next_ranges.extend(ranges);
+        let mut ranges = next_ranges
+            .into_iter()
+            .filter_map(|(start, end)| {
+                if start == 0 || end < start {
+                    None
+                } else {
+                    Some(ObservedLineRange { start, end })
+                }
+            })
+            .collect::<Vec<_>>();
+        merge_observed_ranges(&mut ranges);
+        self.observed_files.insert(
+            path.to_path_buf(),
+            ObservedFileInfo {
+                content_hash,
+                ranges,
+            },
+        );
     }
 
     /// Front-run apply patch calls to track the starting contents of any modified files.

@@ -1,0 +1,6 @@
+---
+source: tui/src/multi_agents.rs
+expression: cell_to_text(&cell)
+---
+• Starting Subagent Robie [explorer] (gpt-5.5 high)
+  └ Search 1 pattern, Read 1 file

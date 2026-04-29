@@ -1208,12 +1208,23 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
     ));
     let request = request_log.single_request();
     let request_body = request.body_json();
+    assert_eq!(request_body.pointer("/text/format"), None);
+    let guardian_tool = request_body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|tools| {
+            tools.iter().find(|tool| {
+                tool.get("name").and_then(serde_json::Value::as_str) == Some("guardian_decision")
+            })
+        })
+        .expect("guardian request should include the guardian_decision tool");
     assert_eq!(
-        request_body.pointer("/text/format/strict"),
-        Some(&serde_json::json!(false))
+        guardian_tool.get("type"),
+        Some(&serde_json::json!("function"))
     );
+    assert_eq!(guardian_tool.get("strict"), Some(&serde_json::json!(false)));
     assert_eq!(
-        request_body.pointer("/text/format/schema"),
+        guardian_tool.get("parameters"),
         Some(&serde_json::json!({
             "type": "object",
             "additionalProperties": false,

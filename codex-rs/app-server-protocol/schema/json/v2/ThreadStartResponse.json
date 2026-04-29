@@ -1889,6 +1889,16 @@
               ],
               "description": "Name of the collab tool that was invoked."
             },
+            "toolProgress": {
+              "description": "Human-readable tool progress lines reported by a spawned agent, when available.",
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "type": {
               "enum": [
                 "collabAgentToolCall"

@@ -455,6 +455,9 @@ pub struct Config {
     /// Show startup tooltips in the TUI welcome screen.
     pub show_tooltips: bool,
 
+    /// Collapse explored read/search/list tool groups into a single count summary.
+    pub compact_explored_tools: bool,
+
     /// Persisted startup availability NUX state for model tooltips.
     pub model_availability_nux: ModelAvailabilityNuxConfig,
 
@@ -2652,6 +2655,11 @@ impl Config {
                 .unwrap_or_default(),
             animations: cfg.tui.as_ref().map(|t| t.animations).unwrap_or(true),
             show_tooltips: cfg.tui.as_ref().map(|t| t.show_tooltips).unwrap_or(true),
+            compact_explored_tools: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.compact_explored_tools)
+                .unwrap_or(true),
             model_availability_nux: cfg
                 .tui
                 .as_ref()

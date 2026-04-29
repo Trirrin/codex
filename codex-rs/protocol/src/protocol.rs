@@ -1591,6 +1591,8 @@ pub enum EventMsg {
 
     /// Collab interaction: agent spawn begin.
     CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent),
+    /// Collab interaction: blocking agent spawn progress update.
+    CollabAgentSpawnUpdate(CollabAgentSpawnUpdateEvent),
     /// Collab interaction: agent spawn end.
     CollabAgentSpawnEnd(CollabAgentSpawnEndEvent),
     /// Collab interaction: agent interaction begin.
@@ -1755,6 +1757,12 @@ pub struct RealtimeConversationSdpEvent {
 impl From<CollabAgentSpawnBeginEvent> for EventMsg {
     fn from(event: CollabAgentSpawnBeginEvent) -> Self {
         EventMsg::CollabAgentSpawnBegin(event)
+    }
+}
+
+impl From<CollabAgentSpawnUpdateEvent> for EventMsg {
+    fn from(event: CollabAgentSpawnUpdateEvent) -> Self {
+        EventMsg::CollabAgentSpawnUpdate(event)
     }
 }
 
@@ -3855,6 +3863,54 @@ pub struct CollabAgentSpawnBeginEvent {
     pub prompt: String,
     pub model: String,
     pub reasoning_effort: ReasoningEffortConfig,
+    #[serde(default)]
+    pub mode: CollabAgentToolCallMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum CollabAgentToolCallMode {
+    Blocking,
+    #[default]
+    Background,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct CollabAgentToolSummary {
+    pub tools: Vec<CollabAgentToolSummaryEntry>,
+    pub output: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct CollabAgentToolSummaryEntry {
+    pub name: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct CollabAgentSpawnUpdateEvent {
+    /// Identifier for the collab tool call.
+    pub call_id: String,
+    /// Thread ID of the sender.
+    pub sender_thread_id: ThreadId,
+    /// Thread ID of the newly spawned agent.
+    pub new_thread_id: ThreadId,
+    /// Optional nickname assigned to the new agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_agent_nickname: Option<String>,
+    /// Optional role assigned to the new agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_agent_role: Option<String>,
+    /// Initial prompt sent to the agent.
+    pub prompt: String,
+    /// Effective model used by the spawned agent after inheritance and role overrides.
+    pub model: String,
+    /// Effective reasoning effort used by the spawned agent after inheritance and role overrides.
+    pub reasoning_effort: ReasoningEffortConfig,
+    /// Last known status of the new agent reported to the sender agent.
+    pub status: AgentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_summary: Option<CollabAgentToolSummary>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -3906,6 +3962,10 @@ pub struct CollabAgentSpawnEndEvent {
     pub reasoning_effort: ReasoningEffortConfig,
     /// Last known status of the new agent reported to the sender agent.
     pub status: AgentStatus,
+    #[serde(default)]
+    pub mode: CollabAgentToolCallMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_summary: Option<CollabAgentToolSummary>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]

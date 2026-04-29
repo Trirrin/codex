@@ -1,0 +1,8 @@
+---
+source: tui/src/diff_render.rs
+expression: text
+---
+• Edited tab_indent.txt (+1 -1)
+    1  ……  get()
+    2 -……      old_patch()
+    2 +……      patch()

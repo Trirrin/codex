@@ -166,6 +166,9 @@ impl ToolHandler for UnifiedExecHandler {
         let Ok(params) = parse_arguments::<ExecCommandArgs>(arguments) else {
             return true;
         };
+        if should_block_plain_inspection_command(&params.cmd) {
+            return false;
+        }
         let command = match get_command(
             &params,
             invocation.session.user_shell(),
@@ -190,6 +193,7 @@ impl ToolHandler for UnifiedExecHandler {
 
         parse_arguments::<ExecCommandArgs>(arguments)
             .ok()
+            .filter(|args| !should_block_plain_inspection_command(&args.cmd))
             .map(|args| PreToolUsePayload {
                 tool_name: HookToolName::bash(),
                 tool_input: serde_json::json!({ "command": args.cmd }),
@@ -262,6 +266,9 @@ impl ToolHandler for UnifiedExecHandler {
                 let cwd = resolve_workdir_base_path(&arguments, &context.turn.cwd)?;
                 let args: ExecCommandArgs = parse_arguments_with_base_path(&arguments, &cwd)?;
                 let hook_command = args.cmd.clone();
+                if should_block_plain_inspection_command(&args.cmd) {
+                    return Ok(blocked_existing_tools_output(args.max_output_tokens));
+                }
                 let workdir = context.turn.resolve_path(args.workdir.clone());
                 maybe_emit_implicit_skill_invocation(
                     session.as_ref(),
@@ -681,6 +688,50 @@ impl ToolHandler for UnifiedExecHandler {
         };
 
         Ok(response)
+    }
+}
+
+const USE_EXISTING_TOOLS_MESSAGE: &str = "Use the existing file tools instead of plain rg, grep, or cat for file inspection. Do not respond to this tool result; continue with the user's task using the appropriate existing tool.";
+
+fn should_block_plain_inspection_command(command: &str) -> bool {
+    let Some(tokens) = shlex::split(command) else {
+        return false;
+    };
+    let Some(command) = primary_command_token(&tokens) else {
+        return false;
+    };
+    let command = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    matches!(command, "cat" | "grep" | "rg")
+}
+
+fn primary_command_token(tokens: &[String]) -> Option<&str> {
+    for token in tokens.iter().map(String::as_str) {
+        if token == "|" {
+            return None;
+        }
+        if token.contains('=') && !token.starts_with('/') {
+            continue;
+        }
+        if matches!(token, "command" | "env" | "sudo" | "time") || token.starts_with('-') {
+            continue;
+        }
+        return Some(token);
+    }
+    None
+}
+
+fn blocked_existing_tools_output(max_output_tokens: Option<usize>) -> ExecCommandToolOutput {
+    ExecCommandToolOutput {
+        event_call_id: String::new(),
+        chunk_id: String::new(),
+        wall_time: std::time::Duration::ZERO,
+        raw_output: USE_EXISTING_TOOLS_MESSAGE.as_bytes().to_vec(),
+        max_output_tokens,
+        shell_id: None,
+        process_id: None,
+        exit_code: None,
+        original_token_count: None,
+        hook_command: None,
     }
 }
 

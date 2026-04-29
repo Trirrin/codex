@@ -64,7 +64,6 @@ const LIGHT_TC_ADD_LINE_BG_RGB: (u8, u8, u8) = (218, 251, 225); // #dafbe1
 const LIGHT_TC_DEL_LINE_BG_RGB: (u8, u8, u8) = (255, 235, 233); // #ffebe9
 const LIGHT_TC_ADD_NUM_BG_RGB: (u8, u8, u8) = (172, 238, 187); // #aceebb
 const LIGHT_TC_DEL_NUM_BG_RGB: (u8, u8, u8) = (255, 206, 203); // #ffcecb
-const LIGHT_TC_GUTTER_FG_RGB: (u8, u8, u8) = (31, 35, 40); // #1f2328
 
 // 256-color palette.
 const DARK_256_ADD_LINE_BG_IDX: u8 = 22;
@@ -73,8 +72,10 @@ const LIGHT_256_ADD_LINE_BG_IDX: u8 = 194;
 const LIGHT_256_DEL_LINE_BG_IDX: u8 = 224;
 const LIGHT_256_ADD_NUM_BG_IDX: u8 = 157;
 const LIGHT_256_DEL_NUM_BG_IDX: u8 = 217;
-const LIGHT_256_GUTTER_FG_IDX: u8 = 236;
 const MAX_RENDERED_ADDED_LINES: usize = 10;
+const DIFF_BLOCK_SIDE_PADDING: usize = 4;
+const MIN_ELIDED_LEADING_INDENT_COLUMNS: usize = 8;
+const LEADING_INDENT_ELISION_MARKER: &str = "……  ";
 
 use crate::color::is_light;
 use crate::color::perceptual_distance;
@@ -84,7 +85,6 @@ use crate::render::highlight::DiffScopeBackgroundRgbs;
 use crate::render::highlight::diff_scope_background_rgbs;
 use crate::render::highlight::exceeds_highlight_limits;
 use crate::render::highlight::highlight_code_to_styled_spans;
-use crate::render::line_utils::prefix_lines;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::InsetRenderable;
 use crate::render::renderable::Renderable;
@@ -250,7 +250,7 @@ fn resolve_diff_backgrounds_for(
 }
 
 /// Hardcoded palette backgrounds, used when the syntax theme provides no
-/// diff-specific scope backgrounds.  Returns empty backgrounds for ANSI-16.
+/// diff-specific scope backgrounds.
 fn fallback_diff_backgrounds(
     theme: DiffTheme,
     color_level: DiffColorLevel,
@@ -260,7 +260,10 @@ fn fallback_diff_backgrounds(
             add: Some(add_line_bg(theme, level)),
             del: Some(del_line_bg(theme, level)),
         },
-        None => ResolvedDiffBackgrounds::default(),
+        None => ResolvedDiffBackgrounds {
+            add: Some(Color::Green),
+            del: Some(Color::Red),
+        },
     }
 }
 
@@ -335,7 +338,7 @@ impl From<DiffSummary> for Box<dyn Renderable> {
             rows.push(Box::new(InsetRenderable::new(
                 Box::new(row.change) as Box<dyn Renderable>,
                 Insets::tlbr(
-                    /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
+                    /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 2,
                 ),
             )));
         }
@@ -458,11 +461,30 @@ fn render_changes_block(rows: Vec<Row>, wrap_cols: usize, cwd: &Path) -> Vec<RtL
         let lang_path = r.move_path.as_deref().unwrap_or(&r.path);
         let lang = detect_lang_for_path(lang_path);
         let mut lines = vec![];
-        render_change(&r.change, &mut lines, wrap_cols - 4, lang.as_deref());
-        out.extend(prefix_lines(lines, "    ".into(), "    ".into()));
+        let diff_width = wrap_cols.saturating_sub(DIFF_BLOCK_SIDE_PADDING * 2).max(1);
+        render_change(&r.change, &mut lines, diff_width, lang.as_deref());
+        out.extend(prefix_diff_lines(lines, DIFF_BLOCK_SIDE_PADDING));
     }
 
     out
+}
+
+fn prefix_diff_lines(lines: Vec<RtLine<'static>>, side_padding: usize) -> Vec<RtLine<'static>> {
+    let padding = " ".repeat(side_padding);
+    lines
+        .into_iter()
+        .map(|mut line| {
+            let changed_line = line.style.bg.is_some();
+            let mut spans = Vec::with_capacity(line.spans.len() + if changed_line { 2 } else { 1 });
+            spans.push(RtSpan::styled(padding.clone(), Style::reset()));
+            spans.append(&mut line.spans);
+            if changed_line {
+                spans.push(RtSpan::styled(padding.clone(), Style::reset()));
+            }
+            line.spans = spans;
+            line
+        })
+        .collect()
 }
 
 /// Detect the programming language for a file path by its extension.
@@ -487,6 +509,9 @@ fn render_change(
             let lines = content.lines().collect::<Vec<_>>();
             let rendered_line_count = lines.len().min(MAX_RENDERED_ADDED_LINES);
             let line_number_width = line_number_width(rendered_line_count);
+            let leading_indent_elision = leading_indent_elision_for_texts(
+                lines.iter().take(MAX_RENDERED_ADDED_LINES).copied(),
+            );
             for (i, raw) in lines.iter().take(MAX_RENDERED_ADDED_LINES).enumerate() {
                 let syn = syntax_lines.as_ref().and_then(|sl| sl.get(i));
                 if let Some(spans) = syn {
@@ -500,6 +525,7 @@ fn render_change(
                         style_context.theme,
                         style_context.color_level,
                         style_context.diff_backgrounds,
+                        leading_indent_elision,
                     ));
                 } else {
                     out.extend(push_wrapped_diff_line_inner_with_theme_and_color_level(
@@ -512,6 +538,7 @@ fn render_change(
                         style_context.theme,
                         style_context.color_level,
                         style_context.diff_backgrounds,
+                        leading_indent_elision,
                     ));
                 }
             }
@@ -576,6 +603,7 @@ fn render_change(
                                 DiffLineType::Context,
                                 style_context.theme,
                                 style_context.color_level,
+                                style_context.diff_backgrounds,
                             ),
                         );
                         out.push(RtLine::from(vec![spacer_span, "⋮".dim()]));
@@ -600,6 +628,12 @@ fn render_change(
 
                     let mut old_ln = h.old_range().start();
                     let mut new_ln = h.new_range().start();
+                    let leading_indent_elision =
+                        leading_indent_elision_for_texts(h.lines().iter().map(|line| match line {
+                            diffy::Line::Insert(text)
+                            | diffy::Line::Delete(text)
+                            | diffy::Line::Context(text) => text.trim_end_matches('\n'),
+                        }));
                     for (line_idx, l) in h.lines().iter().enumerate() {
                         let syntax_spans = hunk_syntax_lines
                             .as_ref()
@@ -619,6 +653,7 @@ fn render_change(
                                             style_context.theme,
                                             style_context.color_level,
                                             style_context.diff_backgrounds,
+                                            leading_indent_elision,
                                         ),
                                     );
                                 } else {
@@ -633,6 +668,7 @@ fn render_change(
                                             style_context.theme,
                                             style_context.color_level,
                                             style_context.diff_backgrounds,
+                                            leading_indent_elision,
                                         ),
                                     );
                                 }
@@ -652,6 +688,7 @@ fn render_change(
                                             style_context.theme,
                                             style_context.color_level,
                                             style_context.diff_backgrounds,
+                                            leading_indent_elision,
                                         ),
                                     );
                                 } else {
@@ -666,6 +703,7 @@ fn render_change(
                                             style_context.theme,
                                             style_context.color_level,
                                             style_context.diff_backgrounds,
+                                            leading_indent_elision,
                                         ),
                                     );
                                 }
@@ -685,6 +723,7 @@ fn render_change(
                                             style_context.theme,
                                             style_context.color_level,
                                             style_context.diff_backgrounds,
+                                            leading_indent_elision,
                                         ),
                                     );
                                 } else {
@@ -699,6 +738,7 @@ fn render_change(
                                             style_context.theme,
                                             style_context.color_level,
                                             style_context.diff_backgrounds,
+                                            leading_indent_elision,
                                         ),
                                     );
                                 }
@@ -756,6 +796,116 @@ pub(crate) fn calculate_add_remove_from_diff(diff: &str) -> (usize, usize) {
     }
 }
 
+fn leading_indent_elision_for_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Option<usize> {
+    let mut min_indent: Option<usize> = None;
+    for text in texts {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let indent = leading_indent_columns(text);
+        min_indent = Some(min_indent.map_or(indent, |current| current.min(indent)));
+    }
+    min_indent.filter(|indent| *indent >= MIN_ELIDED_LEADING_INDENT_COLUMNS)
+}
+
+fn leading_indent_columns(text: &str) -> usize {
+    text.chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .map(indent_char_width)
+        .sum()
+}
+
+fn indent_char_width(ch: char) -> usize {
+    match ch {
+        ' ' => 1,
+        '\t' => TAB_WIDTH,
+        _ => 0,
+    }
+}
+
+fn apply_leading_indent_elision_to_spans(
+    spans: impl IntoIterator<Item = RtSpan<'static>>,
+    leading_indent_elision: Option<usize>,
+    marker_style: Style,
+) -> Vec<RtSpan<'static>> {
+    let spans = spans.into_iter().collect::<Vec<_>>();
+    let Some(indent_to_elide) = leading_indent_elision else {
+        return spans;
+    };
+    if leading_indent_columns_in_spans(&spans) < indent_to_elide {
+        return spans;
+    }
+
+    let mut remaining = indent_to_elide;
+    let mut out = vec![RtSpan::styled(LEADING_INDENT_ELISION_MARKER, marker_style)];
+    for span in spans {
+        let style = span.style;
+        let text = span.content.into_owned();
+        if remaining == 0 {
+            out.push(RtSpan::styled(expand_leading_tabs(&text), style));
+            continue;
+        }
+
+        let (next_remaining, rest) = elide_leading_indent_from_text(&text, remaining);
+        remaining = next_remaining;
+        if !rest.is_empty() {
+            out.push(RtSpan::styled(rest, style));
+        }
+    }
+    out
+}
+
+fn leading_indent_columns_in_spans(spans: &[RtSpan<'static>]) -> usize {
+    let mut columns = 0;
+    for span in spans {
+        for ch in span.content.as_ref().chars() {
+            if !matches!(ch, ' ' | '\t') {
+                return columns;
+            }
+            columns += indent_char_width(ch);
+        }
+    }
+    columns
+}
+
+fn elide_leading_indent_from_text(text: &str, mut columns: usize) -> (usize, String) {
+    for (idx, ch) in text.char_indices() {
+        if columns == 0 {
+            return (0, expand_leading_tabs(&text[idx..]));
+        }
+        if !matches!(ch, ' ' | '\t') {
+            return (columns, text[idx..].to_string());
+        }
+
+        let width = indent_char_width(ch);
+        if columns >= width {
+            columns -= width;
+            continue;
+        }
+
+        let next = idx + ch.len_utf8();
+        let mut rest = " ".repeat(width - columns);
+        rest.push_str(&expand_leading_tabs(&text[next..]));
+        return (0, rest);
+    }
+    (columns, String::new())
+}
+
+fn expand_leading_tabs(text: &str) -> String {
+    let mut out = String::new();
+    for (idx, ch) in text.char_indices() {
+        match ch {
+            ' ' => out.push(' '),
+            '\t' => out.push_str(&" ".repeat(TAB_WIDTH)),
+            _ => {
+                out.push_str(&text[idx..]);
+                return out;
+            }
+        }
+    }
+    out
+}
+
 /// Render a single plain-text (non-syntax-highlighted) diff line, wrapped to
 /// `width` columns, using a pre-computed [`DiffRenderStyleContext`].
 ///
@@ -780,6 +930,7 @@ pub(crate) fn push_wrapped_diff_line_with_style_context(
         style_context.theme,
         style_context.color_level,
         style_context.diff_backgrounds,
+        /*leading_indent_elision*/ None,
     )
 }
 
@@ -809,6 +960,7 @@ pub(crate) fn push_wrapped_diff_line_with_syntax_and_style_context(
         style_context.theme,
         style_context.color_level,
         style_context.diff_backgrounds,
+        /*leading_indent_elision*/ None,
     )
 }
 
@@ -823,6 +975,7 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
     theme: DiffTheme,
     color_level: DiffColorLevel,
     diff_backgrounds: ResolvedDiffBackgrounds,
+    leading_indent_elision: Option<usize>,
 ) -> Vec<RtLine<'static>> {
     let ln_str = line_number.to_string();
 
@@ -846,7 +999,7 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
     };
 
     let line_bg = style_line_bg_for(kind, diff_backgrounds);
-    let gutter_style = style_gutter_for(kind, theme, color_level);
+    let gutter_style = style_gutter_for(kind, theme, color_level, diff_backgrounds);
 
     // When we have syntax spans, compose them with the diff style for a richer
     // view. The sign character keeps the diff color; content gets syntax colors
@@ -854,17 +1007,19 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
     if let Some(syn_spans) = syntax_spans {
         let gutter = format!("{ln_str:>gutter_width$} ");
         let sign = format!("{sign_char}");
-        let styled: Vec<RtSpan<'static>> = syn_spans
-            .iter()
-            .map(|sp| {
+        let styled: Vec<RtSpan<'static>> = apply_leading_indent_elision_to_spans(
+            syn_spans.iter().map(|sp| {
                 let style = if matches!(kind, DiffLineType::Delete) {
                     sp.style.add_modifier(Modifier::DIM)
                 } else {
                     sp.style
                 };
+                let style = style_with_line_bg(style, line_bg);
                 RtSpan::styled(sp.content.clone().into_owned(), style)
-            })
-            .collect();
+            }),
+            leading_indent_elision,
+            content_style,
+        );
 
         // Determine how many display columns remain for content after the
         // gutter and sign character.
@@ -879,7 +1034,10 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
             if i == 0 {
                 // First line: gutter + sign + content
                 row_spans.push(RtSpan::styled(gutter.clone(), gutter_style));
-                row_spans.push(RtSpan::styled(sign.clone(), sign_style));
+                row_spans.push(RtSpan::styled(
+                    sign.clone(),
+                    style_with_line_bg(sign_style, line_bg),
+                ));
             } else {
                 // Continuation: empty gutter + two-space indent (matches
                 // the plain-text wrapping continuation style).
@@ -887,13 +1045,18 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
                 row_spans.push(RtSpan::styled(cont_gutter, gutter_style));
             }
             row_spans.extend(chunk);
-            lines.push(RtLine::from(row_spans).style(line_bg));
+            push_diff_row(&mut lines, row_spans, line_bg, width);
         }
         return lines;
     }
 
     let available_content_cols = width.saturating_sub(prefix_cols + 1).max(1);
-    let styled = vec![RtSpan::styled(text.to_string(), content_style)];
+    let content_style = style_with_line_bg(content_style, line_bg);
+    let styled = apply_leading_indent_elision_to_spans(
+        [RtSpan::styled(text.to_string(), content_style)],
+        leading_indent_elision,
+        content_style,
+    );
     let wrapped_chunks = wrap_styled_spans(&styled, available_content_cols);
 
     let mut lines: Vec<RtLine<'static>> = Vec::new();
@@ -903,16 +1066,57 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
             let gutter = format!("{ln_str:>gutter_width$} ");
             let sign = format!("{sign_char}");
             row_spans.push(RtSpan::styled(gutter, gutter_style));
-            row_spans.push(RtSpan::styled(sign, sign_style));
+            row_spans.push(RtSpan::styled(
+                sign,
+                style_with_line_bg(sign_style, line_bg),
+            ));
         } else {
             let cont_gutter = format!("{:gutter_width$}  ", "");
             row_spans.push(RtSpan::styled(cont_gutter, gutter_style));
         }
         row_spans.extend(chunk);
-        lines.push(RtLine::from(row_spans).style(line_bg));
+        push_diff_row(&mut lines, row_spans, line_bg, width);
     }
 
     lines
+}
+
+fn push_diff_row(
+    lines: &mut Vec<RtLine<'static>>,
+    mut row_spans: Vec<RtSpan<'static>>,
+    line_bg: Style,
+    width: usize,
+) {
+    let changed_line = line_bg.bg.is_some();
+    if changed_line {
+        let row_width = spans_display_width(&row_spans);
+        let padding_cols = width.saturating_sub(row_width);
+        if padding_cols > 0 {
+            row_spans.push(RtSpan::styled(" ".repeat(padding_cols), line_bg));
+        }
+    }
+
+    let mut line = RtLine::from(row_spans);
+    if changed_line {
+        line.style = line_bg;
+    }
+    lines.push(line);
+}
+
+fn spans_display_width(spans: &[RtSpan<'static>]) -> usize {
+    spans
+        .iter()
+        .flat_map(|span| span.content.chars())
+        .map(char_display_width)
+        .sum()
+}
+
+fn char_display_width(ch: char) -> usize {
+    ch.width().unwrap_or(if ch == '\t' { TAB_WIDTH } else { 0 })
+}
+
+fn style_with_line_bg(style: Style, line_bg: Style) -> Style {
+    line_bg.patch(style)
 }
 
 /// Split styled spans into chunks that fit within `max_cols` display columns.
@@ -1101,18 +1305,16 @@ fn diff_color_level_for_terminal(
 //   │ (line #) │ +/-  │  (plain or syntax-highlighted text)      │
 //   └──────────┴──────┴──────────────────────────────────────────┘
 //
-// A fourth, full-width layer — `line_bg` — is applied via `RtLine::style()`
-// so that the background tint extends from the leftmost column to the right
-// edge of the terminal, including any padding beyond the content.
+// A fourth layer — `line_bg` — is set on changed rows and merged into their
+// spans plus explicit trailing padding.  The diff block is bounded by the
+// caller-provided width, so surrounding layout can keep left and right margins
+// symmetric.
 //
-// On dark terminals, the sign and content share one style (colored fg + tinted
-// bg), and the gutter is simply dimmed.  On light terminals, sign and content
-// are split: the sign gets only a colored foreground (no bg, so the line bg
-// shows through), while content relies on the line bg alone; the gutter gets
-// an opaque, more-saturated background so line numbers stay readable against
-// the pastel line tint.
+// Changed gutters follow the add/delete color family.  Light terminals still
+// use a stronger number-column background for readability; context gutters stay
+// dimmed so unchanged rows do not compete with the actual diff.
 
-/// Full-width background applied to the `RtLine` itself (not individual spans).
+/// Background fill used by changed row spans and explicit trailing padding.
 /// Context lines intentionally leave the background unset so the terminal
 /// default shows through.
 fn style_line_bg_for(kind: DiffLineType, diff_backgrounds: ResolvedDiffBackgrounds) -> Style {
@@ -1149,14 +1351,6 @@ fn del_line_bg(theme: DiffTheme, color_level: RichDiffColorLevel) -> Color {
     }
 }
 
-fn light_gutter_fg(color_level: DiffColorLevel) -> Color {
-    match color_level {
-        DiffColorLevel::TrueColor => rgb_color(LIGHT_TC_GUTTER_FG_RGB),
-        DiffColorLevel::Ansi256 => indexed_color(LIGHT_256_GUTTER_FG_IDX),
-        DiffColorLevel::Ansi16 => Color::Black,
-    }
-}
-
 fn light_add_num_bg(color_level: RichDiffColorLevel) -> Color {
     match color_level {
         RichDiffColorLevel::TrueColor => rgb_color(LIGHT_TC_ADD_NUM_BG_RGB),
@@ -1171,29 +1365,53 @@ fn light_del_num_bg(color_level: RichDiffColorLevel) -> Color {
     }
 }
 
-/// Line-number gutter style.  On light backgrounds the gutter has an opaque
-/// tinted background so numbers contrast against the pastel line fill.  On
-/// dark backgrounds a simple `DIM` modifier is sufficient.
-fn style_gutter_for(kind: DiffLineType, theme: DiffTheme, color_level: DiffColorLevel) -> Style {
+/// Line-number gutter style.  Changed lines use add/delete foregrounds; light
+/// backgrounds get an opaque number-column tint for contrast. Context lines
+/// stay dimmed.
+fn style_gutter_for(
+    kind: DiffLineType,
+    theme: DiffTheme,
+    color_level: DiffColorLevel,
+    diff_backgrounds: ResolvedDiffBackgrounds,
+) -> Style {
+    match kind {
+        DiffLineType::Insert => style_changed_gutter(
+            Color::Green,
+            theme,
+            color_level,
+            diff_backgrounds.add,
+            light_add_num_bg,
+        ),
+        DiffLineType::Delete => style_changed_gutter(
+            Color::Red,
+            theme,
+            color_level,
+            diff_backgrounds.del,
+            light_del_num_bg,
+        ),
+        DiffLineType::Context => style_gutter_dim(),
+    }
+}
+
+fn style_changed_gutter(
+    fg: Color,
+    theme: DiffTheme,
+    color_level: DiffColorLevel,
+    line_bg: Option<Color>,
+    light_num_bg: fn(RichDiffColorLevel) -> Color,
+) -> Style {
+    let style = Style::default().fg(fg);
     match (
         theme,
-        kind,
         RichDiffColorLevel::from_diff_color_level(color_level),
     ) {
-        (DiffTheme::Light, DiffLineType::Insert, None) => {
-            Style::default().fg(light_gutter_fg(color_level))
-        }
-        (DiffTheme::Light, DiffLineType::Delete, None) => {
-            Style::default().fg(light_gutter_fg(color_level))
-        }
-        (DiffTheme::Light, DiffLineType::Insert, Some(level)) => Style::default()
-            .fg(light_gutter_fg(color_level))
-            .bg(light_add_num_bg(level)),
-        (DiffTheme::Light, DiffLineType::Delete, Some(level)) => Style::default()
-            .fg(light_gutter_fg(color_level))
-            .bg(light_del_num_bg(level)),
-        _ => style_gutter_dim(),
+        (DiffTheme::Light, Some(level)) => style.bg(light_num_bg(level)),
+        _ => line_bg.map_or(style, |bg| style.bg(bg)),
     }
+}
+
+fn style_gutter_dim() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
 }
 
 /// Sign character (`+`) for insert lines.  On dark terminals it inherits the
@@ -1277,10 +1495,6 @@ fn style_del(
     }
 }
 
-fn style_gutter_dim() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1360,6 +1574,86 @@ mod tests {
             .iter()
             .map(|span| display_width(span.content.as_ref()))
             .sum()
+    }
+
+    #[test]
+    fn changed_diff_rows_keep_symmetric_outer_padding() {
+        let width = 40;
+        let diff_width = width - (DIFF_BLOCK_SIDE_PADDING * 2);
+        let lines = push_wrapped_diff_line_inner_with_theme_and_color_level(
+            /*line_number*/ 1,
+            DiffLineType::Insert,
+            "new",
+            diff_width,
+            line_number_width(/*max_line_number*/ 1),
+            /*syntax_spans*/ None,
+            DiffTheme::Dark,
+            DiffColorLevel::TrueColor,
+            fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::TrueColor),
+            /*leading_indent_elision*/ None,
+        );
+        let lines = prefix_diff_lines(lines, DIFF_BLOCK_SIDE_PADDING);
+        let changed_line = lines.first().expect("changed line");
+        let text = changed_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.starts_with("    1 +"));
+        assert_eq!(line_display_width(changed_line), width);
+        assert_eq!(
+            changed_line.style.bg,
+            Some(rgb_color(DARK_TC_ADD_LINE_BG_RGB))
+        );
+        assert_eq!(changed_line.spans[0].style.bg, Some(Color::Reset));
+        assert_eq!(changed_line.spans[1].style.fg, Some(Color::Green));
+        assert_eq!(
+            changed_line.spans.last().unwrap().style.bg,
+            Some(Color::Reset)
+        );
+    }
+
+    #[test]
+    fn blank_changed_diff_rows_keep_colored_fill() {
+        let width = 40;
+        let diff_width = width - (DIFF_BLOCK_SIDE_PADDING * 2);
+        let lines = push_wrapped_diff_line_inner_with_theme_and_color_level(
+            /*line_number*/ 12,
+            DiffLineType::Insert,
+            "",
+            diff_width,
+            line_number_width(/*max_line_number*/ 12),
+            /*syntax_spans*/ None,
+            DiffTheme::Dark,
+            DiffColorLevel::Ansi16,
+            fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::Ansi16),
+            /*leading_indent_elision*/ None,
+        );
+        let lines = prefix_diff_lines(lines, DIFF_BLOCK_SIDE_PADDING);
+        let changed_line = lines.first().expect("blank changed line");
+        let text = changed_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.starts_with("    12 +"));
+        assert_eq!(line_display_width(changed_line), width);
+        assert_eq!(changed_line.style.bg, Some(Color::Green));
+        assert_eq!(changed_line.spans[0].style.bg, Some(Color::Reset));
+        assert_eq!(
+            changed_line.spans.last().unwrap().style.bg,
+            Some(Color::Reset)
+        );
+        let colored_width: usize = changed_line
+            .spans
+            .iter()
+            .skip(1)
+            .filter(|span| span.style.bg == Some(Color::Green))
+            .map(|span| display_width(span.content.as_ref()))
+            .sum();
+        assert_eq!(colored_width, diff_width);
     }
 
     fn snapshot_lines_text(name: &str, lines: &[RtLine<'static>]) {
@@ -1686,6 +1980,44 @@ mod tests {
     }
 
     #[test]
+    fn ui_snapshot_apply_update_elides_shared_leading_spaces_text() {
+        let original = "        get()\n            old_patch()\n";
+        let modified = "        get()\n            patch()\n";
+        let patch = diffy::create_patch(original, modified).to_string();
+
+        let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
+        changes.insert(
+            PathBuf::from("deep_indent.txt"),
+            FileChange::Update {
+                unified_diff: patch,
+                move_path: None,
+            },
+        );
+
+        let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
+        snapshot_lines_text("apply_update_elides_shared_leading_spaces_text", &lines);
+    }
+
+    #[test]
+    fn ui_snapshot_apply_update_elides_shared_leading_tabs_text() {
+        let original = "\t\tget()\n\t\t\told_patch()\n";
+        let modified = "\t\tget()\n\t\t\tpatch()\n";
+        let patch = diffy::create_patch(original, modified).to_string();
+
+        let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
+        changes.insert(
+            PathBuf::from("tab_indent.txt"),
+            FileChange::Update {
+                unified_diff: patch,
+                move_path: None,
+            },
+        );
+
+        let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
+        snapshot_lines_text("apply_update_elides_shared_leading_tabs_text", &lines);
+    }
+
+    #[test]
     fn ui_snapshot_apply_update_block_relativizes_path() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let abs_old = cwd.join("abs_old.rs");
@@ -1789,7 +2121,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_snapshot_ansi16_insert_delete_no_background() {
+    fn ui_snapshot_ansi16_insert_delete_uses_block_fill() {
         let mut lines = push_wrapped_diff_line_inner_with_theme_and_color_level(
             /*line_number*/ 1,
             DiffLineType::Insert,
@@ -1800,6 +2132,7 @@ mod tests {
             DiffTheme::Dark,
             DiffColorLevel::Ansi16,
             fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::Ansi16),
+            /*leading_indent_elision*/ None,
         );
         lines.extend(push_wrapped_diff_line_inner_with_theme_and_color_level(
             /*line_number*/ 2,
@@ -1811,10 +2144,11 @@ mod tests {
             DiffTheme::Dark,
             DiffColorLevel::Ansi16,
             fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::Ansi16),
+            /*leading_indent_elision*/ None,
         ));
 
         snapshot_lines(
-            "ansi16_insert_delete_no_background",
+            "ansi16_insert_delete_uses_block_fill",
             lines,
             /*width*/ 40,
             /*height*/ 4,
@@ -1837,21 +2171,28 @@ mod tests {
             ),
             Style::default().bg(rgb_color(DARK_TC_DEL_LINE_BG_RGB))
         );
+        let backgrounds = fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::TrueColor);
         assert_eq!(
             style_gutter_for(
                 DiffLineType::Insert,
                 DiffTheme::Dark,
-                DiffColorLevel::TrueColor
+                DiffColorLevel::TrueColor,
+                backgrounds
             ),
-            style_gutter_dim()
+            Style::default()
+                .fg(Color::Green)
+                .bg(rgb_color(DARK_TC_ADD_LINE_BG_RGB))
         );
         assert_eq!(
             style_gutter_for(
                 DiffLineType::Delete,
                 DiffTheme::Dark,
-                DiffColorLevel::TrueColor
+                DiffColorLevel::TrueColor,
+                backgrounds
             ),
-            style_gutter_dim()
+            Style::default()
+                .fg(Color::Red)
+                .bg(rgb_color(DARK_TC_DEL_LINE_BG_RGB))
         );
     }
 
@@ -1903,7 +2244,6 @@ mod tests {
             Style::default().bg(rgb_color((4, 5, 6)))
         );
     }
-
     #[test]
     fn theme_scope_backgrounds_quantize_to_ansi256() {
         let backgrounds = resolve_diff_backgrounds_for(
@@ -1943,36 +2283,39 @@ mod tests {
     }
 
     #[test]
-    fn ansi16_disables_line_and_gutter_backgrounds() {
+    fn ansi16_uses_line_and_gutter_fill() {
         assert_eq!(
             style_line_bg_for(
                 DiffLineType::Insert,
                 fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::Ansi16)
             ),
-            Style::default()
+            Style::default().bg(Color::Green)
         );
         assert_eq!(
             style_line_bg_for(
                 DiffLineType::Delete,
                 fallback_diff_backgrounds(DiffTheme::Light, DiffColorLevel::Ansi16)
             ),
-            Style::default()
+            Style::default().bg(Color::Red)
         );
+        let backgrounds = fallback_diff_backgrounds(DiffTheme::Light, DiffColorLevel::Ansi16);
         assert_eq!(
             style_gutter_for(
                 DiffLineType::Insert,
                 DiffTheme::Light,
-                DiffColorLevel::Ansi16
+                DiffColorLevel::Ansi16,
+                backgrounds
             ),
-            Style::default().fg(Color::Black)
+            Style::default().fg(Color::Green).bg(Color::Green)
         );
         assert_eq!(
             style_gutter_for(
                 DiffLineType::Delete,
                 DiffTheme::Light,
-                DiffColorLevel::Ansi16
+                DiffColorLevel::Ansi16,
+                backgrounds
             ),
-            Style::default().fg(Color::Black)
+            Style::default().fg(Color::Red).bg(Color::Red)
         );
         let themed_backgrounds = resolve_diff_backgrounds_for(
             DiffTheme::Light,
@@ -1984,11 +2327,11 @@ mod tests {
         );
         assert_eq!(
             style_line_bg_for(DiffLineType::Insert, themed_backgrounds),
-            Style::default()
+            Style::default().bg(Color::Green)
         );
         assert_eq!(
             style_line_bg_for(DiffLineType::Delete, themed_backgrounds),
-            Style::default()
+            Style::default().bg(Color::Red)
         );
     }
 
@@ -2008,24 +2351,27 @@ mod tests {
             ),
             Style::default().bg(rgb_color(LIGHT_TC_DEL_LINE_BG_RGB))
         );
+        let backgrounds = fallback_diff_backgrounds(DiffTheme::Light, DiffColorLevel::TrueColor);
         assert_eq!(
             style_gutter_for(
                 DiffLineType::Insert,
                 DiffTheme::Light,
-                DiffColorLevel::TrueColor
+                DiffColorLevel::TrueColor,
+                backgrounds
             ),
             Style::default()
-                .fg(rgb_color(LIGHT_TC_GUTTER_FG_RGB))
+                .fg(Color::Green)
                 .bg(rgb_color(LIGHT_TC_ADD_NUM_BG_RGB))
         );
         assert_eq!(
             style_gutter_for(
                 DiffLineType::Delete,
                 DiffTheme::Light,
-                DiffColorLevel::TrueColor
+                DiffColorLevel::TrueColor,
+                backgrounds
             ),
             Style::default()
-                .fg(rgb_color(LIGHT_TC_GUTTER_FG_RGB))
+                .fg(Color::Red)
                 .bg(rgb_color(LIGHT_TC_DEL_NUM_BG_RGB))
         );
     }
@@ -2042,6 +2388,7 @@ mod tests {
             DiffTheme::Light,
             DiffColorLevel::TrueColor,
             fallback_diff_backgrounds(DiffTheme::Light, DiffColorLevel::TrueColor),
+            /*leading_indent_elision*/ None,
         );
 
         assert!(
@@ -2051,17 +2398,18 @@ mod tests {
         assert_eq!(
             lines[0].spans[0].style,
             Style::default()
-                .fg(rgb_color(LIGHT_TC_GUTTER_FG_RGB))
+                .fg(Color::Green)
                 .bg(rgb_color(LIGHT_TC_ADD_NUM_BG_RGB))
         );
         assert_eq!(
             lines[1].spans[0].style,
             Style::default()
-                .fg(rgb_color(LIGHT_TC_GUTTER_FG_RGB))
+                .fg(Color::Green)
                 .bg(rgb_color(LIGHT_TC_ADD_NUM_BG_RGB))
         );
-        assert_eq!(lines[0].style.bg, Some(rgb_color(LIGHT_TC_ADD_LINE_BG_RGB)));
-        assert_eq!(lines[1].style.bg, Some(rgb_color(LIGHT_TC_ADD_LINE_BG_RGB)));
+        let line_bg = Some(rgb_color(LIGHT_TC_ADD_LINE_BG_RGB));
+        assert_eq!(lines[0].style.bg, line_bg);
+        assert_eq!(lines[1].style.bg, line_bg);
     }
 
     #[test]
@@ -2487,6 +2835,8 @@ mod tests {
             .map(|span| span.style)
             .expect("expected rendered diff span containing 'world'");
 
-        assert_eq!(actual_style, expected_style);
+        assert_eq!(actual_style.fg, expected_style.fg);
+        assert_eq!(actual_style.add_modifier, expected_style.add_modifier);
+        assert_eq!(actual_style.sub_modifier, expected_style.sub_modifier);
     }
 }

@@ -302,9 +302,10 @@ fn edit_operation_schema() -> JsonSchema {
                         json!("replace_range"),
                         json!("delete_range"),
                         json!("delete_text"),
+                        json!("replace_occurrences"),
                     ],
                     Some(
-                        "Operation to apply in order. replace/delete_text use old_text; insert_* use anchor and text; *_range use one-based inclusive start_line and end_line in the current text for that operation."
+                        "Operation to apply. replace/delete_text use old_text; insert_* use anchor and text; *_range use one-based inclusive start_line and end_line. In apply_mode=\"sequential\" operations resolve against the current text after earlier ops; in apply_mode=\"snapshot\" every operation resolves against the original file."
                             .to_string(),
                     ),
                 ),
@@ -331,6 +332,13 @@ fn edit_operation_schema() -> JsonSchema {
                     "One-based occurrence to edit. Omit only when old_text or anchor occurs exactly once."
                         .to_string(),
                 )),
+            ),
+            (
+                "occurrences".to_string(),
+                JsonSchema::array(
+                    JsonSchema::number(None),
+                    Some("One-based occurrences to edit for replace_occurrences.".to_string()),
+                ),
             ),
             (
                 "start_line".to_string(),
@@ -361,7 +369,17 @@ fn text_replacement_properties() -> BTreeMap<String, JsonSchema> {
             JsonSchema::array(
                 edit_operation_schema(),
                 Some(
-                    "Atomic edit operations to apply in order. Use this for inserts, deletions, ranges, or multiple edits."
+                    "Atomic edit operations to apply. Use this to batch all planned inserts, deletions, ranges, or multiple edits for the file."
+                        .to_string(),
+                ),
+            ),
+        ),
+        (
+            "apply_mode".to_string(),
+            JsonSchema::string_enum(
+                vec![json!("sequential"), json!("snapshot")],
+                Some(
+                    "How ops are applied. sequential preserves legacy behavior. Prefer snapshot for new batched ops; it resolves all op locations against the original file, rejects overlapping ranges, then applies changes from back to front."
                         .to_string(),
                 ),
             ),
@@ -392,7 +410,7 @@ pub fn create_edit_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "edit".to_string(),
         description:
-            "Edits a single local file. Prefer ops for atomic inserts, deletes, ranges, or multiple edits; legacy old_text/new_text remains supported."
+            "Edits a single local file. Prefer ops for atomic inserts, deletes, ranges, or multiple edits; legacy old_text/new_text remains supported. After observing a file, batch all planned edits for that file into one edit call when possible, because a successful edit changes the file hash and later edits require fresh observation."
                 .to_string(),
         strict: false,
         defer_loading: None,

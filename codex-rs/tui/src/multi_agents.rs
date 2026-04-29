@@ -4,6 +4,8 @@
 //! entries, and the fast-switch keyboard shortcuts. Higher-level coordination, such as deciding
 //! which thread becomes active or when a thread closes, stays in [`crate::app::App`].
 
+use crate::exec_cell::spinner;
+use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
 use crate::render::line_utils::prefix_lines;
 use crate::text_formatting::truncate_text;
@@ -13,7 +15,9 @@ use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
 use codex_protocol::protocol::CollabAgentRef;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
+use codex_protocol::protocol::CollabAgentSpawnUpdateEvent;
 use codex_protocol::protocol::CollabAgentStatusEntry;
+use codex_protocol::protocol::CollabAgentToolCallMode;
 use codex_protocol::protocol::CollabCloseEndEvent;
 use codex_protocol::protocol::CollabResumeBeginEvent;
 use codex_protocol::protocol::CollabResumeEndEvent;
@@ -30,6 +34,7 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::time::Instant;
 
 const COLLAB_PROMPT_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_ERROR_PREVIEW_GRAPHEMES: usize = 160;
@@ -56,6 +61,38 @@ struct AgentLabel<'a> {
 pub(crate) struct SpawnRequestSummary {
     pub(crate) model: String,
     pub(crate) reasoning_effort: ReasoningEffortConfig,
+}
+
+#[derive(Debug)]
+pub(crate) struct BlockingSpawnCell {
+    call_id: String,
+    title_spans: Vec<Span<'static>>,
+    details: Vec<Line<'static>>,
+    start_time: Instant,
+    animations_enabled: bool,
+}
+
+impl BlockingSpawnCell {
+    pub(crate) fn call_id(&self) -> &str {
+        &self.call_id
+    }
+}
+
+impl HistoryCell for BlockingSpawnCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        collab_event_lines(
+            title_spans_line_with_bullet(
+                spinner(Some(self.start_time), self.animations_enabled),
+                self.title_spans.clone(),
+            ),
+            self.details.clone(),
+        )
+    }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        self.animations_enabled
+            .then(|| self.start_time.elapsed().as_millis() as u64 / 600)
+    }
 }
 
 pub(crate) fn agent_picker_status_dot_spans(is_closed: bool) -> Vec<Span<'static>> {
@@ -183,27 +220,63 @@ pub(crate) fn spawn_end(
         new_agent_role,
         prompt,
         status: _,
+        mode,
+        tool_summary,
         ..
     } = ev;
 
     let title = match new_thread_id {
-        Some(thread_id) => title_with_agent(
-            "Spawned",
+        Some(thread_id) => spawn_title(
             AgentLabel {
                 thread_id: Some(thread_id),
                 nickname: new_agent_nickname.as_deref(),
                 role: new_agent_role.as_deref(),
             },
             spawn_request,
+            mode,
         ),
         None => title_text("Agent spawn failed"),
     };
 
-    let mut details = Vec::new();
-    if let Some(line) = prompt_line(&prompt) {
-        details.push(line);
+    collab_event(title, spawn_details(&prompt, tool_summary.as_ref()))
+}
+
+pub(crate) fn blocking_spawn_update(
+    ev: CollabAgentSpawnUpdateEvent,
+    animations_enabled: bool,
+) -> BlockingSpawnCell {
+    let CollabAgentSpawnUpdateEvent {
+        call_id,
+        sender_thread_id: _,
+        new_thread_id,
+        new_agent_nickname,
+        new_agent_role,
+        prompt,
+        model,
+        reasoning_effort,
+        status: _,
+        tool_summary,
+    } = ev;
+    let spawn_request = SpawnRequestSummary {
+        model,
+        reasoning_effort,
+    };
+    BlockingSpawnCell {
+        call_id,
+        title_spans: spawn_title_spans(
+            "Starting Subagent ",
+            AgentLabel {
+                thread_id: Some(new_thread_id),
+                nickname: new_agent_nickname.as_deref(),
+                role: new_agent_role.as_deref(),
+            },
+            Some(&spawn_request),
+            CollabAgentToolCallMode::Blocking,
+        ),
+        details: spawn_details(&prompt, tool_summary.as_ref()),
+        start_time: Instant::now(),
+        animations_enabled,
     }
-    collab_event(title, details)
 }
 
 pub(crate) fn interaction_end(ev: CollabAgentInteractionEndEvent) -> PlainHistoryCell {
@@ -348,11 +421,118 @@ pub(crate) fn resume_end(ev: CollabResumeEndEvent) -> PlainHistoryCell {
 }
 
 fn collab_event(title: Line<'static>, details: Vec<Line<'static>>) -> PlainHistoryCell {
+    PlainHistoryCell::new(collab_event_lines(title, details))
+}
+
+fn collab_event_lines(title: Line<'static>, details: Vec<Line<'static>>) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = vec![title];
     if !details.is_empty() {
         lines.extend(prefix_lines(details, "  └ ".dim(), "    ".into()));
     }
-    PlainHistoryCell::new(lines)
+    lines
+}
+
+fn spawn_details(
+    prompt: &str,
+    tool_summary: Option<&codex_protocol::protocol::CollabAgentToolSummary>,
+) -> Vec<Line<'static>> {
+    if let Some(tool_summary) = tool_summary
+        && !tool_summary.tools.is_empty()
+    {
+        return vec![Line::from(tool_summary_line(tool_summary))];
+    }
+
+    prompt_line(prompt).into_iter().collect()
+}
+
+fn tool_summary_line(tool_summary: &codex_protocol::protocol::CollabAgentToolSummary) -> String {
+    let counts =
+        tool_summary
+            .tools
+            .iter()
+            .fold(ToolSummaryCounts::default(), |mut counts, tool| {
+                counts.add(tool.name.as_str(), tool.count);
+                counts
+            });
+    counts.into_parts().join(", ")
+}
+
+#[derive(Default)]
+struct ToolSummaryCounts {
+    read_files: u32,
+    search_patterns: u32,
+    listed_dirs: u32,
+    execute_commands: u32,
+    write_files: u32,
+    edit_files: u32,
+    delete_paths: u32,
+    web_searches: u32,
+    image_generations: u32,
+    other_tools: u32,
+}
+
+impl ToolSummaryCounts {
+    fn add(&mut self, name: &str, count: u32) {
+        match name {
+            "read_file" => self.read_files += count,
+            "search_file" | "grep_file" | "glob_file" => self.search_patterns += count,
+            "list_dir" => self.listed_dirs += count,
+            "execute" | "shell" => self.execute_commands += count,
+            "write" => self.write_files += count,
+            "edit" => self.edit_files += count,
+            "delete" => self.delete_paths += count,
+            "web_search" => self.web_searches += count,
+            "image_generation" => self.image_generations += count,
+            _ => self.other_tools += count,
+        }
+    }
+
+    fn into_parts(self) -> Vec<String> {
+        let mut parts = Vec::new();
+        push_count_part(
+            &mut parts,
+            "Search",
+            self.search_patterns,
+            "pattern",
+            "patterns",
+        );
+        push_count_part(&mut parts, "Read", self.read_files, "file", "files");
+        push_count_part(&mut parts, "List", self.listed_dirs, "dir", "dirs");
+        push_count_part(
+            &mut parts,
+            "Execute",
+            self.execute_commands,
+            "command",
+            "commands",
+        );
+        push_count_part(&mut parts, "Edit", self.edit_files, "file", "files");
+        push_count_part(&mut parts, "Write", self.write_files, "file", "files");
+        push_count_part(&mut parts, "Delete", self.delete_paths, "path", "paths");
+        push_count_part(
+            &mut parts,
+            "Web Search",
+            self.web_searches,
+            "query",
+            "queries",
+        );
+        push_count_part(
+            &mut parts,
+            "Image Generation",
+            self.image_generations,
+            "image",
+            "images",
+        );
+        push_count_part(&mut parts, "Use", self.other_tools, "tool", "tools");
+        parts
+    }
+}
+
+fn push_count_part(parts: &mut Vec<String>, verb: &str, count: u32, singular: &str, plural: &str) {
+    if count == 0 {
+        return;
+    }
+    let noun = if count == 1 { singular } else { plural };
+    parts.push(format!("{verb} {count} {noun}"));
 }
 
 fn title_text(title: impl Into<String>) -> Line<'static> {
@@ -370,9 +550,47 @@ fn title_with_agent(
     title_spans_line(spans)
 }
 
-fn title_spans_line(mut spans: Vec<Span<'static>>) -> Line<'static> {
-    let mut title = Vec::with_capacity(spans.len() + 1);
-    title.push(Span::from("• ").dim());
+fn spawn_title(
+    agent: AgentLabel<'_>,
+    spawn_request: Option<&SpawnRequestSummary>,
+    mode: CollabAgentToolCallMode,
+) -> Line<'static> {
+    let bullet = match mode {
+        CollabAgentToolCallMode::Blocking => "•".green(),
+        CollabAgentToolCallMode::Background => "•".dim(),
+    };
+    title_spans_line_with_bullet(
+        bullet,
+        spawn_title_spans("Started Subagent ", agent, spawn_request, mode),
+    )
+}
+
+fn spawn_title_spans(
+    prefix: &'static str,
+    agent: AgentLabel<'_>,
+    spawn_request: Option<&SpawnRequestSummary>,
+    mode: CollabAgentToolCallMode,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![prefix.bold()];
+    spans.extend(agent_label_spans(agent));
+    spans.extend(spawn_request_spans(spawn_request));
+    if matches!(mode, CollabAgentToolCallMode::Background) {
+        spans.push(" in background".dim());
+    }
+    spans
+}
+
+fn title_spans_line(spans: Vec<Span<'static>>) -> Line<'static> {
+    title_spans_line_with_bullet("•".dim(), spans)
+}
+
+fn title_spans_line_with_bullet(
+    bullet: Span<'static>,
+    mut spans: Vec<Span<'static>>,
+) -> Line<'static> {
+    let mut title = Vec::with_capacity(spans.len() + 2);
+    title.push(bullet);
+    title.push(" ".into());
     title.append(&mut spans);
     title.into()
 }
@@ -612,6 +830,8 @@ mod tests {
                 model: "gpt-5".to_string(),
                 reasoning_effort: ReasoningEffortConfig::High,
                 status: AgentStatus::PendingInit,
+                mode: CollabAgentToolCallMode::Background,
+                tool_summary: None,
             },
             Some(&SpawnRequestSummary {
                 model: "gpt-5".to_string(),
@@ -677,10 +897,151 @@ mod tests {
 
         let snapshot = [spawn, send, waiting, finished, close]
             .iter()
-            .map(cell_to_text)
+            .map(|cell| cell_to_text(cell))
             .collect::<Vec<_>>()
             .join("\n\n");
         assert_snapshot!("collab_agent_transcript", snapshot);
+    }
+
+    #[test]
+    fn blocking_spawn_summary_lists_only_used_tools() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
+            .expect("valid robie thread id");
+
+        let cell = spawn_end(
+            CollabAgentSpawnEndEvent {
+                call_id: "call-spawn".to_string(),
+                sender_thread_id,
+                new_thread_id: Some(robie_id),
+                new_agent_nickname: Some("Robie".to_string()),
+                new_agent_role: Some("worker".to_string()),
+                prompt: "Inspect only the target file.".to_string(),
+                model: "gpt-5".to_string(),
+                reasoning_effort: ReasoningEffortConfig::Medium,
+                status: AgentStatus::Completed(Some("done".to_string())),
+                mode: CollabAgentToolCallMode::Blocking,
+                tool_summary: Some(codex_protocol::protocol::CollabAgentToolSummary {
+                    tools: vec![codex_protocol::protocol::CollabAgentToolSummaryEntry {
+                        name: "read_file".to_string(),
+                        count: 1,
+                    }],
+                    output: vec!["Read codex-rs/tui/src/multi_agents.rs".to_string()],
+                }),
+            },
+            Some(&SpawnRequestSummary {
+                model: "gpt-5".to_string(),
+                reasoning_effort: ReasoningEffortConfig::Medium,
+            }),
+        );
+
+        assert_snapshot!(
+            "blocking_spawn_summary_lists_only_used_tools",
+            cell_to_text(&cell)
+        );
+    }
+
+    #[test]
+    fn blocking_spawn_update_renders_live_tool_progress() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
+            .expect("valid robie thread id");
+
+        let cell = blocking_spawn_update(
+            CollabAgentSpawnUpdateEvent {
+                call_id: "call-spawn".to_string(),
+                sender_thread_id,
+                new_thread_id: robie_id,
+                new_agent_nickname: Some("Robie".to_string()),
+                new_agent_role: Some("explorer".to_string()),
+                prompt: "Explore the codebase.".to_string(),
+                model: "gpt-5.5".to_string(),
+                reasoning_effort: ReasoningEffortConfig::High,
+                status: AgentStatus::Running,
+                tool_summary: Some(codex_protocol::protocol::CollabAgentToolSummary {
+                    tools: vec![
+                        codex_protocol::protocol::CollabAgentToolSummaryEntry {
+                            name: "grep_file".to_string(),
+                            count: 1,
+                        },
+                        codex_protocol::protocol::CollabAgentToolSummaryEntry {
+                            name: "read_file".to_string(),
+                            count: 1,
+                        },
+                    ],
+                    output: vec![
+                        "Search CollabAgentSpawn".to_string(),
+                        "Read codex-rs/tui/src/chatwidget.rs".to_string(),
+                    ],
+                }),
+            },
+            /*animations_enabled*/ false,
+        );
+
+        assert_snapshot!(
+            "blocking_spawn_update_renders_live_tool_progress",
+            cell_to_text(&cell)
+        );
+    }
+
+    #[test]
+    fn blocking_spawn_update_animates_when_enabled() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
+            .expect("valid robie thread id");
+
+        let cell = blocking_spawn_update(
+            CollabAgentSpawnUpdateEvent {
+                call_id: "call-spawn".to_string(),
+                sender_thread_id,
+                new_thread_id: robie_id,
+                new_agent_nickname: Some("Robie".to_string()),
+                new_agent_role: Some("explorer".to_string()),
+                prompt: "Explore the codebase.".to_string(),
+                model: "gpt-5.5".to_string(),
+                reasoning_effort: ReasoningEffortConfig::High,
+                status: AgentStatus::Running,
+                tool_summary: None,
+            },
+            /*animations_enabled*/ true,
+        );
+
+        assert!(cell.transcript_animation_tick().is_some());
+    }
+
+    #[test]
+    fn blocking_spawn_end_uses_green_status_dot() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
+            .expect("valid robie thread id");
+        let cell = spawn_end(
+            CollabAgentSpawnEndEvent {
+                call_id: "call-spawn".to_string(),
+                sender_thread_id,
+                new_thread_id: Some(robie_id),
+                new_agent_nickname: Some("Robie".to_string()),
+                new_agent_role: Some("worker".to_string()),
+                prompt: String::new(),
+                model: "gpt-5".to_string(),
+                reasoning_effort: ReasoningEffortConfig::Medium,
+                status: AgentStatus::Completed(Some("done".to_string())),
+                mode: CollabAgentToolCallMode::Blocking,
+                tool_summary: None,
+            },
+            Some(&SpawnRequestSummary {
+                model: "gpt-5".to_string(),
+                reasoning_effort: ReasoningEffortConfig::Medium,
+            }),
+        );
+
+        let lines = cell.display_lines(/*width*/ 200);
+        let title = &lines[0];
+        assert_eq!(title.spans[0].content.as_ref(), "•");
+        assert_eq!(title.spans[0].style.fg, Some(Color::Green));
     }
 
     #[cfg(target_os = "macos")]
@@ -750,6 +1111,8 @@ mod tests {
                 model: "gpt-5".to_string(),
                 reasoning_effort: ReasoningEffortConfig::High,
                 status: AgentStatus::PendingInit,
+                mode: CollabAgentToolCallMode::Background,
+                tool_summary: None,
             },
             Some(&SpawnRequestSummary {
                 model: "gpt-5".to_string(),
@@ -759,14 +1122,14 @@ mod tests {
 
         let lines = cell.display_lines(/*width*/ 200);
         let title = &lines[0];
-        assert_eq!(title.spans[2].content.as_ref(), "Robie");
-        assert_eq!(title.spans[2].style.fg, Some(Color::Cyan));
-        assert!(title.spans[2].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(title.spans[4].content.as_ref(), "[explorer]");
-        assert_eq!(title.spans[4].style.fg, None);
-        assert!(!title.spans[4].style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(title.spans[6].content.as_ref(), "(gpt-5 high)");
-        assert_eq!(title.spans[6].style.fg, Some(Color::Magenta));
+        assert_eq!(title.spans[3].content.as_ref(), "Robie");
+        assert_eq!(title.spans[3].style.fg, Some(Color::Cyan));
+        assert!(title.spans[3].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(title.spans[5].content.as_ref(), "[explorer]");
+        assert_eq!(title.spans[5].style.fg, None);
+        assert!(!title.spans[5].style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(title.spans[7].content.as_ref(), "(gpt-5 high)");
+        assert_eq!(title.spans[7].style.fg, Some(Color::Magenta));
     }
 
     #[test]
@@ -788,7 +1151,7 @@ mod tests {
         assert_snapshot!("collab_resume_interrupted", cell_to_text(&cell));
     }
 
-    fn cell_to_text(cell: &PlainHistoryCell) -> String {
+    fn cell_to_text(cell: &dyn HistoryCell) -> String {
         cell.display_lines(/*width*/ 200)
             .iter()
             .map(line_to_text)

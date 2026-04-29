@@ -56,6 +56,7 @@ impl ToolHandler for Handler {
                     prompt: prompt.clone(),
                     model: args.model.clone().unwrap_or_default(),
                     reasoning_effort: args.reasoning_effort.unwrap_or_default(),
+                    mode: collab_tool_call_mode(mode),
                 }
                 .into(),
             )
@@ -117,13 +118,6 @@ impl ToolHandler for Handler {
             ),
             Err(_) => (None, None, AgentStatus::NotFound),
         };
-        if matches!(mode, AgentToolMode::Blocking)
-            && let Some(thread_id) = new_thread_id
-        {
-            status =
-                wait_for_agent_final_status(session.clone(), thread_id, DEFAULT_WAIT_TIMEOUT_MS)
-                    .await;
-        }
         let agent_snapshot = match new_thread_id {
             Some(thread_id) => {
                 session
@@ -156,6 +150,33 @@ impl ToolHandler for Handler {
             .as_ref()
             .and_then(|snapshot| snapshot.reasoning_effort)
             .unwrap_or(args.reasoning_effort.unwrap_or_default());
+        if matches!(mode, AgentToolMode::Blocking)
+            && let Some(thread_id) = new_thread_id
+        {
+            status = wait_for_blocking_spawn_final_status(
+                session.clone(),
+                turn.clone(),
+                BlockingSpawnProgress {
+                    call_id: call_id.clone(),
+                    thread_id,
+                    nickname: new_agent_nickname.clone(),
+                    role: new_agent_role.clone(),
+                    prompt: prompt.clone(),
+                    model: effective_model.clone(),
+                    reasoning_effort: effective_reasoning_effort,
+                },
+                DEFAULT_BLOCKING_AGENT_TIMEOUT_MS,
+            )
+            .await;
+        }
+        let tool_summary = if matches!(mode, AgentToolMode::Blocking) {
+            match new_thread_id {
+                Some(thread_id) => collab_agent_tool_summary(session.clone(), thread_id).await,
+                None => None,
+            }
+        } else {
+            None
+        };
         let nickname = new_agent_nickname.clone();
         session
             .send_event(
@@ -170,6 +191,8 @@ impl ToolHandler for Handler {
                     model: effective_model,
                     reasoning_effort: effective_reasoning_effort,
                     status: status.clone(),
+                    mode: collab_tool_call_mode(mode),
+                    tool_summary: tool_summary.clone(),
                 }
                 .into(),
             )
@@ -186,6 +209,7 @@ impl ToolHandler for Handler {
             agent_id: new_thread_id.to_string(),
             nickname,
             status: matches!(mode, AgentToolMode::Blocking).then_some(status),
+            tool_summary,
         })
     }
 }
@@ -209,6 +233,8 @@ pub(crate) struct SpawnAgentResult {
     nickname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<AgentStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_summary: Option<codex_protocol::protocol::CollabAgentToolSummary>,
 }
 
 impl ToolOutput for SpawnAgentResult {

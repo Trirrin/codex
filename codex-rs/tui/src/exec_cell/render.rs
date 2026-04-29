@@ -3,6 +3,8 @@ use std::time::Instant;
 use super::model::CommandOutput;
 use super::model::ExecCall;
 use super::model::ExecCell;
+use super::model::ExecCellDisplayOptions;
+use super::model::ExploredToolsDisplay;
 use crate::exec_command::strip_bash_lc_and_escape;
 use crate::history_cell::HistoryCell;
 use crate::render::highlight::highlight_bash_to_lines;
@@ -47,7 +49,7 @@ pub(crate) fn new_active_exec_command(
     source: ExecCommandSource,
     run_mode: Option<ExecCommandRunMode>,
     interaction_input: Option<String>,
-    animations_enabled: bool,
+    display_options: ExecCellDisplayOptions,
 ) -> ExecCell {
     ExecCell::new(
         ExecCall {
@@ -55,14 +57,16 @@ pub(crate) fn new_active_exec_command(
             command,
             parsed,
             output: None,
+            auto_review_approved: false,
             source,
             run_mode,
             start_time: Some(Instant::now()),
             duration: None,
             interaction_input,
         },
-        animations_enabled,
+        display_options.animations_enabled,
     )
+    .with_explored_tools_display(display_options.explored_tools_display)
 }
 
 fn format_unified_exec_interaction(command: &[String], input: Option<&str>) -> String {
@@ -267,6 +271,178 @@ impl HistoryCell for ExecCell {
         }
         lines
     }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        if !self.animations_enabled() {
+            return None;
+        }
+        let elapsed = self.active_start_time()?.elapsed();
+        Some(elapsed.as_millis() as u64 / 600)
+    }
+}
+
+fn first_command_token(cmd: &str) -> Option<String> {
+    shlex::split(cmd)
+        .and_then(|tokens| tokens.into_iter().next())
+        .or_else(|| cmd.split_whitespace().next().map(str::to_string))
+}
+
+fn read_line_range_display(cmd: &str) -> Option<String> {
+    let tokens = shlex::split(cmd)?;
+    let (start, end) = match first_command_token(cmd).as_deref() {
+        Some("read_file") => read_file_range(&tokens)?,
+        Some("sed") => sed_range(&tokens)?,
+        Some("head") => head_range(&tokens)?,
+        Some("tail") => tail_range(&tokens)?,
+        _ => return None,
+    };
+    Some(format_line_range(start, end))
+}
+
+fn read_file_range(tokens: &[String]) -> Option<(usize, Option<usize>)> {
+    let mut start_line: Option<usize> = None;
+    let mut end_line: Option<usize> = None;
+    let mut offset: Option<usize> = None;
+    let mut limit: Option<usize> = None;
+    for token in tokens.iter().skip(1) {
+        if let Some(value) = token.strip_prefix("--start-line=") {
+            start_line = value.parse().ok();
+        } else if let Some(value) = token.strip_prefix("--end-line=") {
+            end_line = value.parse().ok();
+        } else if let Some(value) = token.strip_prefix("--offset=") {
+            offset = value.parse::<usize>().ok();
+        } else if let Some(value) = token.strip_prefix("--limit=") {
+            limit = value.parse().ok();
+        }
+    }
+    let start = start_line.or_else(|| offset.map(|offset| offset + 1))?;
+    let end = end_line.or_else(|| limit.map(|limit| start + limit.saturating_sub(1)));
+    Some((start, end))
+}
+
+fn sed_range(tokens: &[String]) -> Option<(usize, Option<usize>)> {
+    for token in tokens.iter().skip(1) {
+        if let Some(range) = parse_sed_range(token) {
+            return Some(range);
+        }
+    }
+    None
+}
+
+fn parse_sed_range(token: &str) -> Option<(usize, Option<usize>)> {
+    let core = token.strip_suffix('p')?;
+    let mut parts = core.split(',');
+    let start = parts.next()?.parse().ok()?;
+    let end = parts.next().map(str::parse).transpose().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((start, end))
+}
+
+fn head_range(tokens: &[String]) -> Option<(usize, Option<usize>)> {
+    let limit = numeric_option(tokens, "-n")?;
+    Some((1, Some(limit)))
+}
+
+fn tail_range(tokens: &[String]) -> Option<(usize, Option<usize>)> {
+    let value = numeric_option_text(tokens, "-n")?;
+    let start = value.strip_prefix('+')?.parse().ok()?;
+    Some((start, None))
+}
+
+fn numeric_option(tokens: &[String], option: &str) -> Option<usize> {
+    numeric_option_text(tokens, option)?.parse().ok()
+}
+
+fn numeric_option_text<'a>(tokens: &'a [String], option: &str) -> Option<&'a str> {
+    for (index, token) in tokens.iter().enumerate() {
+        if token == option {
+            return tokens.get(index + 1).map(String::as_str);
+        }
+        if let Some(value) = token.strip_prefix(option)
+            && !value.is_empty()
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn format_line_range(start: usize, end: Option<usize>) -> String {
+    match end {
+        Some(end) if end == start => format!("line {start}"),
+        Some(end) => format!("lines {start}-{end}"),
+        None => format!("lines {start}+"),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExploredToolKind {
+    Read,
+    List,
+    Grep,
+    Glob,
+    Search,
+}
+
+struct ExploredToolCount {
+    kind: ExploredToolKind,
+    count: usize,
+}
+
+impl ExploredToolKind {
+    fn from_parsed(parsed: &ParsedCommand) -> Option<Self> {
+        match parsed {
+            ParsedCommand::Read { .. } => Some(Self::Read),
+            ParsedCommand::ListFiles { .. } => Some(Self::List),
+            ParsedCommand::Search { cmd, .. } => match first_command_token(cmd).as_deref() {
+                Some("grep_file") => Some(Self::Grep),
+                Some("glob_file") => Some(Self::Glob),
+                Some("search_file") => Some(Self::Search),
+                _ => Some(Self::Search),
+            },
+            ParsedCommand::Unknown { .. } => None,
+        }
+    }
+
+    fn title(self) -> Span<'static> {
+        match self {
+            Self::Read => "Read".cyan().bold(),
+            Self::List => "List".green().bold(),
+            Self::Grep => "Grep".magenta().bold(),
+            Self::Glob => "Glob".red().bold(),
+            Self::Search => "Search".bold(),
+        }
+    }
+
+    fn noun(self, count: usize) -> &'static str {
+        match (self, count) {
+            (Self::Read | Self::Search, 1) => "file",
+            (Self::Read | Self::Search, _) => "files",
+            (Self::List, 1) => "path",
+            (Self::List, _) => "paths",
+            (Self::Grep, 1) => "search",
+            (Self::Grep, _) => "searches",
+            (Self::Glob, 1) => "pattern",
+            (Self::Glob, _) => "patterns",
+        }
+    }
+}
+
+fn explored_tool_counts(calls: &[ExecCall]) -> Vec<ExploredToolCount> {
+    let mut counts = Vec::<ExploredToolCount>::new();
+    for parsed in calls.iter().flat_map(|call| call.parsed.iter()) {
+        let Some(kind) = ExploredToolKind::from_parsed(parsed) else {
+            continue;
+        };
+        if let Some(existing) = counts.iter_mut().find(|entry| entry.kind == kind) {
+            existing.count += 1;
+        } else {
+            counts.push(ExploredToolCount { kind, count: 1 });
+        }
+    }
+    counts
 }
 
 impl ExecCell {
@@ -278,7 +454,65 @@ impl ExecCell {
         Line::from(vec![Self::output_ellipsis_text(omitted).dim()])
     }
 
+    fn read_display_text(name: &str, cmd: &str) -> String {
+        let Some(range) = read_line_range_display(cmd) else {
+            return name.to_string();
+        };
+        format!("{name} ({range})")
+    }
+
+    fn read_display_spans(name: &str, cmd: &str) -> Vec<Span<'static>> {
+        let mut spans = vec![name.to_string().into()];
+        if let Some(range) = read_line_range_display(cmd) {
+            spans.push(" ".into());
+            spans.push(format!("({range})").dim());
+        }
+        spans
+    }
+
+    fn search_title(cmd: &str) -> &'static str {
+        match first_command_token(cmd).as_deref() {
+            Some("grep_file") => "Grep",
+            Some("glob_file") => "Glob",
+            Some("search_file") => "Search",
+            _ => "Search",
+        }
+    }
+
     fn exploring_display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        match self.explored_tools_display() {
+            ExploredToolsDisplay::Compact => self.compact_exploring_display_lines(),
+            ExploredToolsDisplay::Detailed => self.detailed_exploring_display_lines(width),
+        }
+    }
+
+    fn compact_exploring_display_lines(&self) -> Vec<Line<'static>> {
+        let counts = explored_tool_counts(&self.calls);
+        if counts.is_empty() {
+            return self.detailed_exploring_display_lines(/*width*/ 80);
+        }
+
+        let mut line = vec![
+            if self.is_active() {
+                spinner(self.active_start_time(), self.animations_enabled())
+            } else {
+                "•".dim()
+            },
+            " ".into(),
+        ];
+        for (index, entry) in counts.iter().enumerate() {
+            if index > 0 {
+                line.push(", ".dim());
+            }
+            line.push(entry.kind.title());
+            line.push(format!(" {}", entry.count).into());
+            line.push(format!(" {}", entry.kind.noun(entry.count)).dim());
+        }
+
+        vec![Line::from(line)]
+    }
+
+    fn detailed_exploring_display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         out.push(Line::from(vec![
             if self.is_active() {
@@ -327,7 +561,7 @@ impl ExecCell {
                     .parsed
                     .iter()
                     .map(|parsed| match parsed {
-                        ParsedCommand::Read { name, .. } => name.clone(),
+                        ParsedCommand::Read { name, cmd, .. } => Self::read_display_text(name, cmd),
                         _ => unreachable!(),
                     })
                     .unique();
@@ -339,8 +573,8 @@ impl ExecCell {
                 let mut lines = Vec::new();
                 for parsed in &call.parsed {
                     match parsed {
-                        ParsedCommand::Read { name, .. } => {
-                            lines.push(("Read", vec![name.clone().into()]));
+                        ParsedCommand::Read { name, cmd, .. } => {
+                            lines.push(("Read", Self::read_display_spans(name, cmd)));
                         }
                         ParsedCommand::ListFiles { cmd, path } => {
                             lines.push(("List", vec![path.clone().unwrap_or(cmd.clone()).into()]));
@@ -353,7 +587,7 @@ impl ExecCell {
                                 (Some(q), None) => vec![q.clone().into()],
                                 _ => vec![cmd.clone().into()],
                             };
-                            lines.push(("Search", spans));
+                            lines.push((Self::search_title(cmd), spans));
                         }
                         ParsedCommand::Unknown { cmd } => {
                             lines.push(("Run", vec![cmd.clone().into()]));
@@ -390,11 +624,7 @@ impl ExecCell {
         let is_running = self.is_active() || call.is_background_unified_exec_startup();
         let success = call.output.as_ref().map(|o| o.exit_code == 0);
         let bullet = if is_running {
-            if self.animations_enabled() {
-                "•".slow_blink()
-            } else {
-                "•".dim()
-            }
+            spinner(call.start_time, self.animations_enabled())
         } else {
             match success {
                 Some(true) => "•".green().bold(),
@@ -473,6 +703,13 @@ impl ExecCell {
                 Span::from(layout.command_continuation.initial_prefix).dim(),
                 Span::from(layout.command_continuation.subsequent_prefix).dim(),
             ));
+        }
+
+        if call.auto_review_approved {
+            lines.push(Line::from(vec![
+                "  └ ".dim(),
+                "Approved by Auto reviewer.".green(),
+            ]));
         }
 
         if let Some(output) = call.output.as_ref()
@@ -775,7 +1012,109 @@ mod tests {
     }
 
     #[test]
-    fn running_command_with_live_output_uses_blinking_bullet_not_success_bullet() {
+    fn compact_explored_summary_counts_tools_with_styles() {
+        let cell = ExecCell::new(
+            ExecCall {
+                call_id: "call-id".to_string(),
+                command: vec!["bash".into(), "-lc".into(), "explore".into()],
+                parsed: vec![
+                    ParsedCommand::Read {
+                        name: "main.rs".into(),
+                        cmd: "read_file main.rs".into(),
+                        path: "main.rs".into(),
+                    },
+                    ParsedCommand::Search {
+                        cmd: "grep_file".into(),
+                        query: Some("fn main".into()),
+                        path: None,
+                    },
+                    ParsedCommand::Search {
+                        cmd: "glob_file".into(),
+                        query: Some("**/*.rs".into()),
+                        path: None,
+                    },
+                    ParsedCommand::Search {
+                        cmd: "search_file".into(),
+                        query: Some("main".into()),
+                        path: None,
+                    },
+                    ParsedCommand::ListFiles {
+                        cmd: "ls".into(),
+                        path: Some("src".into()),
+                    },
+                ],
+                output: Some(CommandOutput::default()),
+                auto_review_approved: false,
+                source: ExecCommandSource::Agent,
+                run_mode: None,
+                start_time: None,
+                duration: Some(std::time::Duration::from_millis(1)),
+                interaction_input: None,
+            },
+            /*animations_enabled*/ false,
+        );
+
+        let lines = cell.display_lines(/*width*/ 80);
+        assert_eq!(
+            render_line_text(&lines[0]),
+            "• Read 1 file, Grep 1 search, Glob 1 pattern, Search 1 file, List 1 path"
+        );
+        let title_colors: Vec<Option<Color>> = lines[0]
+            .spans
+            .iter()
+            .filter_map(|span| match span.content.as_ref() {
+                "Read" | "Grep" | "Glob" | "Search" | "List" => Some(span.style.fg),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            title_colors,
+            vec![
+                Some(Color::Cyan),
+                Some(Color::Magenta),
+                Some(Color::Red),
+                None,
+                Some(Color::Green),
+            ]
+        );
+    }
+
+    #[test]
+    fn detailed_explored_display_remains_available() {
+        let cell = ExecCell::new(
+            ExecCall {
+                call_id: "call-id".to_string(),
+                command: vec!["bash".into(), "-lc".into(), "cat foo.txt".into()],
+                parsed: vec![ParsedCommand::Read {
+                    name: "foo.txt".into(),
+                    cmd: "cat foo.txt".into(),
+                    path: "foo.txt".into(),
+                }],
+                output: Some(CommandOutput::default()),
+                auto_review_approved: false,
+                source: ExecCommandSource::Agent,
+                run_mode: None,
+                start_time: None,
+                duration: Some(std::time::Duration::from_millis(1)),
+                interaction_input: None,
+            },
+            /*animations_enabled*/ false,
+        )
+        .with_explored_tools_display(ExploredToolsDisplay::Detailed);
+
+        let rendered = cell
+            .display_lines(/*width*/ 80)
+            .iter()
+            .map(render_line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("• Explored"));
+        assert!(rendered.contains("Read foo.txt"));
+    }
+
+    #[test]
+    fn running_command_with_live_output_uses_frame_driven_bullet_not_success_bullet() {
         let call = ExecCall {
             call_id: "call-id".to_string(),
             command: vec!["bash".into(), "-lc".into(), "printf done".into()],
@@ -785,6 +1124,7 @@ mod tests {
                 aggregated_output: "partial output\n".to_string(),
                 formatted_output: String::new(),
             }),
+            auto_review_approved: false,
             source: ExecCommandSource::UnifiedExecStartup,
             run_mode: Some(ExecCommandRunMode::Blocking),
             start_time: Some(Instant::now()),
@@ -799,10 +1139,41 @@ mod tests {
         assert_eq!(bullet.content.as_ref(), "•");
         assert_ne!(bullet.style.fg, Some(Color::Green));
         assert!(
-            bullet.style.add_modifier.contains(Modifier::SLOW_BLINK),
-            "running command bullet should blink until an exit code completes the command"
+            !bullet.style.add_modifier.contains(Modifier::SLOW_BLINK),
+            "running command bullet should use the frame-driven spinner, not terminal blink"
         );
         assert_eq!(render_line_text(&lines[0]), "• Running printf done");
+    }
+
+    #[test]
+    fn active_exec_cell_reports_transcript_animation_tick() {
+        let call = ExecCall {
+            call_id: "call-id".to_string(),
+            command: vec!["bash".into(), "-lc".into(), "printf done".into()],
+            parsed: Vec::new(),
+            output: None,
+            auto_review_approved: false,
+            source: ExecCommandSource::UnifiedExecStartup,
+            run_mode: Some(ExecCommandRunMode::Blocking),
+            start_time: Some(Instant::now()),
+            duration: None,
+            interaction_input: None,
+        };
+
+        let active = ExecCell::new(call.clone(), /*animations_enabled*/ true);
+        assert_eq!(active.transcript_animation_tick(), Some(0));
+
+        let animations_disabled = ExecCell::new(call.clone(), /*animations_enabled*/ false);
+        assert_eq!(animations_disabled.transcript_animation_tick(), None);
+
+        let completed = ExecCell::new(
+            ExecCall {
+                start_time: None,
+                ..call
+            },
+            /*animations_enabled*/ true,
+        );
+        assert_eq!(completed.transcript_animation_tick(), None);
     }
 
     #[test]
@@ -865,6 +1236,7 @@ mod tests {
             command: vec!["bash".into(), "-lc".into(), "echo long".into()],
             parsed: Vec::new(),
             output: Some(output),
+            auto_review_approved: false,
             source: ExecCommandSource::UserShell,
             run_mode: None,
             start_time: None,
@@ -1015,6 +1387,7 @@ mod tests {
             command: vec!["bash".into(), "-lc".into(), format!("echo {url}")],
             parsed: Vec::new(),
             output: None,
+            auto_review_approved: false,
             source: ExecCommandSource::UserShell,
             run_mode: None,
             start_time: None,
@@ -1053,6 +1426,7 @@ mod tests {
                 path: None,
             }],
             output: None,
+            auto_review_approved: false,
             source: ExecCommandSource::Agent,
             run_mode: None,
             start_time: None,
@@ -1060,7 +1434,8 @@ mod tests {
             interaction_input: None,
         };
 
-        let cell = ExecCell::new(call, /*animations_enabled*/ false);
+        let cell = ExecCell::new(call, /*animations_enabled*/ false)
+            .with_explored_tools_display(ExploredToolsDisplay::Detailed);
         let rendered: Vec<String> = cell
             .display_lines(/*width*/ 36)
             .iter()
@@ -1095,6 +1470,7 @@ mod tests {
                 formatted_output: String::new(),
                 aggregated_output: url.to_string(),
             }),
+            auto_review_approved: false,
             source: ExecCommandSource::UserShell,
             run_mode: None,
             start_time: None,
@@ -1133,6 +1509,7 @@ mod tests {
                 formatted_output: url.to_string(),
                 aggregated_output: url.to_string(),
             }),
+            auto_review_approved: false,
             source: ExecCommandSource::Agent,
             run_mode: None,
             start_time: None,

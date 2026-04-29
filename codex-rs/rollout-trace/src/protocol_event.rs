@@ -285,6 +285,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::PlanDelta(_)
         | EventMsg::ReasoningContentDelta(_)
         | EventMsg::ReasoningRawContentDelta(_)
+        | EventMsg::CollabAgentSpawnUpdate(_)
         | EventMsg::CollabResumeBegin(_)
         | EventMsg::CollabResumeEnd(_) => None,
     }
@@ -367,6 +368,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::ReasoningContentDelta(_)
         | EventMsg::ReasoningRawContentDelta(_)
         | EventMsg::CollabAgentSpawnBegin(_)
+        | EventMsg::CollabAgentSpawnUpdate(_)
         | EventMsg::CollabAgentSpawnEnd(_)
         | EventMsg::CollabAgentInteractionBegin(_)
         | EventMsg::CollabAgentInteractionEnd(_)

@@ -187,12 +187,14 @@ fn openai_manager_for_tests_with_auth(
     endpoint_client: Arc<dyn ModelsEndpointClient>,
     auth_manager: Option<Arc<AuthManager>>,
 ) -> OpenAiModelsManager {
-    OpenAiModelsManager::new(
+    let mut manager = OpenAiModelsManager::new(
         codex_home,
         endpoint_client,
         auth_manager,
         CollaborationModesConfig::default(),
-    )
+    );
+    manager.remote_model_downloads_enabled = true;
+    manager
 }
 
 fn static_manager_for_tests(model_catalog: ModelsResponse) -> StaticModelsManager {
@@ -354,6 +356,58 @@ async fn refresh_available_models_sorts_by_priority() {
         "higher priority should be listed before lower priority"
     );
     assert_eq!(endpoint.fetch_count(), 1, "expected a single model fetch");
+}
+
+#[tokio::test]
+async fn refresh_available_models_uses_bundled_models_by_default() {
+    let dynamic_slug = "dynamic-model-only-for-test-default-bundled";
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::new(vec![vec![remote_model(
+        dynamic_slug,
+        "Default Bundled",
+        /*priority*/ 1,
+    )]]);
+    let manager = OpenAiModelsManager::new(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
+        CollaborationModesConfig::default(),
+    );
+
+    manager
+        .refresh_available_models(RefreshStrategy::Online)
+        .await
+        .expect("refresh should use bundled catalog by default");
+
+    assert!(
+        !manager
+            .get_remote_models()
+            .await
+            .iter()
+            .any(|candidate| candidate.slug == dynamic_slug),
+        "remote downloads should be disabled by default"
+    );
+    assert_eq!(
+        endpoint.fetch_count(),
+        0,
+        "default model catalog should not fetch remote models"
+    );
+}
+
+#[test]
+fn remote_model_download_env_parsing() {
+    assert!(remote_model_downloads_enabled(Some("1")));
+    assert!(remote_model_downloads_enabled(Some("true")));
+    assert!(remote_model_downloads_enabled(Some("TRUE")));
+    assert!(remote_model_downloads_enabled(Some("yes")));
+    assert!(remote_model_downloads_enabled(Some("YES")));
+
+    assert!(!remote_model_downloads_enabled(None));
+    assert!(!remote_model_downloads_enabled(Some("")));
+    assert!(!remote_model_downloads_enabled(Some("0")));
+    assert!(!remote_model_downloads_enabled(Some("false")));
 }
 
 #[tokio::test]

@@ -78,11 +78,11 @@ pub fn create_execute_tool(options: CommandToolOptions) -> ToolSpec {
         name: "execute".to_string(),
         description: if cfg!(windows) {
             format!(
-                "Runs a command in a PTY. Defaults to mode=\"blocking\"; use mode=\"background\" to keep it running.\n\n{}",
+                "Runs a command in a PTY. Defaults to mode=\"blocking\"; use mode=\"background\" to keep it running. Plain rg/grep/cat file inspection must use the existing file tools instead.\n\n{}",
                 windows_shell_guidance()
             )
         } else {
-            "Runs a command in a PTY. Defaults to mode=\"blocking\"; use mode=\"background\" to keep it running."
+            "Runs a command in a PTY. Defaults to mode=\"blocking\"; use mode=\"background\" to keep it running. Plain rg/grep/cat file inspection must use the existing file tools instead."
                 .to_string()
         },
         strict: false,

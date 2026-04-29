@@ -1,0 +1,6 @@
+---
+source: tui/src/multi_agents.rs
+expression: cell_to_text(&cell)
+---
+• Started Subagent Robie [worker] (gpt-5 medium)
+  └ Read 1 file

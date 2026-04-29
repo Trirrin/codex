@@ -54,8 +54,8 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
 }
 
 /// Write a models_cache.json file to the codex home directory.
-/// This prevents ModelsManager from making network requests to refresh models.
-/// The cache will be treated as fresh (within TTL) and used instead of fetching from the network.
+/// When remote model downloads are enabled, the cache will be treated as fresh
+/// and used instead of fetching from the network.
 /// Uses bundled-catalog-derived presets, converted to ModelInfo format.
 pub fn write_models_cache(codex_home: &Path) -> std::io::Result<()> {
     // Get a stable bundled-catalog-derived preset list and filter for picker-visible entries.

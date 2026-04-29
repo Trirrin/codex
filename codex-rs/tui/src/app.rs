@@ -29,6 +29,7 @@ use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::ReplayKind;
 use crate::chatwidget::ThreadInputState;
+use crate::custom_terminal::Frame;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::split_command_string;
@@ -154,6 +155,7 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::backend::Backend;
+use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
@@ -1095,6 +1097,28 @@ impl App {
         })
     }
 
+    fn render_chat_frame(&self, frame: &mut Frame<'_>, picker_height: u16) {
+        let area = frame.area();
+        self.chat_widget.render(area, frame.buffer);
+
+        let picker_height = picker_height.min(area.height);
+        if picker_height > 0 {
+            self.render_backtrack_picker(
+                Rect {
+                    y: area.y + area.height - picker_height,
+                    height: picker_height,
+                    ..area
+                },
+                frame.buffer,
+            );
+            return;
+        }
+
+        if let Some((x, y)) = self.chat_widget.cursor_pos(area) {
+            frame.set_cursor_position((x, y));
+        }
+    }
+
     pub(crate) async fn handle_tui_event(
         &mut self,
         tui: &mut tui::Tui,
@@ -1140,21 +1164,16 @@ impl App {
                     }
                     // Allow widgets to process any pending timers before rendering.
                     self.chat_widget.pre_draw_tick();
-                    let desired_height =
-                        self.chat_widget.desired_height(tui.terminal.size()?.width);
+                    let width = tui.terminal.size()?.width;
+                    let picker_height = self.backtrack_picker_desired_height(width);
+                    let desired_height = self.chat_widget.desired_height(width).max(picker_height);
                     if terminal_resize_reflow_enabled {
                         tui.draw_with_resize_reflow(desired_height, |frame| {
-                            self.chat_widget.render(frame.area(), frame.buffer);
-                            if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
-                                frame.set_cursor_position((x, y));
-                            }
+                            self.render_chat_frame(frame, picker_height);
                         })?;
                     } else {
                         tui.draw(desired_height, |frame| {
-                            self.chat_widget.render(frame.area(), frame.buffer);
-                            if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
-                                frame.set_cursor_position((x, y));
-                            }
+                            self.render_chat_frame(frame, picker_height);
                         })?;
                     }
                     if self.chat_widget.external_editor_state() == ExternalEditorState::Requested {

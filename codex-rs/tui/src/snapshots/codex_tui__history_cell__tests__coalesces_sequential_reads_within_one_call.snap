@@ -2,7 +2,4 @@
 source: tui/src/history_cell.rs
 expression: rendered
 ---
-• Explored
-  └ Search shimmer_spans
-    Read shimmer.rs
-    Read status_indicator_widget.rs
+• Search 1 file, Read 2 files

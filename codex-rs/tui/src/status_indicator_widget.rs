@@ -19,6 +19,8 @@ use ratatui::widgets::WidgetRef;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app_event_sender::AppEventSender;
+use crate::exec_cell::spinner;
+use crate::frames::FRAME_TICK_DEFAULT;
 use crate::key_hint;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::render::renderable::Renderable;
@@ -212,15 +214,17 @@ impl StatusIndicatorWidget {
             Duration::from_secs(1).saturating_sub(Duration::from_nanos(u64::from(subsecond)))
         };
         let next_tick = now + delay;
-        if self
-            .next_elapsed_tick_at
-            .is_some_and(|scheduled| scheduled <= next_tick)
-        {
-            return;
-        }
-
         self.next_elapsed_tick_at = Some(next_tick);
+        // The frame scheduler coalesces delayed draws with earlier immediate draws.
+        // Re-arm this on every render tick so the elapsed counter never believes
+        // a swallowed future draw is still pending.
         self.frame_requester.schedule_frame_in(delay);
+    }
+
+    pub(crate) fn schedule_next_animation_tick(&self) {
+        if self.animations_enabled && !self.is_paused {
+            self.frame_requester.schedule_frame_in(FRAME_TICK_DEFAULT);
+        }
     }
 
     fn elapsed_duration_at(&self, now: Instant) -> Duration {
@@ -287,8 +291,11 @@ impl Renderable for StatusIndicatorWidget {
         let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());
 
         let mut spans = Vec::with_capacity(5);
-        if self.animations_enabled {
-            spans.push("•".slow_blink());
+        if self.is_paused {
+            spans.push("•".dim());
+        } else if self.animations_enabled {
+            let animation_start = now.checked_sub(elapsed_duration).unwrap_or(now);
+            spans.push(spinner(Some(animation_start), self.animations_enabled));
         } else {
             spans.push("•".dim());
         }

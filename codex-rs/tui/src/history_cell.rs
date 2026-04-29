@@ -363,7 +363,7 @@ impl HistoryCell for UserHistoryCell {
             return Vec::new();
         }
 
-        let mut lines: Vec<Line<'static>> = vec![Line::from("").style(style)];
+        let mut lines: Vec<Line<'static>> = Vec::new();
 
         if let Some(wrapped_remote_images) = wrapped_remote_images {
             lines.extend(prefix_lines(
@@ -383,8 +383,6 @@ impl HistoryCell for UserHistoryCell {
                 "  ".into(),
             ));
         }
-
-        lines.push(Line::from("").style(style));
         lines
     }
 }
@@ -1028,16 +1026,6 @@ pub fn new_guardian_denied_action_request(summary: String) -> Box<dyn HistoryCel
         Span::from(summary).dim(),
     ]);
     Box::new(PrefixedWrappedHistoryCell::new(line, "✗ ".red(), "  "))
-}
-
-pub fn new_guardian_approved_action_request(summary: String) -> Box<dyn HistoryCell> {
-    let line = Line::from(vec![
-        "Request ".into(),
-        "approved".bold(),
-        " for ".into(),
-        Span::from(summary).dim(),
-    ]);
-    Box::new(PrefixedWrappedHistoryCell::new(line, "✔ ".green(), "  "))
 }
 
 pub fn new_guardian_timed_out_patch_request(files: Vec<String>) -> Box<dyn HistoryCell> {
@@ -4288,6 +4276,7 @@ mod tests {
                     },
                 ],
                 output: None,
+                auto_review_approved: false,
                 source: ExecCommandSource::Agent,
                 run_mode: None,
                 start_time: Some(Instant::now()),
@@ -4321,6 +4310,7 @@ mod tests {
                     cmd: "rg shimmer_spans".into(),
                 }],
                 output: None,
+                auto_review_approved: false,
                 source: ExecCommandSource::Agent,
                 run_mode: None,
                 start_time: Some(Instant::now()),
@@ -4408,6 +4398,7 @@ mod tests {
                     },
                 ],
                 output: None,
+                auto_review_approved: false,
                 source: ExecCommandSource::Agent,
                 run_mode: None,
                 start_time: Some(Instant::now()),
@@ -4428,6 +4419,56 @@ mod tests {
     }
 
     #[test]
+    fn explored_display_includes_tool_parameters() {
+        let call_id = "c1".to_string();
+        let mut cell = ExecCell::new(
+            ExecCall {
+                call_id: call_id.clone(),
+                command: vec!["bash".into(), "-lc".into(), "echo".into()],
+                parsed: vec![
+                    ParsedCommand::Read {
+                        name: "main.py".into(),
+                        cmd: "read_file --start-line=85 --end-line=97".into(),
+                        path: "main.py".into(),
+                    },
+                    ParsedCommand::Read {
+                        name: "model.py".into(),
+                        cmd: "read_file --start-line=1 --limit=80".into(),
+                        path: "model.py".into(),
+                    },
+                    ParsedCommand::Search {
+                        cmd: "grep_file".into(),
+                        query: Some("class Model".into()),
+                        path: Some("src".into()),
+                    },
+                    ParsedCommand::Search {
+                        cmd: "glob_file".into(),
+                        query: Some("**/*.py".into()),
+                        path: Some("src".into()),
+                    },
+                ],
+                output: None,
+                auto_review_approved: false,
+                source: ExecCommandSource::Agent,
+                run_mode: None,
+                start_time: Some(Instant::now()),
+                duration: None,
+                interaction_input: None,
+            },
+            /*animations_enabled*/ true,
+        );
+        cell.complete_call(
+            &call_id,
+            CommandOutput::default(),
+            Duration::from_millis(1),
+            None,
+        );
+        let lines = cell.display_lines(/*width*/ 80);
+        let rendered = render_lines(&lines).join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
     fn multiline_command_wraps_with_extra_indent_on_subsequent_lines() {
         // Create a completed exec cell with a multiline command
         let cmd = "set -o pipefail\ncargo test -p codex-tui --quiet".to_string();
@@ -4438,6 +4479,7 @@ mod tests {
                 command: vec!["bash".into(), "-lc".into(), cmd],
                 parsed: Vec::new(),
                 output: None,
+                auto_review_approved: false,
                 source: ExecCommandSource::Agent,
                 run_mode: None,
                 start_time: Some(Instant::now()),
@@ -4470,6 +4512,7 @@ mod tests {
                 command: vec!["echo".into(), "ok".into()],
                 parsed: Vec::new(),
                 output: None,
+                auto_review_approved: false,
                 source: ExecCommandSource::Agent,
                 run_mode: None,
                 start_time: Some(Instant::now()),
@@ -4500,6 +4543,7 @@ mod tests {
                 command: vec!["bash".into(), "-lc".into(), long],
                 parsed: Vec::new(),
                 output: None,
+                auto_review_approved: false,
                 source: ExecCommandSource::Agent,
                 run_mode: None,
                 start_time: Some(Instant::now()),
@@ -4529,6 +4573,7 @@ mod tests {
                 command: vec!["bash".into(), "-lc".into(), cmd],
                 parsed: Vec::new(),
                 output: None,
+                auto_review_approved: false,
                 source: ExecCommandSource::Agent,
                 run_mode: None,
                 start_time: Some(Instant::now()),
@@ -4559,6 +4604,7 @@ mod tests {
                 command: vec!["bash".into(), "-lc".into(), cmd],
                 parsed: Vec::new(),
                 output: None,
+                auto_review_approved: false,
                 source: ExecCommandSource::Agent,
                 run_mode: None,
                 start_time: Some(Instant::now()),
@@ -4589,6 +4635,7 @@ mod tests {
                 command: vec!["bash".into(), "-lc".into(), "seq 1 10 1>&2 && false".into()],
                 parsed: Vec::new(),
                 output: None,
+                auto_review_approved: false,
                 source: ExecCommandSource::Agent,
                 run_mode: None,
                 start_time: Some(Instant::now()),
@@ -4641,6 +4688,7 @@ mod tests {
                 command: vec!["bash".into(), "-lc".into(), long_cmd.to_string()],
                 parsed: Vec::new(),
                 output: None,
+                auto_review_approved: false,
                 source: ExecCommandSource::Agent,
                 run_mode: None,
                 start_time: Some(Instant::now()),
@@ -4782,7 +4830,7 @@ mod tests {
             .rev()
             .take_while(|line| line.trim().is_empty())
             .count();
-        assert_eq!(trailing_blank_count, 1);
+        assert_eq!(trailing_blank_count, 0);
         assert!(rendered.iter().any(|line| line.contains("line one")));
     }
 
@@ -4805,7 +4853,7 @@ mod tests {
             .rev()
             .take_while(|line| line.trim().is_empty())
             .count();
-        assert_eq!(trailing_blank_count, 1);
+        assert_eq!(trailing_blank_count, 0);
         assert!(rendered.iter().any(|line| line.contains("tokenized")));
     }
 

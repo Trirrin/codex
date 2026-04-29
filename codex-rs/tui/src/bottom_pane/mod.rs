@@ -139,6 +139,7 @@ mod textarea;
 mod unified_exec_footer;
 pub(crate) use feedback_view::FeedbackNoteView;
 pub(crate) use selection_tabs::SelectionTab;
+pub(crate) use unified_exec_footer::BackgroundSubagentActivity;
 pub(crate) use unified_exec_footer::CommandActivity;
 
 /// How long the "press again to quit" hint stays visible.
@@ -228,7 +229,14 @@ pub(crate) struct BottomPane {
     context_window_used_tokens: Option<i64>,
     estimated_output_tokens: Option<usize>,
     background_footer_focused: bool,
-    background_activity_details_open: bool,
+    background_activity_view: Option<BackgroundActivityView>,
+    background_activity_selected: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundActivityView {
+    List,
+    Detail,
 }
 
 pub(crate) struct BottomPaneParams {
@@ -334,7 +342,8 @@ impl BottomPane {
             context_window_used_tokens: None,
             estimated_output_tokens: None,
             background_footer_focused: false,
-            background_activity_details_open: false,
+            background_activity_view: None,
+            background_activity_selected: 0,
         }
     }
 
@@ -610,23 +619,43 @@ impl BottomPane {
             self.request_redraw();
             InputResult::None
         } else {
-            if self.background_activity_details_open {
+            if let Some(view) = self.background_activity_view {
                 if self.unified_exec_footer.is_empty() {
-                    self.background_activity_details_open = false;
+                    self.close_background_activity_controls();
                     self.request_redraw();
                 } else if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                    match key_event.code {
-                        KeyCode::Esc | KeyCode::Enter => {
-                            self.background_activity_details_open = false;
+                    self.clamp_background_activity_selection();
+                    match (view, key_event.code) {
+                        (BackgroundActivityView::List, KeyCode::Esc) => {
+                            self.background_activity_view = None;
                             self.request_redraw();
                             return InputResult::None;
                         }
-                        KeyCode::Char('k') => {
+                        (BackgroundActivityView::Detail, KeyCode::Esc) => {
+                            self.background_activity_view = Some(BackgroundActivityView::List);
+                            self.request_redraw();
+                            return InputResult::None;
+                        }
+                        (BackgroundActivityView::List, KeyCode::Enter) => {
+                            self.background_activity_view = Some(BackgroundActivityView::Detail);
+                            self.request_redraw_in(Duration::from_secs(1));
+                            self.request_redraw();
+                            return InputResult::None;
+                        }
+                        (BackgroundActivityView::List, KeyCode::Down) => {
+                            self.move_background_activity_selection(1);
+                            self.request_redraw();
+                            return InputResult::None;
+                        }
+                        (BackgroundActivityView::List, KeyCode::Up) => {
+                            self.move_background_activity_selection(-1);
+                            self.request_redraw();
+                            return InputResult::None;
+                        }
+                        (_, KeyCode::Char('k')) => {
                             self.app_event_tx
                                 .send(AppEvent::CodexOp(Op::CleanBackgroundActivity));
-                            self.background_activity_details_open = false;
-                            self.background_footer_focused = false;
-                            self.unified_exec_footer.set_focused(false);
+                            self.close_background_activity_controls();
                             self.request_redraw();
                             return InputResult::None;
                         }
@@ -642,15 +671,14 @@ impl BottomPane {
             {
                 match key_event.code {
                     KeyCode::Esc | KeyCode::Up => {
-                        self.background_footer_focused = false;
-                        self.unified_exec_footer.set_focused(false);
+                        self.close_background_activity_controls();
                         self.request_redraw();
                         return InputResult::None;
                     }
                     KeyCode::Enter => {
-                        let lines = self.unified_exec_footer.detail_lines();
-                        if !lines.is_empty() {
-                            self.background_activity_details_open = true;
+                        if self.unified_exec_footer.activity_count() > 0 {
+                            self.background_activity_selected = 0;
+                            self.background_activity_view = Some(BackgroundActivityView::List);
                             self.request_redraw_in(Duration::from_secs(1));
                         }
                         self.background_footer_focused = false;
@@ -661,9 +689,7 @@ impl BottomPane {
                     KeyCode::Char('k') => {
                         self.app_event_tx
                             .send(AppEvent::CodexOp(Op::CleanBackgroundActivity));
-                        self.background_footer_focused = false;
-                        self.background_activity_details_open = false;
-                        self.unified_exec_footer.set_focused(false);
+                        self.close_background_activity_controls();
                         self.request_redraw();
                         return InputResult::None;
                     }
@@ -805,7 +831,10 @@ impl BottomPane {
         if let Some(status) = self.status.as_mut() {
             status.schedule_next_elapsed_tick_at(now);
         }
-        if self.background_activity_details_open {
+        if let Some(status) = self.status.as_ref() {
+            status.schedule_next_animation_tick();
+        }
+        if self.background_activity_view.is_some() {
             self.request_redraw();
             self.request_redraw_in(Duration::from_secs(1));
         }
@@ -1162,7 +1191,7 @@ impl BottomPane {
         }
     }
 
-    pub(crate) fn set_background_subagents(&mut self, subagents: Vec<String>) {
+    pub(crate) fn set_background_subagents(&mut self, subagents: Vec<BackgroundSubagentActivity>) {
         if self.unified_exec_footer.set_subagents(subagents) {
             self.clear_background_footer_focus_if_empty();
             self.sync_status_inline_message();
@@ -1172,10 +1201,36 @@ impl BottomPane {
 
     fn clear_background_footer_focus_if_empty(&mut self) {
         if self.unified_exec_footer.is_empty() {
-            self.background_footer_focused = false;
-            self.background_activity_details_open = false;
-            self.unified_exec_footer.set_focused(false);
+            self.close_background_activity_controls();
+        } else {
+            self.clamp_background_activity_selection();
         }
+    }
+
+    fn close_background_activity_controls(&mut self) {
+        self.background_footer_focused = false;
+        self.background_activity_view = None;
+        self.background_activity_selected = 0;
+        self.unified_exec_footer.set_focused(false);
+    }
+
+    fn clamp_background_activity_selection(&mut self) {
+        let count = self.unified_exec_footer.activity_count();
+        if count == 0 {
+            self.background_activity_selected = 0;
+        } else if self.background_activity_selected >= count {
+            self.background_activity_selected = count - 1;
+        }
+    }
+
+    fn move_background_activity_selection(&mut self, delta: isize) {
+        let count = self.unified_exec_footer.activity_count();
+        if count == 0 {
+            self.background_activity_selected = 0;
+            return;
+        }
+        let selected = self.background_activity_selected as isize + delta;
+        self.background_activity_selected = selected.clamp(0, count as isize - 1) as usize;
     }
 
     /// Keep the status row focused on turn state; background activity has its own row.
@@ -1237,7 +1292,7 @@ impl BottomPane {
 
     fn background_activity_controls_active(&self) -> bool {
         !self.unified_exec_footer.is_empty()
-            && (self.background_footer_focused || self.background_activity_details_open)
+            && (self.background_footer_focused || self.background_activity_view.is_some())
     }
 
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
@@ -1525,10 +1580,21 @@ impl BottomPane {
     fn as_renderable(&'_ self) -> RenderableItem<'_> {
         if let Some(view) = self.active_view() {
             RenderableItem::Borrowed(view)
-        } else if self.background_activity_details_open && !self.unified_exec_footer.is_empty() {
-            RenderableItem::Owned(Box::new(BackgroundActivityDetailsCard::new(
-                self.unified_exec_footer.detail_lines(),
-            )))
+        } else if let Some(view) = self.background_activity_view {
+            if self.unified_exec_footer.is_empty() {
+                RenderableItem::Owned(Box::new(BackgroundActivityDetailsCard::new(Vec::new())))
+            } else {
+                let selected = self
+                    .background_activity_selected
+                    .min(self.unified_exec_footer.activity_count().saturating_sub(1));
+                let lines = match view {
+                    BackgroundActivityView::List => self.unified_exec_footer.list_lines(selected),
+                    BackgroundActivityView::Detail => {
+                        self.unified_exec_footer.detail_lines(selected)
+                    }
+                };
+                RenderableItem::Owned(Box::new(BackgroundActivityDetailsCard::new(lines)))
+            }
         } else {
             let mut flex = FlexRenderable::new();
             if let Some(status) = &self.status {
@@ -2300,6 +2366,12 @@ mod tests {
         pane.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
+        let rendered_list = render_snapshot(&pane, Rect::new(0, 0, 80, 30));
+        assert!(rendered_list.contains("Commands"));
+        assert!(rendered_list.contains("> sleep 5 [1000](running) · Enter details · k kill"));
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
         let rendered_details = render_snapshot(&pane, Rect::new(0, 0, 80, 30));
         assert!(rendered_details.contains("────"));
         assert!(rendered_details.contains("runtime:"));
@@ -2312,6 +2384,7 @@ mod tests {
         assert!(!rendered_details.contains('›'));
         assert!(!rendered_details.contains("command running · Enter details"));
 
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         assert!(pane.cursor_pos(Rect::new(0, 0, 80, 20)).is_some());
@@ -2348,6 +2421,12 @@ mod tests {
 
         pane.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!pane.is_normal_backtrack_mode());
+        assert!(!pane.no_modal_or_popup_active());
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         assert!(!pane.is_normal_backtrack_mode());
         assert!(!pane.no_modal_or_popup_active());

@@ -42,6 +42,46 @@ async fn invocation_for_payload(
 }
 
 #[test]
+fn plain_inspection_command_guard_blocks_only_primary_inspection_tools() {
+    assert!(should_block_plain_inspection_command(
+        "rg FileHandler codex-rs"
+    ));
+    assert!(should_block_plain_inspection_command("grep -R beta src"));
+    assert!(should_block_plain_inspection_command("cat src/main.rs"));
+    assert!(should_block_plain_inspection_command(
+        "FOO=1 command rg beta"
+    ));
+    assert!(should_block_plain_inspection_command(
+        "sudo -n /usr/bin/grep beta src/main.rs"
+    ));
+
+    assert!(!should_block_plain_inspection_command(
+        "cargo test | grep failure"
+    ));
+    assert!(!should_block_plain_inspection_command("git grep beta"));
+    assert!(!should_block_plain_inspection_command(
+        "printf beta | grep beta"
+    ));
+    assert!(!should_block_plain_inspection_command(
+        "sed -n '1,20p' src/main.rs"
+    ));
+}
+
+#[test]
+fn blocked_plain_inspection_output_is_model_instruction_only() {
+    let output = blocked_existing_tools_output(/*max_output_tokens*/ None);
+
+    assert_eq!(
+        String::from_utf8(output.raw_output).expect("valid utf-8"),
+        USE_EXISTING_TOOLS_MESSAGE
+    );
+    assert_eq!(output.chunk_id, "");
+    assert_eq!(output.exit_code, None);
+    assert_eq!(output.original_token_count, None);
+    assert_eq!(output.hook_command, None);
+}
+
+#[test]
 fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()> {
     let json = r#"{"cmd": "echo hello"}"#;
 
@@ -242,6 +282,17 @@ async fn execute_pre_tool_use_payload_uses_raw_command() {
             tool_input: serde_json::json!({ "command": "printf exec command" }),
         })
     );
+}
+
+#[tokio::test]
+async fn blocked_plain_inspection_skips_hooks_and_mutation_gate() {
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({ "cmd": "rg beta src" }).to_string(),
+    };
+    let invocation = invocation_for_payload("execute", "call-blocked", payload).await;
+
+    assert_eq!(UnifiedExecHandler.pre_tool_use_payload(&invocation), None);
+    assert!(!UnifiedExecHandler.is_mutating(&invocation).await);
 }
 
 #[tokio::test]

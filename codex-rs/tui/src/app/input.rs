@@ -129,10 +129,7 @@ impl App {
                 kind: KeyEventKind::Press,
                 ..
             } => {
-                // Enter alternate screen and set viewport to full size.
-                let _ = tui.enter_alt_screen();
-                self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
-                tui.frame_requester().schedule_frame();
+                self.open_transcript_overlay(tui);
             }
             KeyEvent {
                 code: KeyCode::Char('l'),
@@ -185,7 +182,21 @@ impl App {
                     self.chat_widget.handle_key_event(key_event);
                 }
             }
-            // Enter confirms backtrack when primed + count > 0. Otherwise pass to widget.
+            KeyEvent {
+                code: KeyCode::Up | KeyCode::Left,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } if self.backtrack_picker_active() && self.chat_widget.composer_is_empty() => {
+                self.move_backtrack_picker_selection(tui, -1);
+            }
+            KeyEvent {
+                code: KeyCode::Down | KeyCode::Right,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } if self.backtrack_picker_active() && self.chat_widget.composer_is_empty() => {
+                self.move_backtrack_picker_selection(tui, 1);
+            }
+            // Enter confirms backtrack when the rollback picker has a selection. Otherwise pass to widget.
             KeyEvent {
                 code: KeyCode::Enter,
                 kind: KeyEventKind::Press,

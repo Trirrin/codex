@@ -1,7 +1,6 @@
-//! Backtracking and transcript overlay event routing.
+//! Backtracking, rollback picker, and transcript overlay event routing.
 //!
-//! This file owns backtrack mode (Esc/Enter navigation in the transcript overlay) and also
-//! mediates a key rendering boundary for the transcript overlay.
+//! This file owns Esc/Enter rollback navigation plus the transcript overlay rendering boundary.
 //!
 //! Overall goal: keep the main chat view and the transcript overlay in sync while allowing
 //! users to "rewind" to an earlier user message. We stage a rollback request, wait for core to
@@ -10,7 +9,7 @@
 //!
 //! Backtrack operates as a small state machine:
 //! - The first `Esc` in the main view "primes" the feature and captures a base thread id.
-//! - A subsequent `Esc` opens the transcript overlay (`Ctrl+T`) and highlights a user message when
+//! - A subsequent `Esc` opens the lightweight rollback picker and selects a user message when
 //!   there is a rewind target.
 //! - `Enter` requests a rollback from core and records a `pending_rollback` guard.
 //! - On `EventMsg::ThreadRolledBack`, we either finish an in-flight backtrack request or queue a
@@ -35,6 +34,7 @@ use crate::app_event::AppEvent;
 use crate::history_cell::AgentMessageCell;
 use crate::history_cell::SessionInfoCell;
 use crate::history_cell::UserHistoryCell;
+use crate::live_wrap::take_prefix_by_width;
 use crate::pager_overlay::Overlay;
 use crate::tui;
 use crate::tui::TuiEvent;
@@ -44,8 +44,18 @@ use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Stylize;
+use ratatui::text::Line;
+use ratatui::widgets::Clear;
+use ratatui::widgets::Paragraph;
+use ratatui::widgets::Widget;
 
 const NO_PREVIOUS_MESSAGE_TO_EDIT: &str = "No previous message to edit.";
+const BACKTRACK_PICKER_MAX_MESSAGES: usize = 3;
+const BACKTRACK_PICKER_TITLE: &str = "Select a previous message to roll back";
+const BACKTRACK_PICKER_HINT: &str = "Enter to roll back, esc to cancel.";
 
 /// Aggregates all backtrack-related state used by the App.
 #[derive(Default)]
@@ -61,6 +71,8 @@ pub(crate) struct BacktrackState {
     /// This is an index into the filtered "user messages since the last session start" view,
     /// not an index into `transcript_cells`. `usize::MAX` indicates "no selection".
     pub(crate) nth_user_message: usize,
+    /// True when the lightweight main-screen rollback picker is open.
+    pub(crate) picker_active: bool,
     /// True when the transcript overlay is showing a backtrack preview.
     pub(crate) overlay_preview_active: bool,
     /// Pending rollback request awaiting confirmation from core.
@@ -174,7 +186,10 @@ impl App {
             return;
         }
 
-        if !self.backtrack.primed {
+        if self.backtrack.picker_active {
+            self.reset_backtrack_state();
+            tui.frame_requester().schedule_frame();
+        } else if !self.backtrack.primed {
             self.prime_backtrack();
         } else if self.overlay.is_none() {
             self.open_backtrack_preview(tui);
@@ -274,7 +289,7 @@ impl App {
         }
     }
 
-    /// Open overlay and begin backtrack preview flow (first step + highlight).
+    /// Open the lightweight main-screen rollback picker.
     fn open_backtrack_preview(&mut self, tui: &mut tui::Tui) {
         if !has_backtrack_target(&self.transcript_cells) {
             self.reset_backtrack_state();
@@ -284,11 +299,13 @@ impl App {
             return;
         }
 
-        self.open_transcript_overlay(tui);
-        self.backtrack.overlay_preview_active = true;
-        // Composer is hidden by overlay; clear its hint.
+        self.backtrack.picker_active = true;
         self.chat_widget.clear_esc_backtrack_hint();
-        self.step_backtrack_and_highlight(tui);
+        let count = user_count(&self.transcript_cells);
+        if let Some(last_index) = count.checked_sub(1) {
+            self.apply_backtrack_selection_internal(last_index);
+        }
+        tui.frame_requester().schedule_frame();
     }
 
     /// When overlay is already open, begin preview mode and select latest user message.
@@ -311,7 +328,7 @@ impl App {
         tui.frame_requester().schedule_frame();
     }
 
-    /// Step selection to the next older user message and update overlay.
+    /// Step selection to the next older user message and update preview UI.
     fn step_backtrack_and_highlight(&mut self, tui: &mut tui::Tui) {
         let count = user_count(&self.transcript_cells);
         if count == 0 {
@@ -334,7 +351,7 @@ impl App {
         tui.frame_requester().schedule_frame();
     }
 
-    /// Step selection to the next newer user message and update overlay.
+    /// Step selection to the next newer user message and update preview UI.
     fn step_forward_backtrack_and_highlight(&mut self, tui: &mut tui::Tui) {
         let count = user_count(&self.transcript_cells);
         if count == 0 {
@@ -355,7 +372,7 @@ impl App {
         tui.frame_requester().schedule_frame();
     }
 
-    /// Apply a computed backtrack selection to the overlay and internal counter.
+    /// Apply a computed backtrack selection to the preview UI and internal counter.
     fn apply_backtrack_selection_internal(&mut self, nth_user_message: usize) {
         if let Some(cell_idx) = nth_user_position(&self.transcript_cells, nth_user_message) {
             self.backtrack.nth_user_message = nth_user_message;
@@ -368,6 +385,48 @@ impl App {
                 t.set_highlight_cell(/*cell*/ None);
             }
         }
+    }
+
+    pub(crate) fn backtrack_picker_active(&self) -> bool {
+        self.backtrack.picker_active
+    }
+
+    pub(crate) fn move_backtrack_picker_selection(&mut self, tui: &mut tui::Tui, delta: isize) {
+        if !self.backtrack.picker_active {
+            return;
+        }
+
+        match delta.cmp(&0) {
+            std::cmp::Ordering::Less => self.step_backtrack_and_highlight(tui),
+            std::cmp::Ordering::Equal => {}
+            std::cmp::Ordering::Greater => self.step_forward_backtrack_and_highlight(tui),
+        }
+    }
+
+    pub(crate) fn backtrack_picker_desired_height(&self, width: u16) -> u16 {
+        self.backtrack_picker_lines(width)
+            .map_or(0, |lines| lines.len() as u16)
+    }
+
+    pub(crate) fn render_backtrack_picker(&self, area: Rect, buf: &mut Buffer) {
+        let Some(lines) = self.backtrack_picker_lines(area.width) else {
+            return;
+        };
+        Clear.render(area, buf);
+        Paragraph::new(lines).render(area, buf);
+    }
+
+    fn backtrack_picker_lines(&self, width: u16) -> Option<Vec<Line<'static>>> {
+        if !self.backtrack.picker_active || self.backtrack.nth_user_message == usize::MAX {
+            return None;
+        }
+
+        let messages = user_messages(&self.transcript_cells);
+        Some(backtrack_picker_lines(
+            &messages,
+            self.backtrack.nth_user_message,
+            width,
+        ))
     }
 
     /// Forwards an event to the overlay and closes it if done.
@@ -469,6 +528,8 @@ impl App {
         self.backtrack.primed = false;
         self.backtrack.base_id = None;
         self.backtrack.nth_user_message = usize::MAX;
+        self.backtrack.picker_active = false;
+        self.backtrack.overlay_preview_active = false;
         // In case a hint is somehow still visible (e.g., race with overlay open/close).
         self.chat_widget.clear_esc_backtrack_hint();
     }
@@ -666,6 +727,104 @@ fn user_positions_iter(
         .filter_map(move |(idx, cell)| (type_of(cell) == user_type).then_some(idx))
 }
 
+fn user_messages(cells: &[Arc<dyn crate::history_cell::HistoryCell>]) -> Vec<String> {
+    user_positions_iter(cells)
+        .filter_map(|idx| cells.get(idx))
+        .filter_map(|cell| cell.as_any().downcast_ref::<UserHistoryCell>())
+        .map(|cell| cell.message.clone())
+        .collect()
+}
+
+fn backtrack_picker_lines(messages: &[String], selected: usize, width: u16) -> Vec<Line<'static>> {
+    if messages.is_empty() || selected >= messages.len() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from("─".repeat(width as usize)).dim());
+    lines.push(Line::from(""));
+    lines.push(
+        Line::from(truncate_picker_message(
+            "  ",
+            BACKTRACK_PICKER_TITLE,
+            width as usize,
+        ))
+        .bold(),
+    );
+    lines.push(Line::from(""));
+    for index in visible_user_message_range(messages.len(), selected, BACKTRACK_PICKER_MAX_MESSAGES)
+    {
+        let prefix = if index == selected { "> " } else { "  " };
+        let text = single_line_message(&messages[index]);
+        let line = truncate_picker_message(prefix, &text, width as usize);
+        if index == selected {
+            lines.push(Line::from(line).cyan());
+        } else {
+            lines.push(Line::from(line));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("  {BACKTRACK_PICKER_HINT}")).dim());
+    lines.push(Line::from(""));
+    lines
+}
+
+fn visible_user_message_range(
+    total: usize,
+    selected: usize,
+    max_messages: usize,
+) -> std::ops::Range<usize> {
+    let max_messages = max_messages.max(1).min(total);
+    if total <= max_messages {
+        return 0..total;
+    }
+
+    let start = if selected == 0 {
+        0
+    } else if selected + 1 == total {
+        total - max_messages
+    } else {
+        selected.saturating_sub(1).min(total - max_messages)
+    };
+    start..start + max_messages
+}
+
+fn single_line_message(message: &str) -> String {
+    let line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() {
+        "(empty message)".to_string()
+    } else {
+        line
+    }
+}
+
+fn truncate_picker_message(prefix: &str, message: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let prefix_width = prefix.chars().count();
+    if width <= prefix_width {
+        let (truncated, _, _) = take_prefix_by_width(prefix, width);
+        return truncated;
+    }
+
+    let message_width = width - prefix_width;
+    let (_, remainder, _) = take_prefix_by_width(message, message_width);
+    if remainder.is_empty() {
+        return format!("{prefix}{message}");
+    }
+
+    const ELLIPSIS: &str = "...";
+    if message_width <= ELLIPSIS.len() {
+        let (truncated, _, _) = take_prefix_by_width(message, message_width);
+        return format!("{prefix}{truncated}");
+    }
+
+    let (truncated, _, _) = take_prefix_by_width(message, message_width - ELLIPSIS.len());
+    format!("{prefix}{}{ELLIPSIS}", truncated.trim_end())
+}
+
 #[cfg(test)]
 fn agent_group_count(cells: &[Arc<dyn crate::history_cell::HistoryCell>]) -> usize {
     agent_group_positions_iter(cells).count()
@@ -699,8 +858,8 @@ mod tests {
     use super::*;
     use crate::history_cell::AgentMessageCell;
     use crate::history_cell::HistoryCell;
+    use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
-    use ratatui::prelude::Line;
     use std::sync::Arc;
 
     fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
@@ -713,6 +872,38 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn picker_keeps_selected_message_surrounded_when_possible() {
+        assert_eq!(visible_user_message_range(6, 0, 3), 0..3);
+        assert_eq!(visible_user_message_range(6, 2, 3), 1..4);
+        assert_eq!(visible_user_message_range(6, 5, 3), 3..6);
+    }
+
+    #[test]
+    fn picker_lines_show_only_user_messages_with_hint() {
+        let messages = vec![
+            "hello".to_string(),
+            "please inspect this project and explain the architecture".to_string(),
+            "is this correct?".to_string(),
+            "one more".to_string(),
+        ];
+
+        let lines = backtrack_picker_lines(&messages, 1, 32);
+
+        assert_snapshot!(render_lines(&lines).join("\n"), @r###"
+────────────────────────────────
+
+  Select a previous message t...
+
+  hello
+> please inspect this project...
+  is this correct?
+
+  Enter to roll back, esc to cancel.
+
+"###);
     }
 
     #[test]

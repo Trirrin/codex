@@ -554,6 +554,11 @@ pub struct Tui {
     #[serde(default = "default_true")]
     pub show_tooltips: bool,
 
+    /// Collapse explored read/search/list tool groups into a single count summary.
+    /// Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub compact_explored_tools: bool,
+
     /// Controls whether the TUI uses the terminal's alternate screen buffer.
     ///
     /// - `auto` (default): Disable alternate screen in Zellij, enable elsewhere.

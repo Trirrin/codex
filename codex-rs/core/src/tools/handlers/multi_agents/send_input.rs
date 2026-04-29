@@ -66,7 +66,7 @@ impl ToolHandler for Handler {
             status = wait_for_agent_final_status(
                 session.clone(),
                 receiver_thread_id,
-                DEFAULT_WAIT_TIMEOUT_MS,
+                DEFAULT_BLOCKING_AGENT_TIMEOUT_MS,
             )
             .await;
         }

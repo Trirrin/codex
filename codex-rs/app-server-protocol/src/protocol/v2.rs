@@ -5623,6 +5623,8 @@ pub enum ThreadItem {
         reasoning_effort: Option<ReasoningEffort>,
         /// Last known status of the target agents, when available.
         agents_states: HashMap<String, CollabAgentState>,
+        /// Human-readable tool progress lines reported by a spawned agent, when available.
+        tool_progress: Option<Vec<String>>,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]

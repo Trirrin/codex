@@ -12,11 +12,17 @@ use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::CollabAgentRef;
+use codex_protocol::protocol::CollabAgentSpawnUpdateEvent;
 use codex_protocol::protocol::CollabAgentStatusEntry;
+use codex_protocol::protocol::CollabAgentToolCallMode;
+use codex_protocol::protocol::CollabAgentToolSummary;
+use codex_protocol::protocol::CollabAgentToolSummaryEntry;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -35,6 +41,8 @@ use tokio::time::timeout_at;
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = 3600 * 1000;
+pub(crate) const DEFAULT_BLOCKING_AGENT_TIMEOUT_MS: i64 = MAX_WAIT_TIMEOUT_MS;
+const BLOCKING_AGENT_PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -43,6 +51,288 @@ pub(crate) enum AgentToolMode {
     Blocking,
     #[default]
     Background,
+}
+
+pub(crate) fn collab_tool_call_mode(mode: AgentToolMode) -> CollabAgentToolCallMode {
+    match mode {
+        AgentToolMode::Blocking => CollabAgentToolCallMode::Blocking,
+        AgentToolMode::Background => CollabAgentToolCallMode::Background,
+    }
+}
+
+pub(crate) async fn collab_agent_tool_summary(
+    session: Arc<Session>,
+    thread_id: ThreadId,
+) -> Option<CollabAgentToolSummary> {
+    let history = session
+        .services
+        .agent_control
+        .clone_agent_history(thread_id)
+        .await
+        .ok()?;
+    let summary = collab_agent_tool_summary_from_history(&history);
+    (!summary.tools.is_empty()).then_some(summary)
+}
+
+fn collab_agent_tool_summary_from_history(history: &[ResponseItem]) -> CollabAgentToolSummary {
+    let outputs = history
+        .iter()
+        .filter_map(tool_call_output_text)
+        .collect::<HashMap<_, _>>();
+    let mut summary = CollabAgentToolSummary::default();
+
+    for item in history {
+        match item {
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                increment_tool_count(&mut summary.tools, name);
+                summary.output.push(function_call_summary_line(
+                    name,
+                    arguments,
+                    outputs.get(call_id),
+                ));
+            }
+            ResponseItem::CustomToolCall { name, input, .. } => {
+                increment_tool_count(&mut summary.tools, name);
+                summary
+                    .output
+                    .push(generic_tool_summary_line(name, Some(input.as_str())));
+            }
+            ResponseItem::ToolSearchCall {
+                call_id: _,
+                execution,
+                arguments,
+                ..
+            } => {
+                increment_tool_count(&mut summary.tools, execution);
+                summary
+                    .output
+                    .push(generic_json_tool_summary_line(execution, arguments));
+            }
+            ResponseItem::LocalShellCall { action, .. } => {
+                increment_tool_count(&mut summary.tools, "shell");
+                summary.output.push(local_shell_summary_line(action));
+            }
+            ResponseItem::WebSearchCall { .. } => {
+                increment_tool_count(&mut summary.tools, "web_search");
+                summary.output.push("Web Search".to_string());
+            }
+            ResponseItem::ImageGenerationCall { .. } => {
+                increment_tool_count(&mut summary.tools, "image_generation");
+                summary.output.push("Image Generation".to_string());
+            }
+            ResponseItem::Message { .. }
+            | ResponseItem::Reasoning { .. }
+            | ResponseItem::FunctionCallOutput { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
+            | ResponseItem::ToolSearchOutput { .. }
+            | ResponseItem::Compaction { .. }
+            | ResponseItem::Other => {}
+        }
+    }
+
+    summary
+}
+
+fn increment_tool_count(entries: &mut Vec<CollabAgentToolSummaryEntry>, name: &str) {
+    if let Some(entry) = entries.iter_mut().find(|entry| entry.name == name) {
+        entry.count += 1;
+        return;
+    }
+    entries.push(CollabAgentToolSummaryEntry {
+        name: name.to_string(),
+        count: 1,
+    });
+}
+
+fn function_call_summary_line(name: &str, arguments: &str, output: Option<&String>) -> String {
+    match name {
+        "read_file" => argument_string(arguments, "path")
+            .map(|path| format!("Read {path}"))
+            .unwrap_or_else(|| "Read".to_string()),
+        "search_file" | "grep_file" => argument_string(arguments, "query")
+            .or_else(|| argument_string(arguments, "pattern"))
+            .map(|pattern| format!("Search {pattern}"))
+            .unwrap_or_else(|| "Search".to_string()),
+        "glob_file" => argument_string(arguments, "pattern")
+            .map(|pattern| format!("Glob {pattern}"))
+            .unwrap_or_else(|| "Glob".to_string()),
+        "delete" => argument_string(arguments, "path")
+            .map(|path| format!("Delete {path}"))
+            .unwrap_or_else(|| "Delete".to_string()),
+        "list_dir" => argument_string(arguments, "dir_path")
+            .map(|path| format!("List {path}"))
+            .unwrap_or_else(|| "List".to_string()),
+        "execute" => argument_string(arguments, "cmd")
+            .map(|cmd| format!("Execute {cmd}"))
+            .unwrap_or_else(|| "Execute".to_string()),
+        "edit" => {
+            let path = argument_string(arguments, "path").unwrap_or_else(|| "file".to_string());
+            let (added, removed) = output
+                .map(String::as_str)
+                .map(diff_line_counts)
+                .unwrap_or_default();
+            format!("Edit {path}(+{added} -{removed})")
+        }
+        "write" => {
+            let path = argument_string(arguments, "path").unwrap_or_else(|| "file".to_string());
+            let added = argument_string(arguments, "content")
+                .map(|content| content.lines().count())
+                .unwrap_or_default();
+            format!("Write {path}(+{added} -0)")
+        }
+        _ => generic_function_call_summary_line(name, arguments),
+    }
+}
+
+fn generic_function_call_summary_line(name: &str, arguments: &str) -> String {
+    let label = short_tool_label(name);
+    let detail = serde_json::from_str::<JsonValue>(arguments)
+        .ok()
+        .and_then(|arguments| first_summary_argument(&arguments));
+    match detail {
+        Some(detail) if !detail.is_empty() => format!("{label} {detail}"),
+        Some(_) | None => label,
+    }
+}
+
+fn generic_json_tool_summary_line(name: &str, arguments: &JsonValue) -> String {
+    let label = short_tool_label(name);
+    match first_summary_argument(arguments) {
+        Some(detail) if !detail.is_empty() => format!("{label} {detail}"),
+        Some(_) | None => label,
+    }
+}
+
+fn generic_tool_summary_line(name: &str, detail: Option<&str>) -> String {
+    let label = short_tool_label(name);
+    match detail.map(truncate_summary_value) {
+        Some(detail) if !detail.is_empty() => format!("{label} {detail}"),
+        Some(_) | None => label,
+    }
+}
+
+fn local_shell_summary_line(action: &codex_protocol::models::LocalShellAction) -> String {
+    match action {
+        codex_protocol::models::LocalShellAction::Exec(action) => {
+            generic_tool_summary_line("shell", Some(&action.command.join(" ")))
+        }
+    }
+}
+
+fn first_summary_argument(arguments: &JsonValue) -> Option<String> {
+    [
+        "path",
+        "dir_path",
+        "cmd",
+        "pattern",
+        "query",
+        "command",
+        "message",
+        "task_name",
+    ]
+    .into_iter()
+    .find_map(|key| argument_value(arguments, key))
+}
+
+fn argument_value(arguments: &JsonValue, key: &str) -> Option<String> {
+    let value = arguments.get(key)?;
+    match value {
+        JsonValue::String(value) => Some(truncate_summary_value(value)),
+        JsonValue::Number(_) | JsonValue::Bool(_) => Some(value.to_string()),
+        JsonValue::Array(_) | JsonValue::Object(_) | JsonValue::Null => None,
+    }
+}
+
+fn truncate_summary_value(value: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn short_tool_label(name: &str) -> String {
+    match name {
+        "read_file" => "Read".to_string(),
+        "write" => "Write".to_string(),
+        "edit" => "Edit".to_string(),
+        "delete" => "Delete".to_string(),
+        "list_dir" => "List".to_string(),
+        "search_file" | "grep_file" => "Search".to_string(),
+        "glob_file" => "Glob".to_string(),
+        "execute" | "shell" => "Execute".to_string(),
+        "web_search" => "Web".to_string(),
+        "image_generation" => "Image".to_string(),
+        "view_image" => "View".to_string(),
+        "update_plan" => "Plan".to_string(),
+        "spawn_agent" => "Spawn".to_string(),
+        "send_input" => "Send".to_string(),
+        "resume_agent" => "Resume".to_string(),
+        "wait_agent" => "Wait".to_string(),
+        "close_agent" => "Close".to_string(),
+        _ => format_tool_name(name),
+    }
+}
+
+fn format_tool_name(name: &str) -> String {
+    name.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn tool_call_output_text(item: &ResponseItem) -> Option<(String, String)> {
+    let (call_id, output) = match item {
+        ResponseItem::FunctionCallOutput { call_id, output } => (call_id, output),
+        ResponseItem::CustomToolCallOutput {
+            call_id, output, ..
+        } => (call_id, output),
+        _ => return None,
+    };
+    let text = match &output.body {
+        FunctionCallOutputBody::Text(text) => text.clone(),
+        FunctionCallOutputBody::ContentItems(items) => {
+            FunctionCallOutputBody::ContentItems(items.clone()).to_text()?
+        }
+    };
+    Some((call_id.clone(), text))
+}
+
+fn argument_string(arguments: &str, key: &str) -> Option<String> {
+    serde_json::from_str::<JsonValue>(arguments)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(ToString::to_string)
+}
+
+fn diff_line_counts(diff: &str) -> (usize, usize) {
+    diff.lines().fold((0, 0), |(added, removed), line| {
+        if line.starts_with("+++") || line.starts_with("---") {
+            (added, removed)
+        } else if line.starts_with('+') {
+            (added + 1, removed)
+        } else if line.starts_with('-') {
+            (added, removed + 1)
+        } else {
+            (added, removed)
+        }
+    })
 }
 
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
@@ -146,6 +436,130 @@ pub(crate) fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionC
         }
         err => FunctionCallError::RespondToModel(format!("collab tool failed: {err}")),
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct BlockingSpawnProgress {
+    pub(crate) call_id: String,
+    pub(crate) thread_id: ThreadId,
+    pub(crate) nickname: Option<String>,
+    pub(crate) role: Option<String>,
+    pub(crate) prompt: String,
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: ReasoningEffort,
+}
+
+pub(crate) async fn wait_for_blocking_spawn_final_status(
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    progress: BlockingSpawnProgress,
+    timeout_ms: i64,
+) -> AgentStatus {
+    let timeout_ms = timeout_ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    match session
+        .services
+        .agent_control
+        .subscribe_status(progress.thread_id)
+        .await
+    {
+        Ok(status_rx) => {
+            match timeout_at(
+                deadline,
+                wait_for_blocking_spawn_final_status_inner(
+                    session.clone(),
+                    turn,
+                    progress.clone(),
+                    status_rx,
+                ),
+            )
+            .await
+            .ok()
+            .flatten()
+            {
+                Some(status) => status,
+                None => {
+                    session
+                        .services
+                        .agent_control
+                        .get_status(progress.thread_id)
+                        .await
+                }
+            }
+        }
+        Err(_) => {
+            session
+                .services
+                .agent_control
+                .get_status(progress.thread_id)
+                .await
+        }
+    }
+}
+
+async fn wait_for_blocking_spawn_final_status_inner(
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    progress: BlockingSpawnProgress,
+    mut status_rx: Receiver<AgentStatus>,
+) -> Option<AgentStatus> {
+    let mut status = status_rx.borrow().clone();
+    let mut last_summary = None;
+    emit_blocking_spawn_update(&session, &turn, &progress, status.clone(), None).await;
+    if crate::agent::status::is_final(&status) {
+        return Some(status);
+    }
+
+    let mut interval = tokio::time::interval(BLOCKING_AGENT_PROGRESS_UPDATE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = status_rx.changed() => {
+                if changed.is_err() {
+                    let latest = session.services.agent_control.get_status(progress.thread_id).await;
+                    return crate::agent::status::is_final(&latest).then_some(latest);
+                }
+                status = status_rx.borrow().clone();
+                if crate::agent::status::is_final(&status) {
+                    return Some(status);
+                }
+            }
+            _ = interval.tick() => {
+                let summary = collab_agent_tool_summary(session.clone(), progress.thread_id).await;
+                if summary != last_summary {
+                    last_summary = summary.clone();
+                    emit_blocking_spawn_update(&session, &turn, &progress, status.clone(), summary).await;
+                }
+            }
+        }
+    }
+}
+
+async fn emit_blocking_spawn_update(
+    session: &Arc<Session>,
+    turn: &Arc<TurnContext>,
+    progress: &BlockingSpawnProgress,
+    status: AgentStatus,
+    tool_summary: Option<CollabAgentToolSummary>,
+) {
+    session
+        .send_event(
+            turn,
+            CollabAgentSpawnUpdateEvent {
+                call_id: progress.call_id.clone(),
+                sender_thread_id: session.conversation_id,
+                new_thread_id: progress.thread_id,
+                new_agent_nickname: progress.nickname.clone(),
+                new_agent_role: progress.role.clone(),
+                prompt: progress.prompt.clone(),
+                model: progress.model.clone(),
+                reasoning_effort: progress.reasoning_effort,
+                status,
+                tool_summary,
+            }
+            .into(),
+        )
+        .await;
 }
 
 pub(crate) async fn wait_for_agent_final_status(
@@ -441,4 +855,88 @@ fn validate_spawn_agent_reasoning_effort(
     Err(FunctionCallError::RespondToModel(format!(
         "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn collab_agent_tool_summary_lists_only_tools_used() {
+        let history = vec![
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "read_file".to_string(),
+                namespace: None,
+                arguments: r#"{"path":"codex-rs/tui/src/multi_agents.rs"}"#.to_string(),
+                call_id: "read-call".to_string(),
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "list_dir".to_string(),
+                namespace: None,
+                arguments: r#"{"dir_path":"codex-rs/tui"}"#.to_string(),
+                call_id: "list-call".to_string(),
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "execute".to_string(),
+                namespace: None,
+                arguments: r#"{"cmd":"cargo test -p codex-tui"}"#.to_string(),
+                call_id: "execute-call".to_string(),
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "fetch_ticket".to_string(),
+                namespace: None,
+                arguments: r#"{"query":"COD-123"}"#.to_string(),
+                call_id: "ticket-call".to_string(),
+            },
+            ResponseItem::CustomToolCall {
+                id: None,
+                status: None,
+                call_id: "custom-call".to_string(),
+                name: "index_symbols".to_string(),
+                input: "crate:codex-tui".to_string(),
+            },
+        ];
+
+        let summary = collab_agent_tool_summary_from_history(&history);
+
+        assert_eq!(
+            summary,
+            CollabAgentToolSummary {
+                tools: vec![
+                    CollabAgentToolSummaryEntry {
+                        name: "read_file".to_string(),
+                        count: 1,
+                    },
+                    CollabAgentToolSummaryEntry {
+                        name: "list_dir".to_string(),
+                        count: 1,
+                    },
+                    CollabAgentToolSummaryEntry {
+                        name: "execute".to_string(),
+                        count: 1,
+                    },
+                    CollabAgentToolSummaryEntry {
+                        name: "fetch_ticket".to_string(),
+                        count: 1,
+                    },
+                    CollabAgentToolSummaryEntry {
+                        name: "index_symbols".to_string(),
+                        count: 1,
+                    },
+                ],
+                output: vec![
+                    "Read codex-rs/tui/src/multi_agents.rs".to_string(),
+                    "List codex-rs/tui".to_string(),
+                    "Execute cargo test -p codex-tui".to_string(),
+                    "Fetch Ticket COD-123".to_string(),
+                    "Index Symbols crate:codex-tui".to_string(),
+                ],
+            }
+        );
+    }
 }

@@ -690,11 +690,11 @@ impl ChatComposer {
             ActivePopup::None => Constraint::Max(footer_total_height),
         };
         let [composer_rect, popup_rect] =
-            Layout::vertical([Constraint::Min(3), popup_constraint]).areas(area);
+            Layout::vertical([Constraint::Min(1), popup_constraint]).areas(area);
         let mut textarea_rect = composer_rect.inset(Insets::tlbr(
-            /*top*/ 1,
+            /*top*/ 0,
             LIVE_PREFIX_COLS,
-            /*bottom*/ 1,
+            /*bottom*/ 0,
             /*right*/ 1,
         ));
         let remote_images_height = self
@@ -3881,7 +3881,6 @@ impl Renderable for ChatComposer {
         self.textarea.desired_height(inner_width)
             + remote_images_height
             + remote_images_separator
-            + 2
             + match &self.active_popup {
                 ActivePopup::None => footer_total_height,
                 ActivePopup::Command(c) => c.calculate_required_height(width),

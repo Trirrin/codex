@@ -22,6 +22,7 @@ use tracing::info;
 
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
+const REMOTE_MODELS_DOWNLOAD_ENV_VAR: &str = "CODEX_ENABLE_REMOTE_MODELS_DOWNLOAD";
 
 /// Remote endpoint used by the OpenAI-compatible model manager.
 ///
@@ -46,11 +47,11 @@ pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
 /// Strategy for refreshing available models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshStrategy {
-    /// Always fetch from the network, ignoring cache.
+    /// Fetch from the network, ignoring cache, when remote downloads are enabled.
     Online,
     /// Only use cached data, never fetch from the network.
     Offline,
-    /// Use cache if available and fresh, otherwise fetch from the network.
+    /// Use cache if available and fresh, otherwise fetch from the network when enabled.
     OnlineIfUncached,
 }
 
@@ -176,7 +177,7 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
 /// Shared model manager handle used across runtime services.
 pub type SharedModelsManager = Arc<dyn ModelsManager>;
 
-/// OpenAI-compatible model manager backed by bundled models, cache, and `/models`.
+/// OpenAI-compatible model manager backed by bundled models and opt-in remote refresh.
 #[derive(Debug)]
 pub struct OpenAiModelsManager {
     remote_models: RwLock<Vec<ModelInfo>>,
@@ -185,6 +186,7 @@ pub struct OpenAiModelsManager {
     cache_manager: ModelsCacheManager,
     endpoint_client: SharedModelsEndpointClient,
     auth_manager: Option<Arc<AuthManager>>,
+    remote_model_downloads_enabled: bool,
 }
 
 /// Static model manager backed by an authoritative in-process catalog.
@@ -213,6 +215,7 @@ impl OpenAiModelsManager {
             cache_manager,
             endpoint_client,
             auth_manager,
+            remote_model_downloads_enabled: remote_model_downloads_enabled_from_env(),
         }
     }
 }
@@ -276,6 +279,10 @@ impl ModelsManager for OpenAiModelsManager {
 impl OpenAiModelsManager {
     /// Refresh available models according to the specified strategy.
     async fn refresh_available_models(&self, refresh_strategy: RefreshStrategy) -> CoreResult<()> {
+        if !self.remote_model_downloads_enabled {
+            return Ok(());
+        }
+
         if !self.should_refresh_models().await {
             if matches!(
                 refresh_strategy,
@@ -399,6 +406,18 @@ impl ModelsManager for StaticModelsManager {
 
 fn load_remote_models_from_file() -> Result<Vec<ModelInfo>, std::io::Error> {
     Ok(crate::bundled_models_response()?.models)
+}
+
+fn remote_model_downloads_enabled_from_env() -> bool {
+    remote_model_downloads_enabled(
+        std::env::var(REMOTE_MODELS_DOWNLOAD_ENV_VAR)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn remote_model_downloads_enabled(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn default_model_from_available(available: Vec<ModelPreset>) -> String {

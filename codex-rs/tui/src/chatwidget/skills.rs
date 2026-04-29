@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 
 use super::ChatWidget;
 use crate::app_event::AppEvent;
@@ -145,30 +146,51 @@ impl ChatWidget {
         &self,
         mut parsed_cmd: Vec<ParsedCommand>,
     ) -> Vec<ParsedCommand> {
-        if self.skills_all.is_empty() {
-            return parsed_cmd;
-        }
-
+        let cwd = self.config.cwd.as_path();
         for parsed in &mut parsed_cmd {
-            let ParsedCommand::Read { name, path, .. } = parsed else {
-                continue;
-            };
-            if name != "SKILL.md" {
-                continue;
-            }
+            match parsed {
+                ParsedCommand::Read { name, path, .. } => {
+                    let display_name =
+                        display_path_for_cwd(path.as_path(), cwd).unwrap_or_else(|| name.clone());
+                    *name = display_name;
 
-            // Best effort only: annotate exact SKILL.md path matches from the loaded skills list.
-            if let Some(skill) = self
-                .skills_all
-                .iter()
-                .find(|skill| skill.path.as_path() == path)
-            {
-                *name = format!("{name} ({} skill)", skill.name);
+                    if path.file_name().and_then(|name| name.to_str()) != Some("SKILL.md") {
+                        continue;
+                    }
+                    if let Some(skill) = self
+                        .skills_all
+                        .iter()
+                        .find(|skill| skill.path.as_path() == path)
+                    {
+                        *name = format!("{name} ({} skill)", skill.name);
+                    }
+                }
+                ParsedCommand::ListFiles { path, .. } | ParsedCommand::Search { path, .. } => {
+                    if let Some(display_path) = path
+                        .as_deref()
+                        .and_then(|path| display_string_path_for_cwd(path, cwd))
+                    {
+                        *path = Some(display_path);
+                    }
+                }
+                ParsedCommand::Unknown { .. } => {}
             }
         }
 
         parsed_cmd
     }
+}
+
+fn display_string_path_for_cwd(path: &str, cwd: &Path) -> Option<String> {
+    display_path_for_cwd(Path::new(path), cwd)
+}
+
+fn display_path_for_cwd(path: &Path, cwd: &Path) -> Option<String> {
+    let relative = path.strip_prefix(cwd).ok()?;
+    if relative.as_os_str().is_empty() {
+        return Some(".".to_string());
+    }
+    Some(relative.display().to_string())
 }
 
 fn skills_for_cwd(

@@ -349,6 +349,45 @@ async fn model_activity_status_lists_current_tool_actions() {
 }
 
 #[tokio::test]
+async fn explored_display_uses_relative_paths_for_cwd_files() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.compact_explored_tools = false;
+    chat.on_task_started();
+    let cwd = test_project_path().abs();
+    chat.config.cwd = cwd.clone();
+    let read_path = test_project_path().join("src/main.py");
+    let search_path = test_project_path().join("src");
+
+    chat.on_exec_command_begin(ExecCommandBeginEvent {
+        call_id: "call-relative".to_string(),
+        process_id: None,
+        turn_id: "turn-1".to_string(),
+        command: vec!["read_file".to_string(), read_path.display().to_string()],
+        cwd,
+        parsed_cmd: vec![
+            ParsedCommand::Read {
+                cmd: "read_file --start-line=85 --end-line=97".to_string(),
+                name: read_path.display().to_string(),
+                path: read_path,
+            },
+            ParsedCommand::Search {
+                cmd: "grep_file".to_string(),
+                query: Some("class Model".to_string()),
+                path: Some(search_path.display().to_string()),
+            },
+        ],
+        source: ExecCommandSource::Agent,
+        run_mode: None,
+        interaction_input: None,
+    });
+
+    let blob = active_blob(&chat);
+    assert!(blob.contains("Read src/main.py (lines 85-97)"));
+    assert!(blob.contains("Grep class Model in src"));
+    assert!(!blob.contains(&test_path_display("/tmp/project")));
+}
+
+#[tokio::test]
 async fn reasoning_status_takes_priority_over_tool_activity() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();
@@ -619,7 +658,7 @@ async fn exec_end_without_begin_does_not_flush_unrelated_running_exploring_cell(
 
     begin_exec(&mut chat, "call-exploring", "cat /dev/null");
     assert!(drain_insert_history(&mut rx).is_empty());
-    assert!(active_blob(&chat).contains("Read null"));
+    assert!(active_blob(&chat).contains("Read 1 file"));
 
     let orphan =
         begin_unified_exec_startup(&mut chat, "call-orphan", "proc-1", "echo repro-marker");
@@ -635,7 +674,7 @@ async fn exec_end_without_begin_does_not_flush_unrelated_running_exploring_cell(
         "expected standalone background entry: {background_blob:?}"
     );
     assert!(
-        active_blob(&chat).contains("Read null"),
+        active_blob(&chat).contains("Read 1 file"),
         "active exploring command should remain visible"
     );
 
@@ -654,11 +693,11 @@ async fn exec_end_without_begin_does_not_flush_unrelated_running_exploring_cell(
     );
     let active = active_blob(&chat);
     assert!(
-        active.contains("• Exploring"),
+        active.contains("• Read 1 file"),
         "expected unrelated exploring call to remain active: {active:?}"
     );
     assert!(
-        active.contains("Read null"),
+        active.contains("Read 1 file"),
         "expected active exploring command to remain visible: {active:?}"
     );
     assert!(
@@ -675,7 +714,7 @@ async fn exec_end_without_begin_flushes_completed_unrelated_exploring_cell() {
     let begin_ls = begin_exec(&mut chat, "call-ls", "ls -la");
     end_exec(&mut chat, begin_ls, "", "", /*exit_code*/ 0);
     assert!(drain_insert_history(&mut rx).is_empty());
-    assert!(active_blob(&chat).contains("ls -la"));
+    assert!(active_blob(&chat).contains("List 1 path"));
 
     let orphan = begin_unified_exec_startup(&mut chat, "call-after", "proc-1", "echo after");
     end_exec(&mut chat, orphan, "after\n", "", /*exit_code*/ 0);
@@ -688,11 +727,11 @@ async fn exec_end_without_begin_flushes_completed_unrelated_exploring_cell() {
     );
     let first = lines_to_single_string(&cells[0]);
     assert!(
-        first.contains("• Explored"),
+        first.contains("• List 1 path"),
         "expected flushed exploring cell: {first:?}"
     );
     assert!(
-        first.contains("List ls -la"),
+        first.contains("List 1 path"),
         "expected flushed exploring cell: {first:?}"
     );
     let active = active_blob(&chat);
@@ -723,15 +762,15 @@ async fn overlapping_exploring_exec_end_is_not_misclassified_as_orphan() {
     );
     let active = active_blob(&chat);
     assert!(
-        active.contains("List ls -la"),
+        active.contains("List 1 path"),
         "expected first command still grouped: {active:?}"
     );
     assert!(
-        active.contains("Read foo.txt"),
+        active.contains("Read 1 file"),
         "expected second running command to stay in the same active cell: {active:?}"
     );
     assert!(
-        active.contains("• Exploring"),
+        active.contains("• List 1 path, Read 1 file"),
         "expected grouped exploring header to remain active: {active:?}"
     );
 
@@ -1078,6 +1117,100 @@ async fn background_execute_tool_response_keeps_footer_activity() {
         chat.unified_exec_processes.len(),
         1,
         "initial background execute tool response must not remove the live shell from the footer"
+    );
+}
+
+#[tokio::test]
+async fn background_shell_interaction_output_updates_footer_details() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+
+    begin_unified_exec_startup(&mut chat, "call-background", "12345", "npm run dev");
+    terminal_interaction(&mut chat, "call-read-output", "12345", "");
+    chat.handle_codex_event(Event {
+        id: "read-output".into(),
+        msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+            call_id: "call-read-output".into(),
+            stream: ExecOutputStream::Stdout,
+            chunk: b"ready\ncompiled\n".to_vec(),
+        }),
+    });
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let details = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(
+        details.contains("output:"),
+        "expected background shell output section, got {details:?}"
+    );
+    assert!(
+        details.contains("ready") && details.contains("compiled"),
+        "expected interaction output in footer details, got {details:?}"
+    );
+}
+
+#[tokio::test]
+async fn background_shell_exit_removes_footer_even_before_initial_end_is_handled() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+
+    let begin =
+        begin_unified_exec_startup(&mut chat, "call-background-race", "12345", "printf done");
+    assert_eq!(chat.unified_exec_processes.len(), 1);
+
+    let mut initial = begin.clone();
+    initial.run_mode = Some(ExecCommandRunMode::Background);
+    let mut exit = begin;
+    exit.run_mode = None;
+
+    let initial_end = ExecCommandEndEvent {
+        call_id: initial.call_id.clone(),
+        process_id: initial.process_id.clone(),
+        turn_id: initial.turn_id.clone(),
+        command: initial.command.clone(),
+        cwd: initial.cwd.clone(),
+        parsed_cmd: initial.parsed_cmd.clone(),
+        source: initial.source,
+        interaction_input: initial.interaction_input,
+        stdout: String::new(),
+        stderr: String::new(),
+        aggregated_output: String::new(),
+        exit_code: 0,
+        duration: std::time::Duration::from_millis(5),
+        formatted_output: String::new(),
+        status: CoreExecCommandStatus::Completed,
+    };
+    chat.track_unified_exec_process_end(&initial_end);
+    assert_eq!(chat.unified_exec_processes.len(), 1);
+
+    let exit_end = ExecCommandEndEvent {
+        call_id: exit.call_id,
+        process_id: exit.process_id,
+        turn_id: exit.turn_id,
+        command: exit.command,
+        cwd: exit.cwd,
+        parsed_cmd: exit.parsed_cmd,
+        source: exit.source,
+        interaction_input: exit.interaction_input,
+        stdout: "done\n".to_string(),
+        stderr: String::new(),
+        aggregated_output: "done\n".to_string(),
+        exit_code: 0,
+        duration: std::time::Duration::from_millis(5),
+        formatted_output: "done\n".to_string(),
+        status: CoreExecCommandStatus::Completed,
+    };
+    chat.track_unified_exec_process_end(&exit_end);
+
+    assert!(
+        chat.running_commands.contains_key("call-background-race"),
+        "test must keep running_commands stale to cover the race"
+    );
+    assert!(
+        chat.unified_exec_processes.is_empty(),
+        "real shell exit must remove the footer row even if the initial end is still queued"
     );
 }
 

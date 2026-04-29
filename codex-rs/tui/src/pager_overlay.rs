@@ -1057,7 +1057,10 @@ mod tests {
             ExecCommandSource::Agent,
             /*run_mode*/ None,
             /*interaction_input*/ None,
-            /*animations_enabled*/ true,
+            crate::exec_cell::ExecCellDisplayOptions {
+                animations_enabled: true,
+                explored_tools_display: crate::exec_cell::ExploredToolsDisplay::Compact,
+            },
         );
         exec_cell.complete_call(
             "exec-1",

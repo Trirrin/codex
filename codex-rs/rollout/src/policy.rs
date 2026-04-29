@@ -178,6 +178,7 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
         | EventMsg::ReasoningRawContentDelta(_)
         | EventMsg::SkillsUpdateAvailable
         | EventMsg::CollabAgentSpawnBegin(_)
+        | EventMsg::CollabAgentSpawnUpdate(_)
         | EventMsg::CollabAgentInteractionBegin(_)
         | EventMsg::CollabWaitingBegin(_)
         | EventMsg::CollabCloseBegin(_)

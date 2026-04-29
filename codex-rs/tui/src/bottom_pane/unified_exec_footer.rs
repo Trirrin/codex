@@ -26,10 +26,19 @@ pub(crate) struct CommandActivity {
     pub(crate) recent_output: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BackgroundSubagentActivity {
+    pub(crate) label: String,
+    pub(crate) thread_id: String,
+    pub(crate) status: String,
+    pub(crate) started_at: Instant,
+    pub(crate) recent_output: Vec<String>,
+}
+
 /// Tracks active unified-exec processes and renders a compact summary.
 pub(crate) struct UnifiedExecFooter {
     processes: Vec<CommandActivity>,
-    subagents: Vec<String>,
+    subagents: Vec<BackgroundSubagentActivity>,
     focused: bool,
 }
 
@@ -54,7 +63,7 @@ impl UnifiedExecFooter {
         self.processes.is_empty() && self.subagents.is_empty()
     }
 
-    pub(crate) fn set_subagents(&mut self, subagents: Vec<String>) -> bool {
+    pub(crate) fn set_subagents(&mut self, subagents: Vec<BackgroundSubagentActivity>) -> bool {
         if self.subagents == subagents {
             return false;
         }
@@ -70,29 +79,65 @@ impl UnifiedExecFooter {
         true
     }
 
-    pub(crate) fn detail_lines(&self) -> Vec<String> {
+    pub(crate) fn activity_count(&self) -> usize {
+        self.blocking_processes().len() + self.background_processes().len() + self.subagents.len()
+    }
+
+    pub(crate) fn list_lines(&self, selected: usize) -> Vec<String> {
         let mut lines = Vec::new();
-        let blocking = self.blocking_processes();
-        if !blocking.is_empty() {
-            lines.push("Commands".to_string());
-            append_process_details(&mut lines, blocking);
-        }
-        let background = self.background_processes();
-        if !background.is_empty() {
-            if !lines.is_empty() {
-                lines.push(String::new());
-            }
-            lines.push("Background commands".to_string());
-            append_process_details(&mut lines, background);
-        }
+        let mut index = 0;
+        append_process_list(
+            &mut lines,
+            "Commands",
+            self.blocking_processes(),
+            &mut index,
+            selected,
+        );
+        append_process_list(
+            &mut lines,
+            "Background commands",
+            self.background_processes(),
+            &mut index,
+            selected,
+        );
         if !self.subagents.is_empty() {
             if !lines.is_empty() {
                 lines.push(String::new());
             }
             lines.push("Subagents".to_string());
-            lines.extend(self.subagents.iter().map(|agent| format!("  {agent}")));
+            for subagent in &self.subagents {
+                let prefix = if index == selected { ">" } else { " " };
+                lines.push(format!(
+                    "  {prefix} {} [{}]({}) · Enter details · k kill",
+                    subagent.label, subagent.thread_id, subagent.status
+                ));
+                index += 1;
+            }
         }
         lines
+    }
+
+    pub(crate) fn detail_lines(&self, selected: usize) -> Vec<String> {
+        let mut index = 0;
+        for process in self.blocking_processes() {
+            if index == selected {
+                return process_detail_lines(process);
+            }
+            index += 1;
+        }
+        for process in self.background_processes() {
+            if index == selected {
+                return process_detail_lines(process);
+            }
+            index += 1;
+        }
+        for subagent in &self.subagents {
+            if index == selected {
+                return subagent_detail_lines(subagent);
+            }
+            index += 1;
+        }
+        Vec::new()
     }
 
     fn blocking_processes(&self) -> Vec<&CommandActivity> {
@@ -151,20 +196,62 @@ impl UnifiedExecFooter {
     }
 }
 
-fn append_process_details(lines: &mut Vec<String>, processes: Vec<&CommandActivity>) {
-    for process in processes {
-        lines.push(format!("  {}", process.command));
-        lines.push(format!("    shell id: {}", process.shell_id));
-        lines.push(format!("    status: {}", process.status));
-        lines.push(format!(
-            "    runtime: {}",
-            format_duration(process.started_at.elapsed())
-        ));
-        if !process.recent_output.is_empty() {
-            lines.push("    output:".to_string());
-            lines.extend(format_output_lines(&process.recent_output));
-        }
+fn append_process_list(
+    lines: &mut Vec<String>,
+    title: &str,
+    processes: Vec<&CommandActivity>,
+    index: &mut usize,
+    selected: usize,
+) {
+    if processes.is_empty() {
+        return;
     }
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines.push(title.to_string());
+    for process in processes {
+        let prefix = if *index == selected { ">" } else { " " };
+        lines.push(format!(
+            "  {prefix} {} [{}]({}) · Enter details · k kill",
+            process.command, process.shell_id, process.status
+        ));
+        *index += 1;
+    }
+}
+
+fn process_detail_lines(process: &CommandActivity) -> Vec<String> {
+    let mut lines = vec![
+        process.command.clone(),
+        format!("  shell id: {}", process.shell_id),
+        format!("  status: {}", process.status),
+        format!(
+            "  runtime: {}",
+            format_duration(process.started_at.elapsed())
+        ),
+    ];
+    if !process.recent_output.is_empty() {
+        lines.push("  output:".to_string());
+        lines.extend(format_output_lines(&process.recent_output));
+    }
+    lines
+}
+
+fn subagent_detail_lines(subagent: &BackgroundSubagentActivity) -> Vec<String> {
+    let mut lines = vec![
+        subagent.label.clone(),
+        format!("  thread id: {}", subagent.thread_id),
+        format!("  status: {}", subagent.status),
+        format!(
+            "  runtime: {}",
+            format_duration(subagent.started_at.elapsed())
+        ),
+    ];
+    if !subagent.recent_output.is_empty() {
+        lines.push("  output:".to_string());
+        lines.extend(format_output_lines(&subagent.recent_output));
+    }
+    lines
 }
 
 fn format_output_lines(output: &[String]) -> Vec<String> {
@@ -286,7 +373,22 @@ mod tests {
             status: "running".to_string(),
             recent_output: vec!["running 12 tests".to_string()],
         }]);
-        footer.set_subagents(vec!["explorer".to_string(), "worker".to_string()]);
+        footer.set_subagents(vec![
+            BackgroundSubagentActivity {
+                label: "explorer".to_string(),
+                thread_id: "agent-1".to_string(),
+                status: "running".to_string(),
+                started_at: Instant::now(),
+                recent_output: Vec::new(),
+            },
+            BackgroundSubagentActivity {
+                label: "worker".to_string(),
+                thread_id: "agent-2".to_string(),
+                status: "running".to_string(),
+                started_at: Instant::now(),
+                recent_output: Vec::new(),
+            },
+        ]);
         let width = 50;
         let height = footer.desired_height(width);
         let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
@@ -306,12 +408,77 @@ mod tests {
             recent_output: Vec::new(),
         }]);
 
-        let detail = footer.detail_lines().join("\n");
+        let detail = footer.detail_lines(0).join("\n");
 
         assert!(detail.contains("cargo test"));
         assert!(detail.contains("shell id: 1000"));
         assert!(detail.contains("status: running"));
         assert!(detail.contains("runtime:"));
         assert!(!detail.contains("output:"));
+    }
+
+    #[test]
+    fn detail_lines_include_background_command_output() {
+        let mut footer = UnifiedExecFooter::new();
+        footer.set_processes(vec![CommandActivity {
+            command: "npm run dev".to_string(),
+            shell_id: "1000".to_string(),
+            run_mode: Some(ExecCommandRunMode::Background),
+            started_at: Instant::now(),
+            status: "running".to_string(),
+            recent_output: vec![
+                "ready on http://localhost:3000".to_string(),
+                "compiled successfully".to_string(),
+            ],
+        }]);
+
+        let detail = footer.detail_lines(0).join("\n");
+
+        assert!(detail.contains("npm run dev"));
+        assert!(detail.contains("shell id: 1000"));
+        assert!(detail.contains("status: running"));
+        assert!(detail.contains("output:"));
+        assert!(detail.contains("ready on http://localhost:3000"));
+        assert!(detail.contains("compiled successfully"));
+    }
+
+    #[test]
+    fn list_lines_include_selectable_commands_and_subagents() {
+        let mut footer = UnifiedExecFooter::new();
+        footer.set_processes(vec![CommandActivity {
+            command: "cargo test".to_string(),
+            shell_id: "1000".to_string(),
+            run_mode: Some(ExecCommandRunMode::Background),
+            started_at: Instant::now(),
+            status: "running".to_string(),
+            recent_output: Vec::new(),
+        }]);
+        footer.set_subagents(vec![BackgroundSubagentActivity {
+            label: "explorer".to_string(),
+            thread_id: "agent-1".to_string(),
+            status: "running".to_string(),
+            started_at: Instant::now(),
+            recent_output: Vec::new(),
+        }]);
+
+        assert_eq!(
+            footer.list_lines(1),
+            vec![
+                "Background commands".to_string(),
+                "    cargo test [1000](running) · Enter details · k kill".to_string(),
+                String::new(),
+                "Subagents".to_string(),
+                "  > explorer [agent-1](running) · Enter details · k kill".to_string(),
+            ]
+        );
+        assert_eq!(
+            footer.detail_lines(1),
+            vec![
+                "explorer".to_string(),
+                "  thread id: agent-1".to_string(),
+                "  status: running".to_string(),
+                "  runtime: 0s".to_string(),
+            ]
+        );
     }
 }

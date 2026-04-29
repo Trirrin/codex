@@ -766,6 +766,21 @@ impl AgentControl {
         Some(thread.config_snapshot().await)
     }
 
+    pub(crate) async fn clone_agent_history(
+        &self,
+        agent_id: ThreadId,
+    ) -> CodexResult<Vec<ResponseItem>> {
+        let state = self.upgrade()?;
+        let thread = state.get_thread(agent_id).await?;
+        Ok(thread
+            .codex
+            .session
+            .clone_history()
+            .await
+            .raw_items()
+            .to_vec())
+    }
+
     pub(crate) async fn resolve_agent_reference(
         &self,
         _current_thread_id: ThreadId,

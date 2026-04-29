@@ -7,8 +7,6 @@ expression: normalized_backend_snapshot(terminal.backend())
 "                                                                                "
 "• Running (0s · 10 tokens • esc to interrupt)                                   "
 "                                                                                "
-"                                                                                "
 "› Ask Codex to do anything                                                      "
-"                                                                                "
 "  gpt-5.5 default · /tmp/project                                                "
 "  1 background command running · Enter details · k kill                         "

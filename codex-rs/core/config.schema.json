@@ -2211,6 +2211,11 @@
           "description": "Enable animations (welcome screen, shimmer effects, spinners). Defaults to `true`.",
           "type": "boolean"
         },
+        "compact_explored_tools": {
+          "default": true,
+          "description": "Collapse explored read/search/list tool groups into a single count summary. Defaults to `true`.",
+          "type": "boolean"
+        },
         "model_availability_nux": {
           "allOf": [
             {

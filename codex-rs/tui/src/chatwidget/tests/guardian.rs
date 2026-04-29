@@ -158,6 +158,12 @@ async fn guardian_approved_exec_renders_approved_request() {
             },
         }),
     });
+    let begin = begin_exec(
+        &mut chat,
+        "guardian-approved-target",
+        "rm -f /tmp/guardian-approved.sqlite",
+    );
+    end_exec(&mut chat, begin, "", "", 0);
 
     let width: u16 = 120;
     let ui_height: u16 = chat.desired_height(width);
