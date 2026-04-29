@@ -1,7 +1,9 @@
 use super::*;
+use codex_protocol::protocol::ToolCallInputDeltaEvent;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::broadcast;
 
 #[tokio::test]
 async fn exec_approval_emits_proposed_command_and_decision_history() {
@@ -526,6 +528,72 @@ async fn tool_call_content_contributes_to_timed_status_tokens() {
 }
 
 #[tokio::test]
+async fn streamed_tool_call_input_updates_timed_status_tokens_immediately() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+    let (draw_tx, mut draw_rx) = broadcast::channel(1);
+    chat.frame_requester = crate::tui::FrameRequester::new(draw_tx);
+
+    chat.handle_codex_event(Event {
+        id: "tool-delta".to_string(),
+        msg: EventMsg::ToolCallInputDelta(ToolCallInputDeltaEvent {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "item-1".to_string(),
+            call_id: Some("call-1".to_string()),
+            delta: "abcdefgh".to_string(),
+        }),
+    });
+
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible");
+    assert_eq!(status.estimated_output_tokens(), Some(2));
+    tokio::time::timeout(Duration::from_millis(100), draw_rx.recv())
+        .await
+        .expect("expected streamed tool input to request a redraw")
+        .expect("draw channel should stay open");
+}
+
+#[tokio::test]
+async fn streamed_tool_call_input_is_not_counted_again_on_completed_request() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+
+    chat.handle_codex_event(Event {
+        id: "tool-delta".to_string(),
+        msg: EventMsg::ToolCallInputDelta(ToolCallInputDeltaEvent {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "item-1".to_string(),
+            call_id: Some("dynamic-write".to_string()),
+            delta: "abcdefgh".to_string(),
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "dynamic-write".to_string(),
+        msg: EventMsg::DynamicToolCallRequest(
+            codex_protocol::dynamic_tools::DynamicToolCallRequest {
+                call_id: "dynamic-write".to_string(),
+                turn_id: "turn-1".to_string(),
+                namespace: None,
+                tool: "w".to_string(),
+                arguments: serde_json::json!({
+                    "cmd": "x".repeat(400),
+                }),
+            },
+        ),
+    });
+
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible");
+    assert_eq!(status.estimated_output_tokens(), Some(3));
+}
+
+#[tokio::test]
 async fn unified_exec_begin_restores_working_status_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -862,7 +930,7 @@ async fn blocking_unified_exec_with_process_id_shows_output() {
 }
 
 #[tokio::test]
-async fn overlapping_blocking_unified_exec_keeps_first_cell_live() {
+async fn overlapping_blocking_unified_exec_displays_all_running_cells() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();
 
@@ -899,11 +967,12 @@ async fn overlapping_blocking_unified_exec_keeps_first_cell_live() {
             .map(|lines| lines_to_single_string(lines))
             .collect::<Vec<_>>()
     );
-    let first_live = active_blob(&chat);
+    let both_live = active_blob(&chat);
     assert!(
-        first_live.contains("• Running printf 'first start\\…")
-            && first_live.contains("first start"),
-        "expected first command to stay live and keep output: {first_live:?}"
+        both_live.contains("• Running printf 'first start\\…")
+            && both_live.contains("first start")
+            && both_live.contains("• Running printf 'second start…"),
+        "expected both blocking commands to render as live: {both_live:?}"
     );
 
     end_exec(
@@ -914,17 +983,17 @@ async fn overlapping_blocking_unified_exec_keeps_first_cell_live() {
         /*exit_code*/ 0,
     );
     let cells = drain_insert_history(&mut rx);
-    assert_eq!(cells.len(), 1, "second completion should render separately");
-    let second_blob = lines_to_single_string(&cells[0]);
     assert!(
-        second_blob.contains("• Ran printf 'second start…") && second_blob.contains("second done"),
-        "expected second command to render completed: {second_blob:?}"
+        cells.is_empty(),
+        "second completion should update the active grouped cell, not immutable history"
     );
-    let first_still_live = active_blob(&chat);
+    let first_live_second_done = active_blob(&chat);
     assert!(
-        first_still_live.contains("• Running printf 'first start\\…")
-            && first_still_live.contains("first start"),
-        "first command should still be live after second completes: {first_still_live:?}"
+        first_live_second_done.contains("• Running printf 'first start\\…")
+            && first_live_second_done.contains("first start")
+            && first_live_second_done.contains("• Ran printf 'second start…")
+            && first_live_second_done.contains("second done"),
+        "expected second command to complete while first stays live: {first_live_second_done:?}"
     );
 
     end_exec(
@@ -934,10 +1003,13 @@ async fn overlapping_blocking_unified_exec_keeps_first_cell_live() {
         "",
         /*exit_code*/ 0,
     );
-    let first_done = active_blob(&chat);
+    let all_done = active_blob(&chat);
     assert!(
-        first_done.contains("• Ran printf 'first start\\…") && first_done.contains("first done"),
-        "expected first command to complete in place: {first_done:?}"
+        all_done.contains("• Ran printf 'first start\\…")
+            && all_done.contains("first done")
+            && all_done.contains("• Ran printf 'second start…")
+            && all_done.contains("second done"),
+        "expected both commands to complete in place: {all_done:?}"
     );
 }
 
@@ -1215,7 +1287,43 @@ async fn background_shell_exit_removes_footer_even_before_initial_end_is_handled
 }
 
 #[tokio::test]
-async fn background_shell_exit_wakes_idle_model() {
+async fn background_shell_fast_exit_without_process_id_removes_footer() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+
+    let begin =
+        begin_unified_exec_startup(&mut chat, "call-background-fast", "12345", "printf done");
+    assert_eq!(chat.unified_exec_processes.len(), 1);
+
+    chat.handle_codex_event(Event {
+        id: "background-fast-exit".into(),
+        msg: EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+            call_id: begin.call_id,
+            process_id: None,
+            turn_id: begin.turn_id,
+            command: begin.command,
+            cwd: begin.cwd,
+            parsed_cmd: begin.parsed_cmd,
+            source: begin.source,
+            interaction_input: begin.interaction_input,
+            stdout: "done\n".to_string(),
+            stderr: String::new(),
+            aggregated_output: "done\n".to_string(),
+            exit_code: 0,
+            duration: std::time::Duration::from_millis(5),
+            formatted_output: "done\n".to_string(),
+            status: CoreExecCommandStatus::Completed,
+        }),
+    });
+
+    assert!(
+        chat.unified_exec_processes.is_empty(),
+        "completed background command with no live process id must clear the footer row"
+    );
+}
+
+#[tokio::test]
+async fn background_shell_exit_does_not_submit_tui_hidden_model_notification() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
     chat.on_task_started();
@@ -1243,80 +1351,9 @@ async fn background_shell_exit_wakes_idle_model() {
     end_exec(&mut chat, begin, "done\n", "", /*exit_code*/ 7);
     assert!(
         drain_insert_history(&mut rx).is_empty(),
-        "background shell exit wake-up must not render a user-visible message"
-    );
-
-    let wake_up_text = "Background shell 12345 exited with code 7.\nCommand: printf done\n\nUse read_shell_output with shell_id 12345 if you need the final output.";
-    match next_submit_op(&mut op_rx) {
-        Op::UserTurn { items, .. } => assert_eq!(
-            items,
-            vec![UserInput::Text {
-                text: wake_up_text.to_string(),
-                text_elements: Vec::new(),
-            }]
-        ),
-        other => panic!("expected shell exit wake-up user turn, got {other:?}"),
-    }
-
-    complete_user_message_for_inputs(
-        &mut chat,
-        "hidden-shell-exit-idle",
-        vec![UserInput::Text {
-            text: wake_up_text.to_string(),
-            text_elements: Vec::new(),
-        }],
-    );
-    assert!(
-        drain_insert_history(&mut rx).is_empty(),
-        "committed hidden shell exit message must stay out of history"
-    );
-}
-
-#[tokio::test]
-async fn background_shell_exit_notifies_running_model() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.thread_id = Some(ThreadId::new());
-    chat.on_task_started();
-
-    let begin = begin_unified_exec_startup(
-        &mut chat,
-        "call-background-exit-running",
-        "12345",
-        "printf done",
-    );
-    end_exec(&mut chat, begin.clone(), "", "", /*exit_code*/ 0);
-    assert_no_submit_op(&mut op_rx);
-
-    end_exec(&mut chat, begin, "done\n", "", /*exit_code*/ 0);
-    assert!(
-        drain_insert_history(&mut rx).is_empty(),
         "background shell exit notification must not render a user-visible message"
     );
-
-    let notification_text = "Background shell 12345 exited with code 0.\nCommand: printf done\n\nUse read_shell_output with shell_id 12345 if you need the final output.";
-    match next_submit_op(&mut op_rx) {
-        Op::UserTurn { items, .. } => assert_eq!(
-            items,
-            vec![UserInput::Text {
-                text: notification_text.to_string(),
-                text_elements: Vec::new(),
-            }]
-        ),
-        other => panic!("expected shell exit notification user turn, got {other:?}"),
-    }
-
-    complete_user_message_for_inputs(
-        &mut chat,
-        "hidden-shell-exit-running",
-        vec![UserInput::Text {
-            text: notification_text.to_string(),
-            text_elements: Vec::new(),
-        }],
-    );
-    assert!(
-        drain_insert_history(&mut rx).is_empty(),
-        "committed hidden shell exit steer must stay out of history"
-    );
+    assert_no_submit_op(&mut op_rx);
 }
 
 #[tokio::test]
@@ -2287,8 +2324,8 @@ async fn apply_patch_events_emit_history_cells() {
     assert!(!cells.is_empty(), "expected apply block cell to be sent");
     let blob = lines_to_single_string(cells.last().unwrap());
     assert!(
-        blob.contains("Added foo.txt") || blob.contains("Edited foo.txt"),
-        "expected single-file header with filename (Added/Edited): {blob:?}"
+        blob.contains("Written foo.txt") || blob.contains("Edited foo.txt"),
+        "expected single-file header with filename (Written/Edited): {blob:?}"
     );
 
     // 3) End apply success -> success cell
@@ -2363,7 +2400,7 @@ async fn apply_patch_manual_approval_adjusts_header() {
     assert!(!cells.is_empty(), "expected apply block cell to be sent");
     let blob = lines_to_single_string(cells.last().unwrap());
     assert!(
-        blob.contains("Added foo.txt") || blob.contains("Edited foo.txt"),
+        blob.contains("Written foo.txt") || blob.contains("Edited foo.txt"),
         "expected apply summary header for foo.txt: {blob:?}"
     );
 }

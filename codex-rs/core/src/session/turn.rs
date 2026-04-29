@@ -93,6 +93,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::PlanDeltaEvent;
 use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
+use codex_protocol::protocol::ToolCallInputDeltaEvent;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -1526,6 +1527,7 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
         | EventMsg::HookCompleted(_)
         | EventMsg::AgentMessageContentDelta(_)
         | EventMsg::PlanDelta(_)
+        | EventMsg::ToolCallInputDelta(_)
         | EventMsg::ReasoningContentDelta(_)
         | EventMsg::ReasoningRawContentDelta(_)
         | EventMsg::CollabAgentSpawnBegin(_)
@@ -1882,6 +1884,7 @@ async fn try_run_sampling_request(
         String,
         Box<dyn ToolArgumentDiffConsumer>,
     )> = None;
+    let mut tool_call_ids_by_item_id: HashMap<String, String> = HashMap::new();
     let mut should_emit_turn_diff = false;
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
@@ -2007,6 +2010,21 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::OutputItemAdded(item) => {
+                match &item {
+                    ResponseItem::FunctionCall {
+                        id: Some(item_id),
+                        call_id,
+                        ..
+                    }
+                    | ResponseItem::CustomToolCall {
+                        id: Some(item_id),
+                        call_id,
+                        ..
+                    } => {
+                        tool_call_ids_by_item_id.insert(item_id.clone(), call_id.clone());
+                    }
+                    _ => {}
+                }
                 if let ResponseItem::CustomToolCall { call_id, name, .. } = &item {
                     let tool_name = ToolName::plain(name.as_str());
                     active_tool_argument_diff_consumer = tool_runtime
@@ -2159,15 +2177,30 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::ToolCallInputDelta {
-                item_id: _,
+                item_id,
                 call_id,
                 delta,
             } => {
+                let resolved_call_id = call_id
+                    .clone()
+                    .or_else(|| tool_call_ids_by_item_id.get(&item_id).cloned());
+                sess.send_event(
+                    &turn_context,
+                    EventMsg::ToolCallInputDelta(ToolCallInputDeltaEvent {
+                        thread_id: sess.conversation_id.to_string(),
+                        turn_id: turn_context.sub_id.clone(),
+                        item_id,
+                        call_id: resolved_call_id.clone(),
+                        delta: delta.clone(),
+                    }),
+                )
+                .await;
+
                 let Some((active_call_id, consumer)) = active_tool_argument_diff_consumer.as_mut()
                 else {
                     continue;
                 };
-                let call_id = match call_id {
+                let call_id = match resolved_call_id {
                     Some(call_id) if call_id.as_str() != active_call_id.as_str() => continue,
                     Some(call_id) => call_id,
                     None => active_call_id.clone(),

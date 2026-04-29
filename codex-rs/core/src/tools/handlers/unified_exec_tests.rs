@@ -11,6 +11,7 @@ use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::tempdir;
 
 use crate::session::tests::make_session_and_context;
@@ -255,6 +256,68 @@ fn exec_command_args_resolve_relative_additional_permissions_against_workdir() -
             ..Default::default()
         })
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_wait_recovers_after_exit_watcher_completes_process() -> anyhow::Result<()> {
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let manager = &session.services.unified_exec_manager;
+    let process_id = manager.allocate_process_id().await;
+    let command_text = "printf start; sleep 0.6; printf end";
+    let command = vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        command_text.to_string(),
+    ];
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "blocking-race".to_string(),
+    );
+
+    let response = manager
+        .exec_command(
+            ExecCommandRequest {
+                command,
+                hook_command: command_text.to_string(),
+                process_id,
+                run_mode: ExecCommandRunMode::Blocking,
+                yield_time_ms: 250,
+                max_output_tokens: Some(crate::unified_exec::DEFAULT_MAX_OUTPUT_TOKENS),
+                workdir: None,
+                network: turn.network.clone(),
+                tty: true,
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                additional_permissions: None,
+                additional_permissions_preapproved: false,
+                justification: None,
+                prefix_rule: None,
+            },
+            &context,
+        )
+        .await?;
+    assert_eq!(response.process_id, Some(process_id));
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    let output = wait_for_process_exit(
+        manager,
+        response,
+        crate::unified_exec::DEFAULT_MAX_OUTPUT_TOKENS,
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+    let text = String::from_utf8(output.raw_output)?;
+
+    assert_eq!(output.process_id, None);
+    assert_eq!(output.exit_code, Some(0));
+    assert_eq!(text.matches("start").count(), 1);
+    assert_eq!(text.matches("end").count(), 1);
+
     Ok(())
 }
 

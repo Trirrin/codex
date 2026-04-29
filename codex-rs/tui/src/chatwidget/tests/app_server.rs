@@ -284,7 +284,7 @@ async fn live_app_server_file_change_item_started_preserves_changes() {
     assert!(!cells.is_empty(), "expected patch history to be rendered");
     let transcript = lines_to_single_string(cells.last().expect("patch cell"));
     assert!(
-        transcript.contains("Added foo.txt") || transcript.contains("Edited foo.txt"),
+        transcript.contains("Written foo.txt") || transcript.contains("Edited foo.txt"),
         "expected patch summary to include foo.txt, got: {transcript}"
     );
 }
@@ -948,6 +948,75 @@ async fn live_app_server_background_spawn_completion_notifies_model() {
 }
 
 #[tokio::test]
+async fn background_subagent_turn_completed_removes_footer_activity() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b90000000007").expect("valid thread id");
+    let spawned_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b91781b41a93").expect("valid thread id");
+    chat.thread_id = Some(sender_thread_id);
+    chat.bottom_pane.set_task_running(/*running*/ true);
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: sender_thread_id.to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::CollabAgentToolCall {
+                id: "spawn-background-1".to_string(),
+                tool: AppServerCollabAgentTool::SpawnAgent,
+                status: AppServerCollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![spawned_thread_id.to_string()],
+                prompt: Some("Explore the repo".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                reasoning_effort: Some(ReasoningEffortConfig::High),
+                agents_states: HashMap::from([(
+                    spawned_thread_id.to_string(),
+                    AppServerCollabAgentState {
+                        status: AppServerCollabAgentStatus::Running,
+                        message: None,
+                    },
+                )]),
+                tool_progress: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    let _ = drain_insert_history(&mut rx);
+    assert!(
+        chat.background_collab_agent_ids
+            .contains(&spawned_thread_id)
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::TurnCompleted(TurnCompletedNotification {
+            thread_id: spawned_thread_id.to_string(),
+            turn: AppServerTurn {
+                id: "turn-child-1".to_string(),
+                items: Vec::new(),
+                status: AppServerTurnStatus::Completed,
+                error: None,
+                started_at: Some(0),
+                completed_at: Some(1),
+                duration_ms: Some(1),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    assert!(
+        !chat
+            .background_collab_agent_ids
+            .contains(&spawned_thread_id),
+        "completed background subagent turn must clear the footer row"
+    );
+    assert!(
+        chat.bottom_pane.is_task_running(),
+        "child subagent completion must not finalize the parent task"
+    );
+}
+
+#[tokio::test]
 async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -1007,6 +1076,31 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
 
     assert!(drain_insert_history(&mut rx).is_empty());
     assert!(!chat.bottom_pane.is_task_running());
+}
+
+#[tokio::test]
+async fn live_app_server_tool_call_input_delta_updates_timed_status_tokens_immediately() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+
+    chat.handle_server_notification(
+        ServerNotification::ToolCallInputDelta(
+            codex_app_server_protocol::ToolCallInputDeltaNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "item-1".to_string(),
+                call_id: Some("call-1".to_string()),
+                delta: "abcdefgh".to_string(),
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible");
+    assert_eq!(status.estimated_output_tokens(), Some(2));
 }
 
 #[tokio::test]

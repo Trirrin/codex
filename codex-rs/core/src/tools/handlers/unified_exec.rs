@@ -878,21 +878,49 @@ async fn wait_for_process_exit(
                 yield_time_ms: default_exec_yield_time_ms(),
                 max_output_tokens: Some(max_output_tokens),
             })
-            .await
-            .map_err(|err| {
-                FunctionCallError::RespondToModel(format!("execute blocking wait failed: {err}"))
-            })?;
-        response.raw_output.extend(next.raw_output);
-        response.wall_time += next.wall_time;
+            .await;
+        let (next, full_snapshot) = match next {
+            Ok(next) => (next, false),
+            Err(UnifiedExecError::UnknownProcessId {
+                process_id: err_process_id,
+            }) if err_process_id == process_id => {
+                let snapshot = manager
+                    .read_shell_output(ShellOutputRequest {
+                        process_id,
+                        yield_time_ms: None,
+                        max_output_tokens: Some(max_output_tokens),
+                    })
+                    .await
+                    .map_err(|err| {
+                        FunctionCallError::RespondToModel(format!(
+                            "execute blocking wait failed: {err}"
+                        ))
+                    })?;
+                (snapshot, true)
+            }
+            Err(err) => {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "execute blocking wait failed: {err}"
+                )));
+            }
+        };
+        if full_snapshot {
+            response.raw_output = next.raw_output;
+            response.wall_time = next.wall_time;
+            response.original_token_count = next.original_token_count;
+        } else {
+            response.raw_output.extend(next.raw_output);
+            response.wall_time += next.wall_time;
+            response.original_token_count = response
+                .original_token_count
+                .zip(next.original_token_count)
+                .map(|(left, right)| left + right)
+                .or(response.original_token_count)
+                .or(next.original_token_count);
+        }
         response.exit_code = next.exit_code;
         response.shell_id = next.shell_id.clone();
         response.process_id = next.process_id;
-        response.original_token_count = response
-            .original_token_count
-            .zip(next.original_token_count)
-            .map(|(left, right)| left + right)
-            .or(response.original_token_count)
-            .or(next.original_token_count);
         if let Some(next_process_id) = next.process_id {
             process_id = next_process_id;
         } else {

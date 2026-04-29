@@ -1586,6 +1586,7 @@ pub enum EventMsg {
 
     AgentMessageContentDelta(AgentMessageContentDeltaEvent),
     PlanDelta(PlanDeltaEvent),
+    ToolCallInputDelta(ToolCallInputDeltaEvent),
     ReasoningContentDelta(ReasoningContentDeltaEvent),
     ReasoningRawContentDelta(ReasoningRawContentDeltaEvent),
 
@@ -1969,6 +1970,15 @@ impl HasLegacyEvent for AgentMessageContentDeltaEvent {
             delta: self.delta.clone(),
         })]
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
+pub struct ToolCallInputDeltaEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub call_id: Option<String>,
+    pub delta: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]

@@ -24,6 +24,7 @@ use crate::frames::FRAME_TICK_DEFAULT;
 use crate::key_hint;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::render::renderable::Renderable;
+use crate::shimmer::shimmer_spans;
 use crate::status::format_tokens_compact;
 use crate::text_formatting::capitalize_first;
 use crate::tui::FrameRequester;
@@ -300,7 +301,9 @@ impl Renderable for StatusIndicatorWidget {
             spans.push("•".dim());
         }
         spans.push(" ".into());
-        if !self.header.is_empty() {
+        if self.animations_enabled && !self.is_paused {
+            spans.extend(shimmer_spans(&self.header));
+        } else if !self.header.is_empty() {
             spans.push(self.header.clone().into());
         }
         spans.push(" ".into());

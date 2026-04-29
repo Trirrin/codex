@@ -1405,43 +1405,29 @@ async fn import_plugins_supports_relative_external_agent_plugin_marketplace_path
     assert!(config.contains("enabled = true"));
 }
 
-#[tokio::test]
-async fn import_plugins_infers_claude_official_marketplace_when_missing_from_settings() {
-    let (_root, external_agent_home, codex_home) = fixture_paths();
+#[test]
+fn collect_marketplace_import_sources_infers_claude_official_marketplace_when_missing_from_settings()
+ {
+    let (_root, external_agent_home, _codex_home) = fixture_paths();
     fs::create_dir_all(&external_agent_home).expect("create external agent home");
-    fs::create_dir_all(&codex_home).expect("create codex home");
 
-    fs::write(
-        external_agent_home.join("settings.json"),
+    let settings: JsonValue = serde_json::from_str(
         r#"{
           "enabledPlugins": {
             "sample@claude-plugins-official": true
           }
         }"#,
     )
-    .expect("write settings");
+    .expect("parse settings");
 
-    let outcome = service_for_paths(external_agent_home, codex_home)
-        .import_plugins(
-            /*cwd*/ None,
-            Some(MigrationDetails {
-                plugins: vec![PluginsMigration {
-                    marketplace_name: "claude-plugins-official".to_string(),
-                    plugin_names: vec!["sample".to_string()],
-                }],
-            }),
-        )
-        .await
-        .expect("import plugins");
+    let import_sources = collect_marketplace_import_sources(&settings, &external_agent_home);
 
     assert_eq!(
-        outcome,
-        PluginImportOutcome {
-            succeeded_marketplaces: vec!["claude-plugins-official".to_string()],
-            succeeded_plugin_ids: Vec::new(),
-            failed_marketplaces: Vec::new(),
-            failed_plugin_ids: vec!["sample@claude-plugins-official".to_string()],
-        }
+        import_sources.get("claude-plugins-official"),
+        Some(&MarketplaceImportSource {
+            source: "anthropics/claude-plugins-official".to_string(),
+            ref_name: None,
+        })
     );
 }
 

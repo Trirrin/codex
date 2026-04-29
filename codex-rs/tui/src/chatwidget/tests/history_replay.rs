@@ -761,6 +761,49 @@ async fn replayed_thread_closed_notification_does_not_exit_tui() {
 }
 
 #[tokio::test]
+async fn replayed_completed_explore_commands_coalesce_like_live_run() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.compact_explored_tools = true;
+
+    for (index, name) in ["alpha.rs", "beta.rs", "gamma.rs"].into_iter().enumerate() {
+        let path = format!("/tmp/project/src/{name}");
+        chat.replay_thread_item(
+            AppServerThreadItem::CommandExecution {
+                id: format!("read-{index}"),
+                command: format!("read_file {path}"),
+                cwd: test_path_buf("/tmp/project").abs(),
+                process_id: None,
+                source: AppServerCommandExecutionSource::Agent,
+                run_mode: None,
+                status: AppServerCommandExecutionStatus::Completed,
+                command_actions: vec![AppServerCommandAction::Read {
+                    command: format!("read_file {path}"),
+                    name: name.to_string(),
+                    path: test_path_buf(path.as_str()).abs(),
+                }],
+                aggregated_output: Some(String::new()),
+                exit_code: Some(0),
+                duration_ms: Some(1),
+            },
+            "turn-1".to_string(),
+            ReplayKind::ThreadSnapshot,
+        );
+    }
+
+    let cells = drain_insert_history(&mut rx);
+    assert!(
+        cells.is_empty(),
+        "completed replayed explore calls should stay grouped in the active cell"
+    );
+    let rendered = active_blob(&chat);
+    assert!(
+        rendered.contains("Read 3 files"),
+        "expected replayed explore calls to be grouped, got {rendered:?}"
+    );
+    assert_eq!(rendered.matches("Read 1 file").count(), 0);
+}
+
+#[tokio::test]
 async fn replayed_reasoning_item_hides_raw_reasoning_when_disabled() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.config.show_raw_agent_reasoning = false;

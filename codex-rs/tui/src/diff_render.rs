@@ -191,9 +191,12 @@ struct ResolvedDiffBackgrounds {
     del: Option<Color>,
 }
 
+type InlineHighlightRanges = Vec<Range<usize>>;
+type MatchedBytePairs = Vec<(usize, usize)>;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct InlineDiffHighlight {
-    ranges: Vec<Range<usize>>,
+    ranges: InlineHighlightRanges,
 }
 
 /// Precomputed render state for diff line styling.
@@ -439,7 +442,7 @@ fn render_changes_block(rows: Vec<Row>, wrap_cols: usize, cwd: &Path) -> Vec<RtL
     let mut header_spans: Vec<RtSpan<'static>> = vec!["• ".dim()];
     if let [row] = &rows[..] {
         let verb = match &row.change {
-            FileChange::Add { .. } => "Added",
+            FileChange::Add { .. } => "Written",
             FileChange::Delete { .. } => "Delete",
             _ => "Edited",
         };
@@ -799,23 +802,120 @@ fn inline_diff_highlights_for_hunk(hunk: &Hunk<'_, str>) -> Vec<Option<InlineDif
             idx += 1;
         }
 
-        let delete_count = insert_start - delete_start;
-        let insert_count = idx - insert_start;
-        for offset in 0..delete_count.min(insert_count) {
-            let diffy::Line::Delete(old) = lines[delete_start + offset] else {
-                continue;
-            };
-            let diffy::Line::Insert(new) = lines[insert_start + offset] else {
-                continue;
-            };
+        let deletes = change_block_delete_texts(&lines[delete_start..insert_start]);
+        let inserts = change_block_insert_texts(&lines[insert_start..idx]);
+        for (delete_offset, insert_offset) in change_line_pairs(&deletes, &inserts) {
             let (old_highlight, new_highlight) =
-                inline_diff_highlight_pair(old.trim_end_matches('\n'), new.trim_end_matches('\n'));
-            highlights[delete_start + offset] = old_highlight;
-            highlights[insert_start + offset] = new_highlight;
+                inline_diff_highlight_pair(deletes[delete_offset], inserts[insert_offset]);
+            highlights[delete_start + delete_offset] = old_highlight;
+            highlights[insert_start + insert_offset] = new_highlight;
         }
     }
 
     highlights
+}
+
+fn change_block_delete_texts<'a>(lines: &[diffy::Line<'a, str>]) -> Vec<&'a str> {
+    lines
+        .iter()
+        .filter_map(|line| match line {
+            diffy::Line::Delete(text) => Some(text.trim_end_matches('\n')),
+            diffy::Line::Context(_) | diffy::Line::Insert(_) => None,
+        })
+        .collect()
+}
+
+fn change_block_insert_texts<'a>(lines: &[diffy::Line<'a, str>]) -> Vec<&'a str> {
+    lines
+        .iter()
+        .filter_map(|line| match line {
+            diffy::Line::Insert(text) => Some(text.trim_end_matches('\n')),
+            diffy::Line::Context(_) | diffy::Line::Delete(_) => None,
+        })
+        .collect()
+}
+
+fn change_line_pairs(deletes: &[&str], inserts: &[&str]) -> Vec<(usize, usize)> {
+    let anchors = equal_trimmed_line_pairs(deletes, inserts);
+    if anchors.is_empty() {
+        return offset_line_pairs(0, deletes.len(), 0, inserts.len());
+    }
+
+    let mut pairs = Vec::new();
+    let mut delete_start = 0;
+    let mut insert_start = 0;
+    for (delete_anchor, insert_anchor) in anchors {
+        pairs.extend(offset_line_pairs(
+            delete_start,
+            delete_anchor,
+            insert_start,
+            insert_anchor,
+        ));
+        pairs.push((delete_anchor, insert_anchor));
+        delete_start = delete_anchor + 1;
+        insert_start = insert_anchor + 1;
+    }
+    pairs.extend(offset_line_pairs(
+        delete_start,
+        deletes.len(),
+        insert_start,
+        inserts.len(),
+    ));
+    pairs
+}
+
+fn offset_line_pairs(
+    delete_start: usize,
+    delete_end: usize,
+    insert_start: usize,
+    insert_end: usize,
+) -> Vec<(usize, usize)> {
+    let count = (delete_end - delete_start).min(insert_end - insert_start);
+    (0..count)
+        .map(|offset| (delete_start + offset, insert_start + offset))
+        .collect()
+}
+
+fn equal_trimmed_line_pairs(deletes: &[&str], inserts: &[&str]) -> Vec<(usize, usize)> {
+    let insert_len = inserts.len();
+    let mut dp = vec![0; (deletes.len() + 1) * (insert_len + 1)];
+    for delete_idx in (0..deletes.len()).rev() {
+        for insert_idx in (0..inserts.len()).rev() {
+            let idx = delete_idx * (insert_len + 1) + insert_idx;
+            dp[idx] = if normalized_change_line(deletes[delete_idx])
+                == normalized_change_line(inserts[insert_idx])
+            {
+                dp[(delete_idx + 1) * (insert_len + 1) + insert_idx + 1] + 1
+            } else {
+                dp[(delete_idx + 1) * (insert_len + 1) + insert_idx]
+                    .max(dp[delete_idx * (insert_len + 1) + insert_idx + 1])
+            };
+        }
+    }
+
+    let mut pairs = Vec::new();
+    let mut delete_idx = 0;
+    let mut insert_idx = 0;
+    while delete_idx < deletes.len() && insert_idx < inserts.len() {
+        if normalized_change_line(deletes[delete_idx])
+            == normalized_change_line(inserts[insert_idx])
+        {
+            pairs.push((delete_idx, insert_idx));
+            delete_idx += 1;
+            insert_idx += 1;
+        } else if dp[(delete_idx + 1) * (insert_len + 1) + insert_idx]
+            >= dp[delete_idx * (insert_len + 1) + insert_idx + 1]
+        {
+            delete_idx += 1;
+        } else {
+            insert_idx += 1;
+        }
+    }
+    pairs
+}
+
+fn normalized_change_line(line: &str) -> &str {
+    line.trim_start()
 }
 
 fn inline_diff_highlight_pair(
@@ -829,13 +929,14 @@ fn inline_diff_highlight_pair(
     let old_chars = indexed_chars(old);
     let new_chars = indexed_chars(new);
     let too_large = old_chars.len().saturating_mul(new_chars.len()) > MAX_INLINE_DIFF_CHARS.pow(2);
-    let (old_ranges, new_ranges) = if too_large {
-        prefix_suffix_inline_ranges(old, new)
+    let (old_ranges, new_ranges, matched_byte_pairs) = if too_large {
+        let (old_ranges, new_ranges) = prefix_suffix_inline_ranges(old, new);
+        (old_ranges, new_ranges, Vec::new())
     } else {
         lcs_inline_ranges(old, new, &old_chars, &new_chars)
     };
-    let old_ranges = expand_ranges_to_words(old, &old_ranges);
-    let new_ranges = expand_ranges_to_words(new, &new_ranges);
+    let (old_ranges, new_ranges) =
+        expand_ranges_to_paired_words(old, new, &old_ranges, &new_ranges, &matched_byte_pairs);
 
     (
         InlineDiffHighlight::from_ranges(old_ranges),
@@ -844,7 +945,7 @@ fn inline_diff_highlight_pair(
 }
 
 impl InlineDiffHighlight {
-    fn from_ranges(ranges: Vec<Range<usize>>) -> Option<Self> {
+    fn from_ranges(ranges: InlineHighlightRanges) -> Option<Self> {
         (!ranges.is_empty()).then_some(Self { ranges })
     }
 }
@@ -858,7 +959,11 @@ fn lcs_inline_ranges(
     new: &str,
     old_chars: &[(usize, char)],
     new_chars: &[(usize, char)],
-) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+) -> (
+    InlineHighlightRanges,
+    InlineHighlightRanges,
+    MatchedBytePairs,
+) {
     let new_len = new_chars.len();
     let mut dp = vec![0; (old_chars.len() + 1) * (new_len + 1)];
     for old_idx in (0..old_chars.len()).rev() {
@@ -892,9 +997,16 @@ fn lcs_inline_ranges(
         }
     }
 
+    let matched_byte_pairs = matched_old
+        .iter()
+        .zip(&matched_new)
+        .map(|(&old_idx, &new_idx)| (old_chars[old_idx].0, new_chars[new_idx].0))
+        .collect();
+
     (
         changed_ranges_between_matches(old, old_chars, &matched_old),
         changed_ranges_between_matches(new, new_chars, &matched_new),
+        matched_byte_pairs,
     )
 }
 
@@ -916,6 +1028,57 @@ fn changed_ranges_between_matches(
         ranges.push(cursor..text.len());
     }
     ranges
+}
+
+fn expand_ranges_to_paired_words(
+    old: &str,
+    new: &str,
+    old_ranges: &[Range<usize>],
+    new_ranges: &[Range<usize>],
+    matched_byte_pairs: &[(usize, usize)],
+) -> (InlineHighlightRanges, InlineHighlightRanges) {
+    let old_words = word_ranges(old);
+    let new_words = word_ranges(new);
+    let base_old = expand_ranges_to_words(old, old_ranges);
+    let base_new = expand_ranges_to_words(new, new_ranges);
+    let mut extra_old = Vec::new();
+    let mut extra_new = Vec::new();
+
+    for &(old_byte, new_byte) in matched_byte_pairs {
+        let old_word = word_range_containing_byte(&old_words, old_byte);
+        let new_word = word_range_containing_byte(&new_words, new_byte);
+        if let (Some(old_word), Some(new_word)) = (old_word, new_word) {
+            let old_is_highlighted = range_overlaps_any(old_word, &base_old);
+            let new_is_highlighted = range_overlaps_any(new_word, &base_new);
+            if old_is_highlighted && !new_is_highlighted {
+                extra_new.push(new_word.clone());
+            }
+            if new_is_highlighted && !old_is_highlighted {
+                extra_old.push(old_word.clone());
+            }
+        }
+    }
+
+    let mut expanded_old = base_old;
+    let mut expanded_new = base_new;
+    expanded_old.extend(extra_old);
+    expanded_new.extend(extra_new);
+    (merge_ranges(expanded_old), merge_ranges(expanded_new))
+}
+
+fn word_range_containing_byte(
+    word_ranges: &[Range<usize>],
+    byte_idx: usize,
+) -> Option<&Range<usize>> {
+    word_ranges
+        .iter()
+        .find(|range| range.start <= byte_idx && byte_idx < range.end)
+}
+
+fn range_overlaps_any(range: &Range<usize>, ranges: &[Range<usize>]) -> bool {
+    ranges
+        .iter()
+        .any(|candidate| ranges_overlap(range, candidate))
 }
 
 fn expand_ranges_to_words(text: &str, ranges: &[Range<usize>]) -> Vec<Range<usize>> {
@@ -1986,6 +2149,17 @@ mod tests {
             .expect("line with content")
     }
 
+    fn range_for_text(line: &str, needle: &str) -> Range<usize> {
+        let start = line.find(needle).expect("needle in line");
+        start..start + needle.len()
+    }
+
+    fn range_is_highlighted(ranges: &[Range<usize>], range: &Range<usize>) -> bool {
+        ranges
+            .iter()
+            .any(|candidate| ranges_overlap(candidate, range))
+    }
+
     #[test]
     fn inline_diff_highlight_pair_marks_changed_character_ranges() {
         let (old, new) = inline_diff_highlight_pair("a b c", "a e c");
@@ -2008,6 +2182,87 @@ mod tests {
         assert_eq!(old_ranges[0], 0.."before".len());
         assert_eq!(new_ranges.len(), 1);
         assert_eq!(new_ranges[0], 0.."after".len());
+    }
+
+    #[test]
+    fn inline_diff_highlight_pair_marks_old_word_when_new_word_extends_it() {
+        let (old, new) = inline_diff_highlight_pair(
+            "let call_id = match call_id {",
+            "let call_id = match resolved_call_id {",
+        );
+
+        let old_ranges = old.expect("old highlight").ranges;
+        let new_ranges = new.expect("new highlight").ranges;
+        let old_changed_word = "let call_id = match ".len().."let call_id = match call_id".len();
+        let new_changed_word =
+            "let call_id = match ".len().."let call_id = match resolved_call_id".len();
+        assert!(old_ranges.contains(&old_changed_word));
+        assert!(new_ranges.contains(&new_changed_word));
+    }
+
+    #[test]
+    fn inline_diff_highlight_pair_does_not_cascade_to_unrelated_shared_words() {
+        let old = "foo call_id tail";
+        let new = "foo resolved_call_id tail";
+        let (old_highlight, new_highlight) = inline_diff_highlight_pair(old, new);
+        let old_ranges = old_highlight.expect("old highlight").ranges;
+        let new_ranges = new_highlight.expect("new highlight").ranges;
+
+        assert!(!range_is_highlighted(
+            &old_ranges,
+            &range_for_text(old, "foo")
+        ));
+        assert!(!range_is_highlighted(
+            &new_ranges,
+            &range_for_text(new, "foo")
+        ));
+        assert!(!range_is_highlighted(
+            &old_ranges,
+            &range_for_text(old, "tail")
+        ));
+        assert!(!range_is_highlighted(
+            &new_ranges,
+            &range_for_text(new, "tail")
+        ));
+    }
+
+    #[test]
+    fn change_line_pairs_aligns_inserted_argument_without_offset_drift() {
+        let deletes = vec![
+            "                let trimmed_output = Self::truncate_lines_middle(",
+            "                    display_limit,",
+            "                    width,",
+            "                    raw_output.omitted,",
+            "                    Some(Line::from(",
+            "                        Span::from(layout.output_block.subsequent_prefix).dim(),",
+            "                    )),",
+            "                );",
+        ];
+        let inserts = vec![
+            "                    let trimmed_output = Self::truncate_lines_middle(",
+            "                        &prefixed_output,",
+            "                        display_limit,",
+            "                        width,",
+            "                        raw_output.omitted,",
+            "                        Some(Line::from(",
+            "                            Span::from(layout.output_block.subsequent_prefix).dim(),",
+            "                        )),",
+            "                    );",
+        ];
+
+        assert_eq!(
+            change_line_pairs(&deletes, &inserts),
+            vec![
+                (0, 0),
+                (1, 2),
+                (2, 3),
+                (3, 4),
+                (4, 5),
+                (5, 6),
+                (6, 7),
+                (7, 8)
+            ]
+        );
     }
 
     fn inline_replacement_lines() -> Vec<RtLine<'static>> {

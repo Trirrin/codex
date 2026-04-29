@@ -6376,6 +6376,62 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     ));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_shell_exit_notification_is_model_visible_but_not_user_visible() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let input = vec![UserInput::Text {
+        text: "hello".to_string(),
+        text_elements: Vec::new(),
+    }];
+    sess.spawn_task(
+        Arc::clone(&tc),
+        input,
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    sess.notify_background_shell_exit(12345, "printf done".to_string(), 7)
+        .await;
+    sess.on_task_finished(Arc::clone(&tc), /*last_agent_message*/ None)
+        .await;
+
+    let history = sess.clone_history().await;
+    let notification = history.raw_items().iter().find_map(|item| match item {
+        ResponseItem::Message { role, content, .. } if role == "user" => {
+            let [ContentItem::InputText { text }] = content.as_slice() else {
+                return None;
+            };
+            text.contains("<background_shell_notification>")
+                .then_some(text)
+        }
+        _ => None,
+    });
+    let Some(notification) = notification else {
+        panic!("expected background shell notification in model history");
+    };
+    assert!(notification.contains("\"shell_id\":12345"));
+    assert!(notification.contains("\"command\":\"printf done\""));
+    assert!(notification.contains("\"exit_code\":7"));
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected raw response item event")
+        .expect("channel open");
+    assert!(matches!(first.msg, EventMsg::RawResponseItem(_)));
+
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected turn complete event")
+        .expect("channel open");
+    assert!(matches!(second.msg, EventMsg::TurnComplete(_)));
+    assert!(rx.try_recv().is_err());
+}
+
 #[tokio::test]
 async fn steer_input_requires_active_turn() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;

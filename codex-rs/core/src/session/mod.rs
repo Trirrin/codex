@@ -23,6 +23,7 @@ use crate::context::ApprovedCommandPrefixSaved;
 use crate::context::AppsInstructions;
 use crate::context::AvailablePluginsInstructions;
 use crate::context::AvailableSkillsInstructions;
+use crate::context::BackgroundShellNotification;
 use crate::context::CollaborationModeInstructions;
 use crate::context::ContextualUserFragment;
 use crate::context::NetworkRuleSaved;
@@ -2891,6 +2892,26 @@ impl Session {
             message: message.into(),
         });
         self.send_event(turn_context, event).await;
+    }
+
+    pub(crate) async fn notify_background_shell_exit(
+        self: &Arc<Self>,
+        shell_id: i32,
+        command: String,
+        exit_code: i32,
+    ) {
+        let notification = BackgroundShellNotification::new(shell_id, command, exit_code);
+        let item = ResponseInputItem::Message {
+            role: BackgroundShellNotification::ROLE.to_string(),
+            content: vec![ContentItem::InputText {
+                text: notification.render(),
+            }],
+        };
+
+        if let Err(items) = self.inject_response_items(vec![item]).await {
+            self.queue_response_items_for_next_turn(items).await;
+            self.maybe_start_turn_for_pending_work().await;
+        }
     }
 
     pub(crate) async fn notify_stream_error(

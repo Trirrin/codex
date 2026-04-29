@@ -1194,6 +1194,8 @@ pub(crate) struct ChatWidget {
     plan_item_active: bool,
     // Estimated model output for the active turn, counted as streamed characters / 4.
     output_chars_this_turn: usize,
+    // Tool calls whose arguments were already counted from streamed input deltas.
+    streamed_tool_call_input_ids: HashSet<String>,
     // Status-indicator elapsed seconds captured at the last emitted final-message separator.
     //
     // This lets the separator show per-chunk work time (since the previous separator) rather than
@@ -1796,18 +1798,23 @@ enum SessionConfiguredDisplay {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ThreadItemRenderSource {
     Live,
-    Replay(ReplayKind),
+    ReplayTurn(ReplayKind),
+    ReplayEvent(ReplayKind),
 }
 
 impl ThreadItemRenderSource {
     fn is_replay(self) -> bool {
-        matches!(self, Self::Replay(_))
+        !matches!(self, Self::Live)
+    }
+
+    fn is_turn_replay(self) -> bool {
+        matches!(self, Self::ReplayTurn(_))
     }
 
     fn replay_kind(self) -> Option<ReplayKind> {
         match self {
             Self::Live => None,
-            Self::Replay(replay_kind) => Some(replay_kind),
+            Self::ReplayTurn(replay_kind) | Self::ReplayEvent(replay_kind) => Some(replay_kind),
         }
     }
 }
@@ -3182,6 +3189,7 @@ impl ChatWidget {
             self.output_chars_this_turn
                 .div_ceil(ESTIMATED_CHARS_PER_OUTPUT_TOKEN),
         ));
+        self.request_redraw();
     }
 
     fn record_model_output_json(&mut self, value: &impl serde::Serialize) {
@@ -3193,6 +3201,16 @@ impl ChatWidget {
             Ok(serialized) => self.record_model_output_delta(&serialized),
             Err(err) => warn!("failed to estimate model output tokens from JSON value: {err}"),
         }
+    }
+    fn record_model_output_json_once_for_tool_call(
+        &mut self,
+        call_id: &str,
+        value: &impl serde::Serialize,
+    ) {
+        if self.streamed_tool_call_input_ids.contains(call_id) {
+            return;
+        }
+        self.record_model_output_json(value);
     }
 
     fn on_agent_reasoning_final(&mut self) {
@@ -3234,6 +3252,7 @@ impl ChatWidget {
         self.plan_item_active = false;
         self.output_chars_this_turn = 0;
         self.adaptive_chunking.reset();
+        self.streamed_tool_call_input_ids.clear();
         self.plan_stream_controller = None;
         self.clear_model_activities();
         self.turn_runtime_metrics = RuntimeMetricsSummary::default();
@@ -3329,6 +3348,7 @@ impl ChatWidget {
         self.goal_status_active_turn_started_at = None;
         self.output_chars_this_turn = 0;
         self.bottom_pane.set_estimated_output_tokens(None);
+        self.streamed_tool_call_input_ids.clear();
         self.turn_sleep_inhibitor
             .set_turn_running(/*turn_running*/ false);
         self.update_task_running_state();
@@ -4834,7 +4854,7 @@ impl ChatWidget {
     }
 
     fn on_patch_apply_begin(&mut self, event: PatchApplyBeginEvent) {
-        self.record_model_output_json(&event.changes);
+        self.record_model_output_json_once_for_tool_call(&event.call_id, &event.changes);
         self.upsert_model_activity(event.call_id.clone(), vec![ModelActivityKind::Writing]);
         self.add_to_history(history_cell::new_patch_event(
             event.changes,
@@ -4844,7 +4864,7 @@ impl ChatWidget {
 
     fn on_view_image_tool_call(&mut self, event: ViewImageToolCallEvent) {
         self.flush_answer_stream_with_separator();
-        self.record_model_output_json(&event.path);
+        self.record_model_output_json_once_for_tool_call(&event.call_id, &event.path);
         self.add_to_history(history_cell::new_view_image_tool_call(
             event.path,
             &self.config.cwd,
@@ -4902,32 +4922,8 @@ impl ChatWidget {
             {
                 self.flush_unified_exec_wait_streak();
             }
-            let shell_exit_message = ev.process_id.as_deref().and_then(|shell_id| {
-                let process = self
-                    .unified_exec_processes
-                    .iter()
-                    .find(|process| process.key == shell_id)?;
-                let initial_background_response = self
-                    .background_unified_exec_call_ids
-                    .contains(&ev.call_id)
-                    && process.call_id == ev.call_id
-                    && matches!(process.run_mode, Some(ExecCommandRunMode::Background));
-                if ev.source != ExecCommandSource::UnifiedExecStartup
-                    || !matches!(process.run_mode, Some(ExecCommandRunMode::Background))
-                    || initial_background_response
-                {
-                    return None;
-                }
-                Some(format!(
-                    "Background shell {shell_id} exited with code {}.\nCommand: {}\n\nUse read_shell_output with shell_id {shell_id} if you need the final output.",
-                    ev.exit_code, process.command_display
-                ))
-            });
             let task_was_running = self.bottom_pane.is_task_running();
             self.track_unified_exec_process_end(&ev);
-            if let Some(message) = shell_exit_message {
-                self.submit_hidden_user_message(message);
-            }
             if !task_was_running {
                 return;
             }
@@ -4971,22 +4967,28 @@ impl ChatWidget {
         if ev.source != ExecCommandSource::UnifiedExecStartup {
             return;
         }
-        let key = ev.process_id.clone().unwrap_or(ev.call_id.to_string());
         let is_initial_background_tool_response =
             self.background_unified_exec_call_ids.remove(&ev.call_id)
-                && self.unified_exec_processes.iter().any(|process| {
-                    process.key == key
-                        && process.call_id == ev.call_id
-                        && matches!(process.run_mode, Some(ExecCommandRunMode::Background))
+                && ev.process_id.as_ref().is_some_and(|key| {
+                    self.unified_exec_processes.iter().any(|process| {
+                        process.key == key.as_str()
+                            && process.call_id == ev.call_id
+                            && matches!(process.run_mode, Some(ExecCommandRunMode::Background))
+                    })
                 });
         if is_initial_background_tool_response {
             return;
         }
-        self.unified_exec_interaction_call_ids
-            .retain(|_, process_id| process_id != &key);
+        if let Some(key) = ev.process_id.as_ref() {
+            self.unified_exec_interaction_call_ids
+                .retain(|_, process_id| process_id != key);
+        }
         let before = self.unified_exec_processes.len();
         self.unified_exec_processes
-            .retain(|process| process.key != key);
+            .retain(|process| match ev.process_id.as_ref() {
+                Some(key) => process.key != key.as_str(),
+                None => process.call_id != ev.call_id,
+            });
         if self.unified_exec_processes.len() != before {
             self.sync_unified_exec_footer();
         }
@@ -6062,6 +6064,9 @@ impl ChatWidget {
             // We have an active exec group, but it does not contain this call id. Render the end
             // as a standalone finalized history cell so the active group remains intact.
             OrphanHistoryWhileActiveExec,
+            // Resume replay can deliver completed explore calls without begin events. Append those
+            // to the existing completed explore cell so redraw matches live grouping.
+            AppendToExploringCell,
             // No active exec cell can safely own this end; build a new cell from the end payload.
             NewCell,
         }
@@ -6107,6 +6112,9 @@ impl ChatWidget {
                 Some(exec_cell) if exec_cell.is_active() => {
                     ExecEndTarget::OrphanHistoryWhileActiveExec
                 }
+                Some(exec_cell) if exec_cell.can_append(source, &parsed) => {
+                    ExecEndTarget::AppendToExploringCell
+                }
                 Some(_) | None => ExecEndTarget::NewCell,
             },
             None => ExecEndTarget::NewCell,
@@ -6147,6 +6155,37 @@ impl ChatWidget {
                     if self.pending_auto_review_approvals.remove(&ev.call_id) {
                         cell.mark_auto_review_approved(&ev.call_id);
                     }
+                    self.bump_active_cell_revision();
+                    self.request_redraw();
+                }
+            }
+            ExecEndTarget::AppendToExploringCell => {
+                if let Some(cell) = self
+                    .active_cell
+                    .as_mut()
+                    .and_then(|c| c.as_any_mut().downcast_mut::<ExecCell>())
+                {
+                    let mut appended = cell
+                        .with_added_call(
+                            ev.call_id.clone(),
+                            command,
+                            parsed,
+                            source,
+                            run_mode,
+                            ev.interaction_input.clone(),
+                        )
+                        .expect("append target should accept replayed explore call");
+                    let completed =
+                        appended.complete_call(&ev.call_id, output, ev.duration, run_mode);
+                    if self.pending_auto_review_approvals.remove(&ev.call_id) {
+                        appended.mark_auto_review_approved(&ev.call_id);
+                    }
+                    debug_assert!(
+                        completed,
+                        "appended exec cell should contain {}",
+                        ev.call_id
+                    );
+                    *cell = appended;
                     self.bump_active_cell_revision();
                     self.request_redraw();
                 }
@@ -6374,7 +6413,7 @@ impl ChatWidget {
             return;
         }
         if ev.source != ExecCommandSource::UserShell && !is_wait_interaction {
-            self.record_model_output_json(&ev.command);
+            self.record_model_output_json_once_for_tool_call(&ev.call_id, &ev.command);
             self.upsert_model_activity(
                 ev.call_id.clone(),
                 model_activity_kinds_for_exec(&ev.command, &parsed_cmd),
@@ -6462,7 +6501,7 @@ impl ChatWidget {
     pub(crate) fn handle_mcp_begin_now(&mut self, ev: McpToolCallBeginEvent) {
         self.flush_answer_stream_with_separator();
         self.flush_active_cell();
-        self.record_model_output_json(&ev.invocation);
+        self.record_model_output_json_once_for_tool_call(&ev.call_id, &ev.invocation);
         self.upsert_model_activity(
             ev.call_id.clone(),
             vec![model_activity_kind_for_tool_name(&ev.invocation.tool)],
@@ -6696,6 +6735,7 @@ impl ChatWidget {
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             output_chars_this_turn: 0,
+            streamed_tool_call_input_ids: HashSet::new(),
             last_separator_elapsed_secs: None,
             turn_runtime_metrics: RuntimeMetricsSummary::default(),
             last_rendered_width: std::cell::Cell::new(None),
@@ -7695,7 +7735,11 @@ impl ChatWidget {
         turn_id: String,
         replay_kind: ReplayKind,
     ) {
-        self.handle_thread_item(item, turn_id, ThreadItemRenderSource::Replay(replay_kind));
+        self.handle_thread_item(
+            item,
+            turn_id,
+            ThreadItemRenderSource::ReplayTurn(replay_kind),
+        );
     }
 
     fn handle_thread_item(
@@ -7838,6 +7882,15 @@ impl ChatWidget {
                 changes,
                 status,
             } => {
+                let changes = file_update_changes_to_core(changes);
+                if render_source.is_turn_replay() {
+                    self.on_patch_apply_begin(PatchApplyBeginEvent {
+                        call_id: id.clone(),
+                        turn_id: turn_id.clone(),
+                        auto_approved: false,
+                        changes: changes.clone(),
+                    });
+                }
                 if !matches!(
                     status,
                     codex_app_server_protocol::PatchApplyStatus::InProgress
@@ -7851,7 +7904,7 @@ impl ChatWidget {
                             status,
                             codex_app_server_protocol::PatchApplyStatus::Failed
                         ),
-                        changes: file_update_changes_to_core(changes),
+                        changes,
                         status: match status {
                             codex_app_server_protocol::PatchApplyStatus::Completed => {
                                 codex_protocol::protocol::PatchApplyStatus::Completed
@@ -7945,7 +7998,7 @@ impl ChatWidget {
                     status,
                     codex_app_server_protocol::DynamicToolCallStatus::InProgress
                 ) {
-                    self.record_model_output_json(&arguments);
+                    self.record_model_output_json_once_for_tool_call(&id, &arguments);
                     self.on_dynamic_tool_call_begin(id, &tool);
                 } else {
                     self.on_dynamic_tool_call_end(&id);
@@ -8109,6 +8162,14 @@ impl ChatWidget {
                 self.on_agent_message_delta(notification.delta);
             }
             ServerNotification::PlanDelta(notification) => self.on_plan_delta(notification.delta),
+            ServerNotification::ToolCallInputDelta(notification) => {
+                self.record_model_output_delta(&notification.delta);
+                self.streamed_tool_call_input_ids
+                    .insert(notification.item_id);
+                if let Some(call_id) = notification.call_id {
+                    self.streamed_tool_call_input_ids.insert(call_id);
+                }
+            }
             ServerNotification::ReasoningSummaryTextDelta(notification) => {
                 self.on_agent_reasoning_delta(notification.delta);
             }
@@ -8359,6 +8420,31 @@ impl ChatWidget {
         notification: TurnCompletedNotification,
         replay_kind: Option<ReplayKind>,
     ) {
+        if let Ok(thread_id) = ThreadId::from_string(&notification.thread_id)
+            && self.background_collab_agent_ids.contains(&thread_id)
+        {
+            let status = match &notification.turn.status {
+                TurnStatus::Completed => Some(AgentStatus::Completed(None)),
+                TurnStatus::Failed => Some(AgentStatus::Errored(
+                    notification
+                        .turn
+                        .error
+                        .as_ref()
+                        .map(|error| error.message.clone())
+                        .unwrap_or_else(|| "Agent turn failed".to_string()),
+                )),
+                TurnStatus::Interrupted => Some(AgentStatus::Interrupted),
+                TurnStatus::InProgress => None,
+            };
+            if let Some(status) = status {
+                self.track_collab_agent_status(thread_id, None, None, status);
+                self.request_redraw();
+            }
+            if self.thread_id != Some(thread_id) {
+                return;
+            }
+        }
+
         match notification.turn.status {
             TurnStatus::Completed => {
                 self.last_non_retry_error = None;
@@ -8472,7 +8558,7 @@ impl ChatWidget {
                     status,
                     codex_app_server_protocol::DynamicToolCallStatus::InProgress
                 ) {
-                    self.record_model_output_json(&arguments);
+                    self.record_model_output_json_once_for_tool_call(&id, &arguments);
                     self.on_dynamic_tool_call_begin(id, &tool);
                 }
             }
@@ -8517,7 +8603,10 @@ impl ChatWidget {
         self.handle_thread_item(
             notification.item,
             notification.turn_id,
-            replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
+            replay_kind.map_or(
+                ThreadItemRenderSource::Live,
+                ThreadItemRenderSource::ReplayEvent,
+            ),
         );
     }
 
@@ -8716,6 +8805,13 @@ impl ChatWidget {
                 self.on_agent_message_delta(delta)
             }
             EventMsg::PlanDelta(event) => self.on_plan_delta(event.delta),
+            EventMsg::ToolCallInputDelta(event) => {
+                self.record_model_output_delta(&event.delta);
+                self.streamed_tool_call_input_ids.insert(event.item_id);
+                if let Some(call_id) = event.call_id {
+                    self.streamed_tool_call_input_ids.insert(call_id);
+                }
+            }
             EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta })
             | EventMsg::AgentReasoningRawContentDelta(AgentReasoningRawContentDeltaEvent {
                 delta,
@@ -8975,7 +9071,10 @@ impl ChatWidget {
             EventMsg::CollabResumeBegin(ev) => self.on_collab_event(multi_agents::resume_begin(ev)),
             EventMsg::CollabResumeEnd(ev) => self.on_collab_event(multi_agents::resume_end(ev)),
             EventMsg::DynamicToolCallRequest(request) => {
-                self.record_model_output_json(&request.arguments);
+                self.record_model_output_json_once_for_tool_call(
+                    &request.call_id,
+                    &request.arguments,
+                );
                 self.on_dynamic_tool_call_begin(request.call_id, &request.tool);
             }
             EventMsg::DynamicToolCallResponse(response) => {

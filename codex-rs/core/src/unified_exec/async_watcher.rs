@@ -21,6 +21,7 @@ use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
+use codex_protocol::protocol::ExecCommandRunMode;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::protocol::ExecOutputStream;
@@ -172,6 +173,8 @@ pub(crate) fn spawn_exit_watcher(
     turn_ref: Arc<TurnContext>,
     call_id: String,
     command: Vec<String>,
+    hook_command: String,
+    run_mode: ExecCommandRunMode,
     cwd: AbsolutePathBuf,
     process_id: i32,
     transcript: Arc<Mutex<HeadTailBuffer>>,
@@ -185,10 +188,10 @@ pub(crate) fn spawn_exit_watcher(
         output_drained.notified().await;
 
         let duration = Instant::now().saturating_duration_since(started_at);
-        if let Some(message) = process.failure_message() {
+        let exit_code = if let Some(message) = process.failure_message() {
             emit_failed_exec_end_for_unified_exec(
-                session_ref,
-                turn_ref,
+                Arc::clone(&session_ref),
+                Arc::clone(&turn_ref),
                 call_id,
                 command,
                 cwd,
@@ -198,11 +201,12 @@ pub(crate) fn spawn_exit_watcher(
                 duration,
             )
             .await;
+            -1
         } else {
             let exit_code = process.exit_code().unwrap_or(-1);
             emit_exec_end_for_unified_exec(
-                session_ref,
-                turn_ref,
+                Arc::clone(&session_ref),
+                Arc::clone(&turn_ref),
                 call_id,
                 command,
                 cwd,
@@ -213,6 +217,13 @@ pub(crate) fn spawn_exit_watcher(
                 duration,
             )
             .await;
+            exit_code
+        };
+
+        if run_mode == ExecCommandRunMode::Background {
+            session_ref
+                .notify_background_shell_exit(process_id, hook_command, exit_code)
+                .await;
         }
     });
 }

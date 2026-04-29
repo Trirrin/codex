@@ -297,6 +297,7 @@ pub(super) async fn make_chatwidget_manual(
         plan_delta_buffer: String::new(),
         plan_item_active: false,
         output_chars_this_turn: 0,
+        streamed_tool_call_input_ids: HashSet::new(),
         last_separator_elapsed_secs: None,
         turn_runtime_metrics: RuntimeMetricsSummary::default(),
         last_rendered_width: std::cell::Cell::new(None),

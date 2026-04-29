@@ -2596,7 +2596,7 @@ async fn inactive_thread_file_change_approval_recovers_buffered_changes() {
         other => panic!("expected patch preview history cell, saw {other:?}"),
     };
     let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
-    assert!(rendered.contains("• Added README.md (+1 -0)"));
+    assert!(rendered.contains("• Written README.md (+1 -0)"));
     assert!(rendered.contains("1 +hello"));
 }
 
@@ -4592,6 +4592,54 @@ async fn backtrack_resubmit_preserves_data_image_urls_in_user_turn() {
             UserInput::Image { image_url } if image_url == &data_image_url
         )
     }));
+}
+
+#[tokio::test]
+async fn replay_thread_snapshot_renders_completed_file_change_diff() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let thread_id = ThreadId::new();
+    app.replay_thread_snapshot(
+        ThreadEventSnapshot {
+            session: Some(test_thread_session(
+                thread_id,
+                test_path_buf("/home/user/project"),
+            )),
+            turns: vec![Turn {
+                id: "turn-write".to_string(),
+                items: vec![ThreadItem::FileChange {
+                    id: "write-1".to_string(),
+                    changes: vec![FileUpdateChange {
+                        path: "foo.txt".to_string(),
+                        kind: PatchChangeKind::Add,
+                        diff: "hello\n".to_string(),
+                    }],
+                    status: codex_app_server_protocol::PatchApplyStatus::Completed,
+                }],
+                status: TurnStatus::Completed,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+            }],
+            events: Vec::new(),
+            input_state: None,
+        },
+        /*resume_restored_queue*/ false,
+    );
+
+    let mut rendered_cells = Vec::new();
+    while let Ok(event) = app_event_rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            rendered_cells.push(lines_to_single_string(&cell.display_lines(/*width*/ 80)));
+        }
+    }
+
+    assert!(
+        rendered_cells
+            .iter()
+            .any(|cell| cell.contains("• Written foo.txt (+1 -0)") && cell.contains("1 +hello")),
+        "expected replayed completed file change to render its diff: {rendered_cells:?}"
+    );
 }
 
 #[tokio::test]

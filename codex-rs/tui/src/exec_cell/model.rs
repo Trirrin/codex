@@ -95,15 +95,15 @@ impl ExecCell {
             duration: None,
             interaction_input,
         };
-        if self.is_exploring_cell() && Self::is_exploring_call(&call) {
-            Some(Self {
-                calls: [self.calls.clone(), vec![call]].concat(),
-                animations_enabled: self.animations_enabled,
-                explored_tools_display: self.explored_tools_display,
-            })
-        } else {
-            None
+        if !self.can_append(source, &call.parsed) {
+            return None;
         }
+
+        Some(Self {
+            calls: [self.calls.clone(), vec![call]].concat(),
+            animations_enabled: self.animations_enabled,
+            explored_tools_display: self.explored_tools_display,
+        })
     }
 
     /// Marks the most recently matching call as finished and returns whether a call was found.
@@ -128,6 +128,15 @@ impl ExecCell {
         call.duration = Some(duration);
         call.start_time = None;
         true
+    }
+
+    pub(crate) fn can_append(&self, source: ExecCommandSource, parsed: &[ParsedCommand]) -> bool {
+        let is_exploring_call = Self::parsed_is_exploring_call(source, parsed);
+        if self.is_exploring_cell() {
+            is_exploring_call
+        } else {
+            self.is_active() && !is_exploring_call
+        }
     }
 
     pub(crate) fn should_flush(&self) -> bool {
@@ -205,11 +214,15 @@ impl ExecCell {
     }
 
     pub(super) fn is_exploring_call(call: &ExecCall) -> bool {
+        Self::parsed_is_exploring_call(call.source, &call.parsed)
+    }
+
+    fn parsed_is_exploring_call(source: ExecCommandSource, parsed: &[ParsedCommand]) -> bool {
         !matches!(
-            call.source,
+            source,
             ExecCommandSource::UserShell | ExecCommandSource::UnifiedExecStartup
-        ) && !call.parsed.is_empty()
-            && call.parsed.iter().all(|p| {
+        ) && !parsed.is_empty()
+            && parsed.iter().all(|p| {
                 matches!(
                     p,
                     ParsedCommand::Read { .. }

@@ -4174,6 +4174,35 @@
       ],
       "type": "object"
     },
+    "ToolCallInputDeltaNotification": {
+      "properties": {
+        "callId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "delta": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "delta",
+        "itemId",
+        "threadId",
+        "turnId"
+      ],
+      "type": "object"
+    },
     "Turn": {
       "properties": {
         "completedAt": {
@@ -5125,6 +5154,26 @@
         "params"
       ],
       "title": "Item/plan/deltaNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "item/toolCall/inputDelta"
+          ],
+          "title": "Item/toolCall/inputDeltaNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ToolCallInputDeltaNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Item/toolCall/inputDeltaNotification",
       "type": "object"
     },
     {

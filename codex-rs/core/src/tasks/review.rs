@@ -162,7 +162,8 @@ async fn process_review_events(
                 ..
             })
             | EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { .. })
-            | EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent { .. }) => {}
+            | EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent { .. })
+            | EventMsg::ToolCallInputDelta(_) => {}
             EventMsg::TurnComplete(task_complete) => {
                 // Parse review output from the last agent message (if present).
                 let out = task_complete

@@ -91,6 +91,7 @@ use codex_app_server_protocol::ThreadRealtimeTranscriptDoneNotification;
 use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
+use codex_app_server_protocol::ToolCallInputDeltaNotification;
 use codex_app_server_protocol::ToolRequestUserInputOption;
 use codex_app_server_protocol::ToolRequestUserInputParams;
 use codex_app_server_protocol::ToolRequestUserInputQuestion;
@@ -1428,6 +1429,18 @@ pub(crate) async fn apply_bespoke_event_handling(
             };
             outgoing
                 .send_server_notification(ServerNotification::PlanDelta(notification))
+                .await;
+        }
+        EventMsg::ToolCallInputDelta(event) => {
+            let notification = ToolCallInputDeltaNotification {
+                thread_id: conversation_id.to_string(),
+                turn_id: event_turn_id.clone(),
+                item_id: event.item_id,
+                call_id: event.call_id,
+                delta: event.delta,
+            };
+            outgoing
+                .send_server_notification(ServerNotification::ToolCallInputDelta(notification))
                 .await;
         }
         EventMsg::ContextCompacted(..) => {

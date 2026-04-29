@@ -53,7 +53,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 
 const NO_PREVIOUS_MESSAGE_TO_EDIT: &str = "No previous message to edit.";
-const BACKTRACK_PICKER_MAX_MESSAGES: usize = 3;
+const BACKTRACK_PICKER_MAX_MESSAGES: usize = 5;
 const BACKTRACK_PICKER_TITLE: &str = "Select a previous message to roll back";
 const BACKTRACK_PICKER_HINT: &str = "Enter to roll back, esc to cancel.";
 
@@ -876,9 +876,9 @@ mod tests {
 
     #[test]
     fn picker_keeps_selected_message_surrounded_when_possible() {
-        assert_eq!(visible_user_message_range(6, 0, 3), 0..3);
-        assert_eq!(visible_user_message_range(6, 2, 3), 1..4);
-        assert_eq!(visible_user_message_range(6, 5, 3), 3..6);
+        assert_eq!(visible_user_message_range(8, 0, 5), 0..5);
+        assert_eq!(visible_user_message_range(8, 3, 5), 2..7);
+        assert_eq!(visible_user_message_range(8, 7, 5), 3..8);
     }
 
     #[test]
@@ -888,6 +888,8 @@ mod tests {
             "please inspect this project and explain the architecture".to_string(),
             "is this correct?".to_string(),
             "one more".to_string(),
+            "fifth".to_string(),
+            "sixth stays hidden".to_string(),
         ];
 
         let lines = backtrack_picker_lines(&messages, 1, 32);
@@ -900,6 +902,8 @@ mod tests {
   hello
 > please inspect this project...
   is this correct?
+  one more
+  fifth
 
   Enter to roll back, esc to cancel.
 

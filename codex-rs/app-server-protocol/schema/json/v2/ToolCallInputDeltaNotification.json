@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "properties": {
+    "callId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "delta": {
+      "type": "string"
+    },
+    "itemId": {
+      "type": "string"
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "delta",
+    "itemId",
+    "threadId",
+    "turnId"
+  ],
+  "title": "ToolCallInputDeltaNotification",
+  "type": "object"
+}

@@ -98,6 +98,8 @@ use codex_protocol::protocol::TokenUsage;
 #[cfg(test)]
 use codex_protocol::protocol::TokenUsageInfo;
 #[cfg(test)]
+use codex_protocol::protocol::ToolCallInputDeltaEvent;
+#[cfg(test)]
 use codex_protocol::protocol::TurnAbortReason;
 #[cfg(test)]
 use codex_protocol::protocol::TurnAbortedEvent;
@@ -380,6 +382,9 @@ fn server_notification_thread_target(
             Some(notification.thread_id.as_str())
         }
         ServerNotification::PlanDelta(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::ToolCallInputDelta(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::CommandExecutionOutputDelta(notification) => {
             Some(notification.thread_id.as_str())
         }
@@ -617,6 +622,19 @@ fn server_notification_thread_events(
                     thread_id: notification.thread_id,
                     turn_id: notification.turn_id,
                     item_id: notification.item_id,
+                    delta: notification.delta,
+                }),
+            }],
+        )),
+        ServerNotification::ToolCallInputDelta(notification) => Some((
+            ThreadId::from_string(&notification.thread_id).ok()?,
+            vec![Event {
+                id: String::new(),
+                msg: EventMsg::ToolCallInputDelta(ToolCallInputDeltaEvent {
+                    thread_id: notification.thread_id,
+                    turn_id: notification.turn_id,
+                    item_id: notification.item_id,
+                    call_id: notification.call_id,
                     delta: notification.delta,
                 }),
             }],

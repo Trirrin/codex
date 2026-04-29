@@ -48,6 +48,7 @@ use codex_app_server_protocol::TextElement;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ToolCallInputDeltaNotification;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnEnvironmentParams;
 use codex_app_server_protocol::TurnStartParams;
@@ -2378,6 +2379,111 @@ async fn turn_start_does_not_stream_apply_patch_change_updates_without_feature_v
             .iter()
             .any(|method| method == "item/fileChange/patchUpdated")
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_start_streams_tool_call_input_delta_v2() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let tmp = TempDir::new()?;
+    let codex_home = tmp.path().join("codex_home");
+    std::fs::create_dir(&codex_home)?;
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir(&workspace)?;
+
+    let tool_delta = r#"{"cmd":"echo live"#;
+    let responses = vec![responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc-tool-call",
+                "call_id": "tool-call",
+                "name": "shell",
+                "arguments": "",
+                "status": "in_progress"
+            }
+        }),
+        serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc-tool-call",
+            "delta": tool_delta,
+        }),
+        responses::ev_assistant_message("msg-1", "done"),
+        responses::ev_completed("resp-1"),
+    ])];
+    let server = create_mock_responses_server_sequence(responses).await;
+    create_config_toml(
+        &codex_home,
+        &server.uri(),
+        "never",
+        &BTreeMap::from([
+            (Feature::Plugins, false),
+            (Feature::RemoteModels, false),
+            (Feature::ShellSnapshot, false),
+        ]),
+    )?;
+
+    let mut mcp = McpProcess::new(&codex_home).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_req = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            cwd: Some(workspace.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "call a tool".into(),
+                text_elements: Vec::new(),
+            }],
+            cwd: Some(workspace.clone()),
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+
+    let delta_notif = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("item/toolCall/inputDelta"),
+    )
+    .await??;
+    let delta: ToolCallInputDeltaNotification = serde_json::from_value(
+        delta_notif
+            .params
+            .clone()
+            .expect("item/toolCall/inputDelta params"),
+    )?;
+    assert_eq!(delta.thread_id, thread.id);
+    assert_eq!(delta.turn_id, turn.id);
+    assert_eq!(delta.item_id, "fc-tool-call");
+    assert_eq!(delta.call_id.as_deref(), Some("tool-call"));
+    assert_eq!(delta.delta, tool_delta);
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
 
     Ok(())
 }
