@@ -42,6 +42,7 @@ use ratatui::text::Line as RtLine;
 use ratatui::text::Span as RtSpan;
 use ratatui::widgets::Paragraph;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -64,6 +65,10 @@ const LIGHT_TC_ADD_LINE_BG_RGB: (u8, u8, u8) = (218, 251, 225); // #dafbe1
 const LIGHT_TC_DEL_LINE_BG_RGB: (u8, u8, u8) = (255, 235, 233); // #ffebe9
 const LIGHT_TC_ADD_NUM_BG_RGB: (u8, u8, u8) = (172, 238, 187); // #aceebb
 const LIGHT_TC_DEL_NUM_BG_RGB: (u8, u8, u8) = (255, 206, 203); // #ffcecb
+const DARK_TC_ADD_INLINE_BG_RGB: (u8, u8, u8) = (70, 130, 84); // #468254
+const DARK_TC_DEL_INLINE_BG_RGB: (u8, u8, u8) = (155, 67, 58); // #9b433a
+const LIGHT_TC_ADD_INLINE_BG_RGB: (u8, u8, u8) = (126, 231, 151); // #7ee797
+const LIGHT_TC_DEL_INLINE_BG_RGB: (u8, u8, u8) = (255, 166, 163); // #ffa6a3
 
 // 256-color palette.
 const DARK_256_ADD_LINE_BG_IDX: u8 = 22;
@@ -72,10 +77,15 @@ const LIGHT_256_ADD_LINE_BG_IDX: u8 = 194;
 const LIGHT_256_DEL_LINE_BG_IDX: u8 = 224;
 const LIGHT_256_ADD_NUM_BG_IDX: u8 = 157;
 const LIGHT_256_DEL_NUM_BG_IDX: u8 = 217;
+const DARK_256_ADD_INLINE_BG_IDX: u8 = 28;
+const DARK_256_DEL_INLINE_BG_IDX: u8 = 88;
+const LIGHT_256_ADD_INLINE_BG_IDX: u8 = 120;
+const LIGHT_256_DEL_INLINE_BG_IDX: u8 = 210;
 const MAX_RENDERED_ADDED_LINES: usize = 10;
 const DIFF_BLOCK_SIDE_PADDING: usize = 4;
 const MIN_ELIDED_LEADING_INDENT_COLUMNS: usize = 8;
 const LEADING_INDENT_ELISION_MARKER: &str = "……  ";
+const MAX_INLINE_DIFF_CHARS: usize = 512;
 
 use crate::color::is_light;
 use crate::color::perceptual_distance;
@@ -179,6 +189,11 @@ impl RichDiffColorLevel {
 struct ResolvedDiffBackgrounds {
     add: Option<Color>,
     del: Option<Color>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct InlineDiffHighlight {
+    ranges: Vec<Range<usize>>,
 }
 
 /// Precomputed render state for diff line styling.
@@ -526,6 +541,7 @@ fn render_change(
                         style_context.color_level,
                         style_context.diff_backgrounds,
                         leading_indent_elision,
+                        /*inline_highlight*/ None,
                     ));
                 } else {
                     out.extend(push_wrapped_diff_line_inner_with_theme_and_color_level(
@@ -539,6 +555,7 @@ fn render_change(
                         style_context.color_level,
                         style_context.diff_backgrounds,
                         leading_indent_elision,
+                        /*inline_highlight*/ None,
                     ));
                 }
             }
@@ -628,6 +645,7 @@ fn render_change(
 
                     let mut old_ln = h.old_range().start();
                     let mut new_ln = h.new_range().start();
+                    let inline_highlights = inline_diff_highlights_for_hunk(h);
                     let leading_indent_elision =
                         leading_indent_elision_for_texts(h.lines().iter().map(|line| match line {
                             diffy::Line::Insert(text)
@@ -638,6 +656,8 @@ fn render_change(
                         let syntax_spans = hunk_syntax_lines
                             .as_ref()
                             .and_then(|syntax_lines| syntax_lines.get(line_idx));
+                        let inline_highlight =
+                            inline_highlights.get(line_idx).and_then(Option::as_ref);
                         match l {
                             diffy::Line::Insert(text) => {
                                 let s = text.trim_end_matches('\n');
@@ -654,6 +674,7 @@ fn render_change(
                                             style_context.color_level,
                                             style_context.diff_backgrounds,
                                             leading_indent_elision,
+                                            inline_highlight,
                                         ),
                                     );
                                 } else {
@@ -669,6 +690,7 @@ fn render_change(
                                             style_context.color_level,
                                             style_context.diff_backgrounds,
                                             leading_indent_elision,
+                                            inline_highlight,
                                         ),
                                     );
                                 }
@@ -689,6 +711,7 @@ fn render_change(
                                             style_context.color_level,
                                             style_context.diff_backgrounds,
                                             leading_indent_elision,
+                                            inline_highlight,
                                         ),
                                     );
                                 } else {
@@ -704,6 +727,7 @@ fn render_change(
                                             style_context.color_level,
                                             style_context.diff_backgrounds,
                                             leading_indent_elision,
+                                            inline_highlight,
                                         ),
                                     );
                                 }
@@ -724,6 +748,7 @@ fn render_change(
                                             style_context.color_level,
                                             style_context.diff_backgrounds,
                                             leading_indent_elision,
+                                            inline_highlight,
                                         ),
                                     );
                                 } else {
@@ -739,6 +764,7 @@ fn render_change(
                                             style_context.color_level,
                                             style_context.diff_backgrounds,
                                             leading_indent_elision,
+                                            inline_highlight,
                                         ),
                                     );
                                 }
@@ -751,6 +777,255 @@ fn render_change(
             }
         }
     }
+}
+
+fn inline_diff_highlights_for_hunk(hunk: &Hunk<'_, str>) -> Vec<Option<InlineDiffHighlight>> {
+    let lines = hunk.lines();
+    let mut highlights = vec![None; lines.len()];
+    let mut idx = 0;
+
+    while idx < lines.len() {
+        if !matches!(lines[idx], diffy::Line::Delete(_)) {
+            idx += 1;
+            continue;
+        }
+
+        let delete_start = idx;
+        while idx < lines.len() && matches!(lines[idx], diffy::Line::Delete(_)) {
+            idx += 1;
+        }
+        let insert_start = idx;
+        while idx < lines.len() && matches!(lines[idx], diffy::Line::Insert(_)) {
+            idx += 1;
+        }
+
+        let delete_count = insert_start - delete_start;
+        let insert_count = idx - insert_start;
+        for offset in 0..delete_count.min(insert_count) {
+            let diffy::Line::Delete(old) = lines[delete_start + offset] else {
+                continue;
+            };
+            let diffy::Line::Insert(new) = lines[insert_start + offset] else {
+                continue;
+            };
+            let (old_highlight, new_highlight) =
+                inline_diff_highlight_pair(old.trim_end_matches('\n'), new.trim_end_matches('\n'));
+            highlights[delete_start + offset] = old_highlight;
+            highlights[insert_start + offset] = new_highlight;
+        }
+    }
+
+    highlights
+}
+
+fn inline_diff_highlight_pair(
+    old: &str,
+    new: &str,
+) -> (Option<InlineDiffHighlight>, Option<InlineDiffHighlight>) {
+    if old == new {
+        return (None, None);
+    }
+
+    let old_chars = indexed_chars(old);
+    let new_chars = indexed_chars(new);
+    let too_large = old_chars.len().saturating_mul(new_chars.len()) > MAX_INLINE_DIFF_CHARS.pow(2);
+    let (old_ranges, new_ranges) = if too_large {
+        prefix_suffix_inline_ranges(old, new)
+    } else {
+        lcs_inline_ranges(old, new, &old_chars, &new_chars)
+    };
+    let old_ranges = expand_ranges_to_words(old, &old_ranges);
+    let new_ranges = expand_ranges_to_words(new, &new_ranges);
+
+    (
+        InlineDiffHighlight::from_ranges(old_ranges),
+        InlineDiffHighlight::from_ranges(new_ranges),
+    )
+}
+
+impl InlineDiffHighlight {
+    fn from_ranges(ranges: Vec<Range<usize>>) -> Option<Self> {
+        (!ranges.is_empty()).then_some(Self { ranges })
+    }
+}
+
+fn indexed_chars(text: &str) -> Vec<(usize, char)> {
+    text.char_indices().collect()
+}
+
+fn lcs_inline_ranges(
+    old: &str,
+    new: &str,
+    old_chars: &[(usize, char)],
+    new_chars: &[(usize, char)],
+) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let new_len = new_chars.len();
+    let mut dp = vec![0; (old_chars.len() + 1) * (new_len + 1)];
+    for old_idx in (0..old_chars.len()).rev() {
+        for new_idx in (0..new_chars.len()).rev() {
+            let idx = old_idx * (new_len + 1) + new_idx;
+            dp[idx] = if old_chars[old_idx].1 == new_chars[new_idx].1 {
+                dp[(old_idx + 1) * (new_len + 1) + new_idx + 1] + 1
+            } else {
+                dp[(old_idx + 1) * (new_len + 1) + new_idx]
+                    .max(dp[old_idx * (new_len + 1) + new_idx + 1])
+            };
+        }
+    }
+
+    let mut matched_old = Vec::new();
+    let mut matched_new = Vec::new();
+    let mut old_idx = 0;
+    let mut new_idx = 0;
+    while old_idx < old_chars.len() && new_idx < new_chars.len() {
+        if old_chars[old_idx].1 == new_chars[new_idx].1 {
+            matched_old.push(old_idx);
+            matched_new.push(new_idx);
+            old_idx += 1;
+            new_idx += 1;
+        } else if dp[(old_idx + 1) * (new_len + 1) + new_idx]
+            >= dp[old_idx * (new_len + 1) + new_idx + 1]
+        {
+            old_idx += 1;
+        } else {
+            new_idx += 1;
+        }
+    }
+
+    (
+        changed_ranges_between_matches(old, old_chars, &matched_old),
+        changed_ranges_between_matches(new, new_chars, &matched_new),
+    )
+}
+
+fn changed_ranges_between_matches(
+    text: &str,
+    chars: &[(usize, char)],
+    matched_char_indices: &[usize],
+) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    for &matched_idx in matched_char_indices {
+        let start = chars[matched_idx].0;
+        if cursor < start {
+            ranges.push(cursor..start);
+        }
+        cursor = start + chars[matched_idx].1.len_utf8();
+    }
+    if cursor < text.len() {
+        ranges.push(cursor..text.len());
+    }
+    ranges
+}
+
+fn expand_ranges_to_words(text: &str, ranges: &[Range<usize>]) -> Vec<Range<usize>> {
+    let word_ranges = word_ranges(text);
+    let mut expanded = Vec::new();
+    for range in ranges {
+        let mut touched_word = false;
+        for word_range in &word_ranges {
+            if ranges_overlap(range, word_range) {
+                expanded.push(word_range.clone());
+                touched_word = true;
+            }
+        }
+        for non_word_range in changed_non_word_ranges(text, range) {
+            expanded.push(non_word_range);
+        }
+        if !touched_word && expanded.last() != Some(range) {
+            expanded.push(range.clone());
+        }
+    }
+    merge_ranges(expanded)
+}
+
+fn word_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (idx, ch) in text.char_indices() {
+        if is_word_char(ch) {
+            start.get_or_insert(idx);
+            continue;
+        }
+        if let Some(word_start) = start.take() {
+            ranges.push(word_start..idx);
+        }
+    }
+    if let Some(word_start) = start {
+        ranges.push(word_start..text.len());
+    }
+    ranges
+}
+
+fn changed_non_word_ranges(text: &str, range: &Range<usize>) -> Vec<Range<usize>> {
+    text.char_indices()
+        .filter_map(|(idx, ch)| {
+            let end = idx + ch.len_utf8();
+            (range.start < end && idx < range.end && !is_word_char(ch) && !ch.is_whitespace())
+                .then_some(idx..end)
+        })
+        .collect()
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+fn merge_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in ranges {
+        let Some(last) = merged.last_mut() else {
+            merged.push(range);
+            continue;
+        };
+        if range.start <= last.end {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+fn prefix_suffix_inline_ranges(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let prefix = common_prefix_len(old, new);
+    let suffix = common_suffix_len(&old[prefix..], &new[prefix..]);
+    let old_end = old.len() - suffix;
+    let new_end = new.len() - suffix;
+    let old_ranges = (prefix < old_end)
+        .then_some(prefix..old_end)
+        .into_iter()
+        .collect();
+    let new_ranges = (prefix < new_end)
+        .then_some(prefix..new_end)
+        .into_iter()
+        .collect();
+    (old_ranges, new_ranges)
+}
+
+fn common_prefix_len(left: &str, right: &str) -> usize {
+    left.char_indices()
+        .zip(right.chars())
+        .take_while(|((_, left), right)| left == right)
+        .map(|((idx, ch), _)| idx + ch.len_utf8())
+        .last()
+        .unwrap_or(0)
+}
+
+fn common_suffix_len(left: &str, right: &str) -> usize {
+    let mut suffix_len = 0;
+    for ((_, left), (_, right)) in left.char_indices().rev().zip(right.char_indices().rev()) {
+        if left != right {
+            break;
+        }
+        suffix_len += left.len_utf8();
+    }
+    suffix_len
 }
 
 /// Format a path for display relative to the current working directory when
@@ -931,6 +1206,7 @@ pub(crate) fn push_wrapped_diff_line_with_style_context(
         style_context.color_level,
         style_context.diff_backgrounds,
         /*leading_indent_elision*/ None,
+        /*inline_highlight*/ None,
     )
 }
 
@@ -961,6 +1237,7 @@ pub(crate) fn push_wrapped_diff_line_with_syntax_and_style_context(
         style_context.color_level,
         style_context.diff_backgrounds,
         /*leading_indent_elision*/ None,
+        /*inline_highlight*/ None,
     )
 }
 
@@ -976,6 +1253,7 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
     color_level: DiffColorLevel,
     diff_backgrounds: ResolvedDiffBackgrounds,
     leading_indent_elision: Option<usize>,
+    inline_highlight: Option<&InlineDiffHighlight>,
 ) -> Vec<RtLine<'static>> {
     let ln_str = line_number.to_string();
 
@@ -1007,19 +1285,19 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
     if let Some(syn_spans) = syntax_spans {
         let gutter = format!("{ln_str:>gutter_width$} ");
         let sign = format!("{sign_char}");
-        let styled: Vec<RtSpan<'static>> = apply_leading_indent_elision_to_spans(
-            syn_spans.iter().map(|sp| {
-                let style = if matches!(kind, DiffLineType::Delete) {
-                    sp.style.add_modifier(Modifier::DIM)
-                } else {
-                    sp.style
-                };
-                let style = style_with_line_bg(style, line_bg);
-                RtSpan::styled(sp.content.clone().into_owned(), style)
-            }),
-            leading_indent_elision,
-            content_style,
-        );
+        let styled = syn_spans.iter().map(|sp| {
+            let style = if matches!(kind, DiffLineType::Delete) {
+                sp.style.add_modifier(Modifier::DIM)
+            } else {
+                sp.style
+            };
+            let style = style_with_line_bg(style, line_bg);
+            RtSpan::styled(sp.content.clone().into_owned(), style)
+        });
+        let styled =
+            apply_inline_highlight_to_spans(styled, inline_highlight, kind, theme, color_level);
+        let styled: Vec<RtSpan<'static>> =
+            apply_leading_indent_elision_to_spans(styled, leading_indent_elision, content_style);
 
         // Determine how many display columns remain for content after the
         // gutter and sign character.
@@ -1052,11 +1330,15 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
 
     let available_content_cols = width.saturating_sub(prefix_cols + 1).max(1);
     let content_style = style_with_line_bg(content_style, line_bg);
-    let styled = apply_leading_indent_elision_to_spans(
+    let styled = apply_inline_highlight_to_spans(
         [RtSpan::styled(text.to_string(), content_style)],
-        leading_indent_elision,
-        content_style,
+        inline_highlight,
+        kind,
+        theme,
+        color_level,
     );
+    let styled =
+        apply_leading_indent_elision_to_spans(styled, leading_indent_elision, content_style);
     let wrapped_chunks = wrap_styled_spans(&styled, available_content_cols);
 
     let mut lines: Vec<RtLine<'static>> = Vec::new();
@@ -1079,6 +1361,115 @@ fn push_wrapped_diff_line_inner_with_theme_and_color_level(
     }
 
     lines
+}
+
+fn apply_inline_highlight_to_spans(
+    spans: impl IntoIterator<Item = RtSpan<'static>>,
+    highlight: Option<&InlineDiffHighlight>,
+    kind: DiffLineType,
+    theme: DiffTheme,
+    color_level: DiffColorLevel,
+) -> Vec<RtSpan<'static>> {
+    let spans = spans.into_iter().collect::<Vec<_>>();
+    let Some(highlight) = highlight else {
+        return spans;
+    };
+
+    let mut out = Vec::new();
+    let mut byte_offset = 0;
+    for span in spans {
+        let text = span.content.into_owned();
+        let mut segment = String::new();
+        let mut segment_highlighted = None;
+        for (idx, ch) in text.char_indices() {
+            let highlighted = range_contains_byte(&highlight.ranges, byte_offset + idx);
+            if segment_highlighted == Some(highlighted) {
+                segment.push(ch);
+                continue;
+            }
+            if !segment.is_empty() {
+                let style = inline_segment_style(
+                    span.style,
+                    kind,
+                    segment_highlighted == Some(true),
+                    theme,
+                    color_level,
+                );
+                out.push(RtSpan::styled(std::mem::take(&mut segment), style));
+            }
+            segment_highlighted = Some(highlighted);
+            segment.push(ch);
+        }
+        if !segment.is_empty() {
+            let style = inline_segment_style(
+                span.style,
+                kind,
+                segment_highlighted == Some(true),
+                theme,
+                color_level,
+            );
+            out.push(RtSpan::styled(segment, style));
+        }
+        byte_offset += text.len();
+    }
+    out
+}
+
+fn range_contains_byte(ranges: &[Range<usize>], byte_idx: usize) -> bool {
+    ranges
+        .iter()
+        .any(|range| range.start <= byte_idx && byte_idx < range.end)
+}
+
+fn inline_segment_style(
+    style: Style,
+    kind: DiffLineType,
+    highlighted: bool,
+    theme: DiffTheme,
+    color_level: DiffColorLevel,
+) -> Style {
+    if highlighted {
+        style.patch(inline_highlight_style(kind, theme, color_level))
+    } else {
+        style
+    }
+}
+
+fn inline_highlight_style(
+    kind: DiffLineType,
+    theme: DiffTheme,
+    color_level: DiffColorLevel,
+) -> Style {
+    let bg = match (kind, theme, color_level) {
+        (DiffLineType::Insert, DiffTheme::Dark, DiffColorLevel::TrueColor) => {
+            rgb_color(DARK_TC_ADD_INLINE_BG_RGB)
+        }
+        (DiffLineType::Insert, DiffTheme::Dark, DiffColorLevel::Ansi256) => {
+            indexed_color(DARK_256_ADD_INLINE_BG_IDX)
+        }
+        (DiffLineType::Insert, DiffTheme::Light, DiffColorLevel::TrueColor) => {
+            rgb_color(LIGHT_TC_ADD_INLINE_BG_RGB)
+        }
+        (DiffLineType::Insert, DiffTheme::Light, DiffColorLevel::Ansi256) => {
+            indexed_color(LIGHT_256_ADD_INLINE_BG_IDX)
+        }
+        (DiffLineType::Insert, _, DiffColorLevel::Ansi16) => Color::LightGreen,
+        (DiffLineType::Delete, DiffTheme::Dark, DiffColorLevel::TrueColor) => {
+            rgb_color(DARK_TC_DEL_INLINE_BG_RGB)
+        }
+        (DiffLineType::Delete, DiffTheme::Dark, DiffColorLevel::Ansi256) => {
+            indexed_color(DARK_256_DEL_INLINE_BG_IDX)
+        }
+        (DiffLineType::Delete, DiffTheme::Light, DiffColorLevel::TrueColor) => {
+            rgb_color(LIGHT_TC_DEL_INLINE_BG_RGB)
+        }
+        (DiffLineType::Delete, DiffTheme::Light, DiffColorLevel::Ansi256) => {
+            indexed_color(LIGHT_256_DEL_INLINE_BG_IDX)
+        }
+        (DiffLineType::Delete, _, DiffColorLevel::Ansi16) => Color::LightRed,
+        (DiffLineType::Context, _, _) => return Style::default(),
+    };
+    Style::default().bg(bg)
 }
 
 fn push_diff_row(
@@ -1576,6 +1967,131 @@ mod tests {
             .sum()
     }
 
+    fn span_with_content<'a>(lines: &'a [RtLine<'static>], content: &str) -> &'a RtSpan<'static> {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == content)
+            .expect("span with content")
+    }
+
+    fn line_with_content<'a>(lines: &'a [RtLine<'static>], content: &str) -> &'a RtLine<'static> {
+        lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.as_ref() == content)
+            })
+            .expect("line with content")
+    }
+
+    #[test]
+    fn inline_diff_highlight_pair_marks_changed_character_ranges() {
+        let (old, new) = inline_diff_highlight_pair("a b c", "a e c");
+
+        let old_ranges = old.expect("old highlight").ranges;
+        let new_ranges = new.expect("new highlight").ranges;
+        assert_eq!(old_ranges.len(), 1);
+        assert_eq!(old_ranges[0], 2..3);
+        assert_eq!(new_ranges.len(), 1);
+        assert_eq!(new_ranges[0], 2..3);
+    }
+
+    #[test]
+    fn inline_diff_highlight_pair_expands_changes_to_whole_words() {
+        let (old, new) = inline_diff_highlight_pair("before", "after");
+
+        let old_ranges = old.expect("old highlight").ranges;
+        let new_ranges = new.expect("new highlight").ranges;
+        assert_eq!(old_ranges.len(), 1);
+        assert_eq!(old_ranges[0], 0.."before".len());
+        assert_eq!(new_ranges.len(), 1);
+        assert_eq!(new_ranges[0], 0.."after".len());
+    }
+
+    fn inline_replacement_lines() -> Vec<RtLine<'static>> {
+        let original = "a b c\n";
+        let modified = "a e c\n";
+        let patch = diffy::create_patch(original, modified).to_string();
+        let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
+        changes.insert(
+            PathBuf::from("inline.txt"),
+            FileChange::Update {
+                unified_diff: patch,
+                move_path: None,
+            },
+        );
+
+        create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80)
+    }
+
+    #[test]
+    fn update_diff_emphasizes_inline_replacement_spans() {
+        let lines = inline_replacement_lines();
+        let deleted = span_with_content(&lines, "b");
+        let inserted = span_with_content(&lines, "e");
+
+        let deleted_line = line_with_content(&lines, "b");
+        let inserted_line = line_with_content(&lines, "e");
+        let deleted_peer = deleted_line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "a ")
+            .expect("deleted peer span");
+        let inserted_peer = inserted_line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == " c")
+            .expect("inserted peer span");
+        let style_context = current_diff_render_style_context();
+
+        assert_eq!(deleted.style.fg, deleted_peer.style.fg);
+        assert_eq!(inserted.style.fg, inserted_peer.style.fg);
+        assert!(!deleted.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!inserted.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            deleted.style.bg,
+            inline_highlight_style(
+                DiffLineType::Delete,
+                style_context.theme,
+                style_context.color_level
+            )
+            .bg
+        );
+        assert_eq!(
+            inserted.style.bg,
+            inline_highlight_style(
+                DiffLineType::Insert,
+                style_context.theme,
+                style_context.color_level
+            )
+            .bg
+        );
+    }
+
+    #[test]
+    fn ui_snapshot_inline_replacement_styles() {
+        let lines = inline_replacement_lines();
+        let snapshot = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| matches!(span.content.as_ref(), "b" | "e"))
+            .map(|span| {
+                format!(
+                    "{} fg={:?} bg={:?} bold={}",
+                    span.content,
+                    span.style.fg,
+                    span.style.bg,
+                    span.style.add_modifier.contains(Modifier::BOLD)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_snapshot!("inline_replacement_styles", snapshot);
+    }
+
     #[test]
     fn changed_diff_rows_keep_symmetric_outer_padding() {
         let width = 40;
@@ -1591,6 +2107,7 @@ mod tests {
             DiffColorLevel::TrueColor,
             fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::TrueColor),
             /*leading_indent_elision*/ None,
+            /*inline_highlight*/ None,
         );
         let lines = prefix_diff_lines(lines, DIFF_BLOCK_SIDE_PADDING);
         let changed_line = lines.first().expect("changed line");
@@ -1629,6 +2146,7 @@ mod tests {
             DiffColorLevel::Ansi16,
             fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::Ansi16),
             /*leading_indent_elision*/ None,
+            /*inline_highlight*/ None,
         );
         let lines = prefix_diff_lines(lines, DIFF_BLOCK_SIDE_PADDING);
         let changed_line = lines.first().expect("blank changed line");
@@ -2133,6 +2651,7 @@ mod tests {
             DiffColorLevel::Ansi16,
             fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::Ansi16),
             /*leading_indent_elision*/ None,
+            /*inline_highlight*/ None,
         );
         lines.extend(push_wrapped_diff_line_inner_with_theme_and_color_level(
             /*line_number*/ 2,
@@ -2145,6 +2664,7 @@ mod tests {
             DiffColorLevel::Ansi16,
             fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::Ansi16),
             /*leading_indent_elision*/ None,
+            /*inline_highlight*/ None,
         ));
 
         snapshot_lines(
@@ -2389,6 +2909,7 @@ mod tests {
             DiffColorLevel::TrueColor,
             fallback_diff_backgrounds(DiffTheme::Light, DiffColorLevel::TrueColor),
             /*leading_indent_elision*/ None,
+            /*inline_highlight*/ None,
         );
 
         assert!(

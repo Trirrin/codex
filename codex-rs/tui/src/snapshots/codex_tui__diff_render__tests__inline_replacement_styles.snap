@@ -1,0 +1,6 @@
+---
+source: tui/src/diff_render.rs
+expression: snapshot
+---
+b fg=Some(Rgb(205, 214, 244)) bg=Some(LightRed) bold=false
+e fg=Some(Rgb(205, 214, 244)) bg=Some(LightGreen) bold=false
