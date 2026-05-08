@@ -200,21 +200,29 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
     );
     assert!(
         description.contains(
-            "Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work."
+            "Use `spawn_agent` for codebase exploration via blocking `explorer`, or when the user explicitly asks for sub-agents, delegation, or parallel agent work."
         ),
-        "expected explicit authorization rule in spawn_agent description: {description:?}"
+        "expected codebase exploration authorization rule in spawn_agent description: {description:?}"
     );
     assert!(
         description.contains(
-            "Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn."
+            "Requests for depth, thoroughness, research, investigation, or detailed codebase analysis authorize only read-only codebase exploration with `explorer`; they do not authorize worker agents or implementation delegation."
         ),
-        "expected non-authorization clarification in spawn_agent description: {description:?}"
+        "expected explorer-only clarification in spawn_agent description: {description:?}"
     );
     assert!(
         description.contains(
             "Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself."
         ),
         "expected agent-role clarification in spawn_agent description: {description:?}"
+    );
+    assert!(
+        !description.contains("Only use `spawn_agent` if and only if"),
+        "old spawn_agent authorization gate should not remain: {description:?}"
+    );
+    assert!(
+        !description.contains("do not count as permission to spawn"),
+        "old codebase exploration exclusion should not remain: {description:?}"
     );
     assert!(
         !description.contains("A mini model can solve many tasks faster than the main model."),
