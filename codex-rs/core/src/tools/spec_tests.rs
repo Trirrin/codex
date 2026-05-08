@@ -806,6 +806,16 @@ async fn shell_zsh_fork_prefers_shell_command_over_unified_exec() {
 }
 
 #[tokio::test]
+async fn spawn_agent_description_includes_default_explorer_usage_hint() {
+    let tools_config = multi_agent_v2_tools_config().await;
+    let description = multi_agent_v2_spawn_agent_description(&tools_config);
+
+    assert!(description.contains("### Codebase exploration first"));
+    assert!(description.contains("start by spawning a blocking `explorer` agent"));
+    assert!(description.contains("read only the key files the explorer identifies"));
+}
+
+#[tokio::test]
 async fn spawn_agent_description_omits_usage_hint_when_disabled() {
     let tools_config = multi_agent_v2_tools_config()
         .await

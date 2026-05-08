@@ -664,11 +664,17 @@ Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, d
 Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.
 {agent_role_usage_hint}
 
+### Codebase exploration first
+- For codebase exploration, start by spawning a blocking `explorer` subagent with a specific, well-scoped question. Use the explorer's result to decide which files to read locally.
+- Spawn multiple explorers in parallel when the investigation naturally splits into independent codebase questions.
+- After blocking explorer results return, read only the key files, symbols, and tests identified by the explorers before implementing or answering.
+- Avoid repeating broad local searches that an explorer has already completed; use local reads to verify the exact code you will change or explain.
+
 ### When to delegate vs. do the subtask yourself
-- First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. As part of that plan, explicitly decide what immediate task you should do locally right now. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.
-- Use a subagent when a subtask is easy enough for it to handle and can run in parallel with your local work. Prefer delegating concrete, bounded sidecar tasks that materially advance the main task without blocking your immediate next local step.
-- Do not delegate urgent blocking work when your immediate next step depends on that result. If the very next action is blocked on that task, the main rollout should usually do it locally to keep the critical path moving.
-- Keep work local when the subtask is too difficult to delegate well and when it is tightly coupled, urgent, or likely to block your immediate next step.
+- First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers, which are codebase exploration questions, and which are sidecar tasks that can run in parallel.
+- Use an explorer for read-only codebase discovery, especially when locating unfamiliar files, tracing ownership, or finding tests.
+- Use a worker when a subtask can make a bounded code change in a clear write scope.
+- Keep work local when the subtask is too difficult to delegate well and when it is tightly coupled to edits you are already making.
 
 ### Designing delegated subtasks
 - Subtasks must be concrete, well-defined, and self-contained.
@@ -676,19 +682,19 @@ Requests for depth, thoroughness, research, investigation, or detailed codebase 
 - Do not duplicate work between the main rollout and delegated subtasks.
 - Avoid issuing multiple delegate calls on the same unresolved thread unless the new delegated task is genuinely different and necessary.
 - Narrow the delegated ask to the concrete output you need next.
-- For coding tasks, prefer delegating concrete code-change worker subtasks over read-only explorer analysis when the subagent can make a bounded patch in a clear write scope.
+- For coding tasks, prefer delegating concrete code-change worker subtasks only after explorer-backed context makes the write scope clear.
 - When delegating coding work, instruct the submodel to edit files directly in its forked workspace and list the file paths it changed in the final answer.
 - For code-edit subtasks, decompose work so each delegated task has a disjoint write set.
 
 ### After you delegate
-- Call wait_agent very sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.
+- Call wait_agent very sparingly, except for the initial blocking explorer pass where waiting for codebase context is the point.
 - Do not redo delegated subagent tasks yourself; focus on integrating results or tackling non-overlapping work.
 - While the subagent is running in the background, do meaningful non-overlapping work immediately.
 - Do not repeatedly wait by reflex.
 - When a delegated coding task returns, quickly review the uploaded changes, then integrate or refine them.
 
 ### Parallel delegation patterns
-- Run multiple independent information-seeking subtasks in parallel when you have distinct questions that can be answered independently.
+- Run multiple independent explorer subtasks in parallel when you have distinct codebase questions that can be answered independently.
 - Split implementation into disjoint codebase slices and spawn multiple agents for them in parallel when the write scopes do not overlap.
 - Delegate verification only when it can run in parallel with ongoing implementation and is likely to catch a concrete risk before final integration.
 - The key is to find opportunities to spawn multiple independent subtasks in parallel within the same round, while ensuring each subtask is well-defined, self-contained, and materially advances the main task."#
@@ -732,7 +738,14 @@ The new agent's canonical task name will be provided to it along with the messag
 {usage_hint_text}"#
         );
     }
-    tool_description
+    format!(
+        r#"
+        {tool_description}
+### Codebase exploration first
+- For codebase exploration, start by spawning a blocking `explorer` agent with a specific, well-scoped question, then read only the key files the explorer identifies.
+- Spawn multiple explorers in parallel when distinct codebase questions can be answered independently.
+- Use explorer results to focus local file reads and avoid repeating broad searches."#
+    )
 }
 
 fn spawn_agent_models_description(models: &[ModelPreset]) -> String {

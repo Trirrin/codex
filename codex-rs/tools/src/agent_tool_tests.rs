@@ -63,6 +63,8 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     assert!(description.contains("Spawns an agent to work on the specified task."));
     assert!(description.contains("The spawned agent will have the same tools as you"));
     assert!(description.contains("`max_concurrent_threads_per_session = 4`"));
+    assert!(description.contains("### Codebase exploration first"));
+    assert!(description.contains("start by spawning a blocking `explorer` agent"));
     assert!(description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
     assert!(
         description
@@ -111,7 +113,12 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
         max_concurrent_threads_per_session: None,
     });
 
-    let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = tool else {
+    let ToolSpec::Function(ResponsesApiTool {
+        description,
+        parameters,
+        ..
+    }) = tool
+    else {
         panic!("spawn_agent should be a function tool");
     };
     assert_eq!(
@@ -124,6 +131,8 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
         .expect("spawn_agent should use object params");
 
     assert!(properties.contains_key("fork_context"));
+    assert!(description.contains("### Codebase exploration first"));
+    assert!(description.contains("start by spawning a blocking `explorer` subagent"));
     assert!(!properties.contains_key("fork_turns"));
     assert_eq!(
         properties
