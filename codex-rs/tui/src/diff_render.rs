@@ -85,7 +85,8 @@ const MAX_RENDERED_ADDED_LINES: usize = 10;
 const DIFF_BLOCK_SIDE_PADDING: usize = 4;
 const MIN_ELIDED_LEADING_INDENT_COLUMNS: usize = 8;
 const LEADING_INDENT_ELISION_MARKER: &str = "……  ";
-const MAX_INLINE_DIFF_CHARS: usize = 512;
+const MAX_INLINE_DIFF_TOKENS: usize = 512;
+const INLINE_DIFF_CHANGE_THRESHOLD: f32 = 0.4;
 
 use crate::color::is_light;
 use crate::color::perceptual_distance;
@@ -192,7 +193,6 @@ struct ResolvedDiffBackgrounds {
 }
 
 type InlineHighlightRanges = Vec<Range<usize>>;
-type MatchedBytePairs = Vec<(usize, usize)>;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct InlineDiffHighlight {
@@ -926,18 +926,7 @@ fn inline_diff_highlight_pair(
         return (None, None);
     }
 
-    let old_chars = indexed_chars(old);
-    let new_chars = indexed_chars(new);
-    let too_large = old_chars.len().saturating_mul(new_chars.len()) > MAX_INLINE_DIFF_CHARS.pow(2);
-    let (old_ranges, new_ranges, matched_byte_pairs) = if too_large {
-        let (old_ranges, new_ranges) = prefix_suffix_inline_ranges(old, new);
-        (old_ranges, new_ranges, Vec::new())
-    } else {
-        lcs_inline_ranges(old, new, &old_chars, &new_chars)
-    };
-    let (old_ranges, new_ranges) =
-        expand_ranges_to_paired_words(old, new, &old_ranges, &new_ranges, &matched_byte_pairs);
-
+    let (old_ranges, new_ranges) = token_inline_ranges(old, new);
     (
         InlineDiffHighlight::from_ranges(old_ranges),
         InlineDiffHighlight::from_ranges(new_ranges),
@@ -950,26 +939,75 @@ impl InlineDiffHighlight {
     }
 }
 
-fn indexed_chars(text: &str) -> Vec<(usize, char)> {
-    text.char_indices().collect()
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InlineToken<'a> {
+    text: &'a str,
+    range: Range<usize>,
 }
 
-fn lcs_inline_ranges(
+fn token_inline_ranges(old: &str, new: &str) -> (InlineHighlightRanges, InlineHighlightRanges) {
+    let old_tokens = inline_tokens(old);
+    let new_tokens = inline_tokens(new);
+    let too_large =
+        old_tokens.len().saturating_mul(new_tokens.len()) > MAX_INLINE_DIFF_TOKENS.pow(2);
+    if too_large {
+        return (Vec::new(), Vec::new());
+    }
+
+    let (old_ranges, new_ranges) = lcs_token_ranges(old, new, &old_tokens, &new_tokens);
+    if change_ratio(old, new, &old_ranges, &new_ranges) > INLINE_DIFF_CHANGE_THRESHOLD {
+        return (Vec::new(), Vec::new());
+    }
+
+    (old_ranges, new_ranges)
+}
+
+fn inline_tokens(text: &str) -> Vec<InlineToken<'_>> {
+    let mut tokens = Vec::new();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let Some(ch) = text[cursor..].chars().next() else {
+            break;
+        };
+        let end = if is_inline_word_char(ch) {
+            token_run_end(text, cursor, is_inline_word_char)
+        } else if ch.is_whitespace() {
+            token_run_end(text, cursor, char::is_whitespace)
+        } else {
+            cursor + ch.len_utf8()
+        };
+        tokens.push(InlineToken {
+            text: &text[cursor..end],
+            range: cursor..end,
+        });
+        cursor = end;
+    }
+    tokens
+}
+
+fn token_run_end(text: &str, start: usize, predicate: impl Fn(char) -> bool) -> usize {
+    text[start..]
+        .char_indices()
+        .find_map(|(idx, ch)| (!predicate(ch)).then_some(start + idx))
+        .unwrap_or(text.len())
+}
+
+fn is_inline_word_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+fn lcs_token_ranges(
     old: &str,
     new: &str,
-    old_chars: &[(usize, char)],
-    new_chars: &[(usize, char)],
-) -> (
-    InlineHighlightRanges,
-    InlineHighlightRanges,
-    MatchedBytePairs,
-) {
-    let new_len = new_chars.len();
-    let mut dp = vec![0; (old_chars.len() + 1) * (new_len + 1)];
-    for old_idx in (0..old_chars.len()).rev() {
-        for new_idx in (0..new_chars.len()).rev() {
+    old_tokens: &[InlineToken<'_>],
+    new_tokens: &[InlineToken<'_>],
+) -> (InlineHighlightRanges, InlineHighlightRanges) {
+    let new_len = new_tokens.len();
+    let mut dp = vec![0; (old_tokens.len() + 1) * (new_len + 1)];
+    for old_idx in (0..old_tokens.len()).rev() {
+        for new_idx in (0..new_tokens.len()).rev() {
             let idx = old_idx * (new_len + 1) + new_idx;
-            dp[idx] = if old_chars[old_idx].1 == new_chars[new_idx].1 {
+            dp[idx] = if old_tokens[old_idx].text == new_tokens[new_idx].text {
                 dp[(old_idx + 1) * (new_len + 1) + new_idx + 1] + 1
             } else {
                 dp[(old_idx + 1) * (new_len + 1) + new_idx]
@@ -978,14 +1016,18 @@ fn lcs_inline_ranges(
         }
     }
 
-    let mut matched_old = Vec::new();
-    let mut matched_new = Vec::new();
+    let mut old_ranges = Vec::new();
+    let mut new_ranges = Vec::new();
+    let mut old_start = 0;
+    let mut new_start = 0;
     let mut old_idx = 0;
     let mut new_idx = 0;
-    while old_idx < old_chars.len() && new_idx < new_chars.len() {
-        if old_chars[old_idx].1 == new_chars[new_idx].1 {
-            matched_old.push(old_idx);
-            matched_new.push(new_idx);
+    while old_idx < old_tokens.len() && new_idx < new_tokens.len() {
+        if old_tokens[old_idx].text == new_tokens[new_idx].text {
+            push_inline_range(&mut old_ranges, old_start, old_tokens[old_idx].range.start);
+            push_inline_range(&mut new_ranges, new_start, new_tokens[new_idx].range.start);
+            old_start = old_tokens[old_idx].range.end;
+            new_start = new_tokens[new_idx].range.end;
             old_idx += 1;
             new_idx += 1;
         } else if dp[(old_idx + 1) * (new_len + 1) + new_idx]
@@ -996,199 +1038,38 @@ fn lcs_inline_ranges(
             new_idx += 1;
         }
     }
-
-    let matched_byte_pairs = matched_old
-        .iter()
-        .zip(&matched_new)
-        .map(|(&old_idx, &new_idx)| (old_chars[old_idx].0, new_chars[new_idx].0))
-        .collect();
-
-    (
-        changed_ranges_between_matches(old, old_chars, &matched_old),
-        changed_ranges_between_matches(new, new_chars, &matched_new),
-        matched_byte_pairs,
-    )
+    push_inline_range(&mut old_ranges, old_start, old.len());
+    push_inline_range(&mut new_ranges, new_start, new.len());
+    (old_ranges, new_ranges)
 }
 
-fn changed_ranges_between_matches(
-    text: &str,
-    chars: &[(usize, char)],
-    matched_char_indices: &[usize],
-) -> Vec<Range<usize>> {
-    let mut ranges = Vec::new();
-    let mut cursor = 0;
-    for &matched_idx in matched_char_indices {
-        let start = chars[matched_idx].0;
-        if cursor < start {
-            ranges.push(cursor..start);
-        }
-        cursor = start + chars[matched_idx].1.len_utf8();
+fn push_inline_range(ranges: &mut InlineHighlightRanges, start: usize, end: usize) {
+    if start < end {
+        ranges.push(start..end);
     }
-    if cursor < text.len() {
-        ranges.push(cursor..text.len());
-    }
-    ranges
 }
 
-fn expand_ranges_to_paired_words(
+fn change_ratio(
     old: &str,
     new: &str,
     old_ranges: &[Range<usize>],
     new_ranges: &[Range<usize>],
-    matched_byte_pairs: &[(usize, usize)],
-) -> (InlineHighlightRanges, InlineHighlightRanges) {
-    let old_words = word_ranges(old);
-    let new_words = word_ranges(new);
-    let base_old = expand_ranges_to_words(old, old_ranges);
-    let base_new = expand_ranges_to_words(new, new_ranges);
-    let mut extra_old = Vec::new();
-    let mut extra_new = Vec::new();
-
-    for &(old_byte, new_byte) in matched_byte_pairs {
-        let old_word = word_range_containing_byte(&old_words, old_byte);
-        let new_word = word_range_containing_byte(&new_words, new_byte);
-        if let (Some(old_word), Some(new_word)) = (old_word, new_word) {
-            let old_is_highlighted = range_overlaps_any(old_word, &base_old);
-            let new_is_highlighted = range_overlaps_any(new_word, &base_new);
-            if old_is_highlighted && !new_is_highlighted {
-                extra_new.push(new_word.clone());
-            }
-            if new_is_highlighted && !old_is_highlighted {
-                extra_old.push(old_word.clone());
-            }
-        }
+) -> f32 {
+    let total_len = old.len() + new.len();
+    if total_len == 0 {
+        return 0.0;
     }
-
-    let mut expanded_old = base_old;
-    let mut expanded_new = base_new;
-    expanded_old.extend(extra_old);
-    expanded_new.extend(extra_new);
-    (merge_ranges(expanded_old), merge_ranges(expanded_new))
-}
-
-fn word_range_containing_byte(
-    word_ranges: &[Range<usize>],
-    byte_idx: usize,
-) -> Option<&Range<usize>> {
-    word_ranges
+    let changed_len: usize = old_ranges
         .iter()
-        .find(|range| range.start <= byte_idx && byte_idx < range.end)
+        .chain(new_ranges)
+        .map(|range| range.end - range.start)
+        .sum();
+    changed_len as f32 / total_len as f32
 }
 
-fn range_overlaps_any(range: &Range<usize>, ranges: &[Range<usize>]) -> bool {
-    ranges
-        .iter()
-        .any(|candidate| ranges_overlap(range, candidate))
-}
-
-fn expand_ranges_to_words(text: &str, ranges: &[Range<usize>]) -> Vec<Range<usize>> {
-    let word_ranges = word_ranges(text);
-    let mut expanded = Vec::new();
-    for range in ranges {
-        let mut touched_word = false;
-        for word_range in &word_ranges {
-            if ranges_overlap(range, word_range) {
-                expanded.push(word_range.clone());
-                touched_word = true;
-            }
-        }
-        for non_word_range in changed_non_word_ranges(text, range) {
-            expanded.push(non_word_range);
-        }
-        if !touched_word && expanded.last() != Some(range) {
-            expanded.push(range.clone());
-        }
-    }
-    merge_ranges(expanded)
-}
-
-fn word_ranges(text: &str) -> Vec<Range<usize>> {
-    let mut ranges = Vec::new();
-    let mut start = None;
-    for (idx, ch) in text.char_indices() {
-        if is_word_char(ch) {
-            start.get_or_insert(idx);
-            continue;
-        }
-        if let Some(word_start) = start.take() {
-            ranges.push(word_start..idx);
-        }
-    }
-    if let Some(word_start) = start {
-        ranges.push(word_start..text.len());
-    }
-    ranges
-}
-
-fn changed_non_word_ranges(text: &str, range: &Range<usize>) -> Vec<Range<usize>> {
-    text.char_indices()
-        .filter_map(|(idx, ch)| {
-            let end = idx + ch.len_utf8();
-            (range.start < end && idx < range.end && !is_word_char(ch) && !ch.is_whitespace())
-                .then_some(idx..end)
-        })
-        .collect()
-}
-
-fn is_word_char(ch: char) -> bool {
-    ch == '_' || ch.is_alphanumeric()
-}
-
+#[cfg(test)]
 fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
-}
-
-fn merge_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
-    ranges.sort_by_key(|range| range.start);
-    let mut merged: Vec<Range<usize>> = Vec::new();
-    for range in ranges {
-        let Some(last) = merged.last_mut() else {
-            merged.push(range);
-            continue;
-        };
-        if range.start <= last.end {
-            last.end = last.end.max(range.end);
-        } else {
-            merged.push(range);
-        }
-    }
-    merged
-}
-
-fn prefix_suffix_inline_ranges(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
-    let prefix = common_prefix_len(old, new);
-    let suffix = common_suffix_len(&old[prefix..], &new[prefix..]);
-    let old_end = old.len() - suffix;
-    let new_end = new.len() - suffix;
-    let old_ranges = (prefix < old_end)
-        .then_some(prefix..old_end)
-        .into_iter()
-        .collect();
-    let new_ranges = (prefix < new_end)
-        .then_some(prefix..new_end)
-        .into_iter()
-        .collect();
-    (old_ranges, new_ranges)
-}
-
-fn common_prefix_len(left: &str, right: &str) -> usize {
-    left.char_indices()
-        .zip(right.chars())
-        .take_while(|((_, left), right)| left == right)
-        .map(|((idx, ch), _)| idx + ch.len_utf8())
-        .last()
-        .unwrap_or(0)
-}
-
-fn common_suffix_len(left: &str, right: &str) -> usize {
-    let mut suffix_len = 0;
-    for ((_, left), (_, right)) in left.char_indices().rev().zip(right.char_indices().rev()) {
-        if left != right {
-            break;
-        }
-        suffix_len += left.len_utf8();
-    }
-    suffix_len
 }
 
 /// Format a path for display relative to the current working directory when
@@ -2173,15 +2054,43 @@ mod tests {
     }
 
     #[test]
-    fn inline_diff_highlight_pair_expands_changes_to_whole_words() {
+    fn inline_diff_highlight_pair_skips_word_diff_when_change_is_too_large() {
         let (old, new) = inline_diff_highlight_pair("before", "after");
+
+        assert_eq!(old, None);
+        assert_eq!(new, None);
+    }
+
+    #[test]
+    fn inline_diff_highlight_pair_highlights_token_runs() {
+        let old_text = "foo.bar(baz)";
+        let new_text = "foo->bar(quux)";
+        let (old, new) = inline_diff_highlight_pair(old_text, new_text);
 
         let old_ranges = old.expect("old highlight").ranges;
         let new_ranges = new.expect("new highlight").ranges;
-        assert_eq!(old_ranges.len(), 1);
-        assert_eq!(old_ranges[0], 0.."before".len());
-        assert_eq!(new_ranges.len(), 1);
-        assert_eq!(new_ranges[0], 0.."after".len());
+        assert!(old_ranges.contains(&range_for_text(old_text, ".")));
+        assert!(old_ranges.contains(&range_for_text(old_text, "baz")));
+        assert!(new_ranges.contains(&range_for_text(new_text, "->")));
+        assert!(new_ranges.contains(&range_for_text(new_text, "quux")));
+        assert!(!range_is_highlighted(
+            &old_ranges,
+            &range_for_text(old_text, "foo")
+        ));
+        assert!(!range_is_highlighted(
+            &new_ranges,
+            &range_for_text(new_text, "bar")
+        ));
+    }
+
+    #[test]
+    fn inline_diff_highlight_pair_preserves_whitespace_ranges() {
+        let old_text = "let x = 1;";
+        let new_text = "let  x = 1;";
+        let (old, new) = inline_diff_highlight_pair(old_text, new_text);
+
+        assert_eq!(old.expect("old highlight").ranges, vec![3..4]);
+        assert_eq!(new.expect("new highlight").ranges, vec![3..5]);
     }
 
     #[test]
@@ -2202,8 +2111,8 @@ mod tests {
 
     #[test]
     fn inline_diff_highlight_pair_does_not_cascade_to_unrelated_shared_words() {
-        let old = "foo call_id tail";
-        let new = "foo resolved_call_id tail";
+        let old = "prefix foo call_id tail suffix";
+        let new = "prefix foo resolved_call_id tail suffix";
         let (old_highlight, new_highlight) = inline_diff_highlight_pair(old, new);
         let old_ranges = old_highlight.expect("old highlight").ranges;
         let new_ranges = new_highlight.expect("new highlight").ranges;
