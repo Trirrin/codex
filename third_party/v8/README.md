@@ -42,9 +42,7 @@ with these raw asset names:
 - `librusty_v8_release_<target>.a.gz`
 - `src_binding_release_<target>.rs`
 
-The dedicated publishing workflow is `.github/workflows/rusty-v8-release.yml`.
-It builds musl release pairs from source and keeps the release artifacts as the
-statically linked form:
+The musl release pairs are kept as the statically linked form:
 
 - `//third_party/v8:rusty_v8_release_pair_x86_64_unknown_linux_musl`
 - `//third_party/v8:rusty_v8_release_pair_aarch64_unknown_linux_musl`

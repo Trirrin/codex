@@ -1,0 +1,45 @@
+name: commit-check
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}::${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
+jobs:
+  check:
+    name: commit check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+        with:
+          components: rustfmt
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+
+      - name: Verify workspace manifests
+        working-directory: .
+        run: python3 .github/scripts/verify_cargo_workspace_manifests.py
+
+      - name: Verify TUI/core boundary
+        working-directory: .
+        run: python3 .github/scripts/verify_tui_core_boundary.py
+
+      - name: Check formatting
+        run: cargo fmt -- --config imports_granularity=Item --check
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
