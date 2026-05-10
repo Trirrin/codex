@@ -426,7 +426,7 @@ pub fn build_tool_registry_plan(
                     usage_hint_text: config.spawn_agent_usage_hint_text.clone(),
                     max_concurrent_threads_per_session: config.max_concurrent_threads_per_session,
                 }),
-                /*supports_parallel_tool_calls*/ false,
+                /*supports_parallel_tool_calls*/ true,
                 config.code_mode_enabled,
             );
             plan.push_spec(
@@ -472,7 +472,7 @@ pub fn build_tool_registry_plan(
                     usage_hint_text: config.spawn_agent_usage_hint_text.clone(),
                     max_concurrent_threads_per_session: config.max_concurrent_threads_per_session,
                 }),
-                /*supports_parallel_tool_calls*/ false,
+                /*supports_parallel_tool_calls*/ true,
                 config.code_mode_enabled,
             );
             plan.push_spec(

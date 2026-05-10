@@ -196,6 +196,9 @@ fn test_build_specs_collab_tools_enabled() {
     assert_lacks_tool_name(&tools, "spawn_agents_on_csv");
     assert_lacks_tool_name(&tools, "list_agents");
 
+    assert_tool_supports_parallel(&tools, "spawn_agent");
+    assert_tools_do_not_support_parallel(&tools, &["send_input", "wait_agent", "close_agent"]);
+
     let spawn_agent = find_tool(&tools, "spawn_agent");
     let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = &spawn_agent.spec else {
         panic!("spawn_agent should be a function tool");
@@ -278,6 +281,18 @@ fn test_build_specs_multi_agent_v2_uses_task_names_and_hides_resume() {
         &tools,
         &[
             "spawn_agent",
+            "send_message",
+            "followup_task",
+            "wait_agent",
+            "close_agent",
+            "list_agents",
+        ],
+    );
+
+    assert_tool_supports_parallel(&tools, "spawn_agent");
+    assert_tools_do_not_support_parallel(
+        &tools,
+        &[
             "send_message",
             "followup_task",
             "wait_agent",
@@ -2157,6 +2172,22 @@ fn assert_contains_tool_names(tools: &[ConfiguredToolSpec], expected_subset: &[&
         assert!(
             names.contains(expected),
             "expected tool {expected} to be present; had: {names:?}"
+        );
+    }
+}
+
+fn assert_tool_supports_parallel(tools: &[ConfiguredToolSpec], expected_name: &str) {
+    assert!(
+        find_tool(tools, expected_name).supports_parallel_tool_calls,
+        "{expected_name} should support parallel calls"
+    );
+}
+
+fn assert_tools_do_not_support_parallel(tools: &[ConfiguredToolSpec], expected_names: &[&str]) {
+    for name in expected_names {
+        assert!(
+            !find_tool(tools, name).supports_parallel_tool_calls,
+            "{name} should run serially"
         );
     }
 }
