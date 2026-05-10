@@ -1554,14 +1554,22 @@ fn style_with_line_bg(style: Style, line_bg: Style) -> Style {
     line_bg.patch(style)
 }
 
+fn expand_tabs(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_string();
+    }
+
+    text.replace('\t', &" ".repeat(TAB_WIDTH))
+}
+
 /// Split styled spans into chunks that fit within `max_cols` display columns.
 ///
 /// Returns one `Vec<RtSpan>` per output line.  Styles are preserved across
 /// split boundaries so that wrapping never loses syntax coloring.
 ///
 /// The algorithm walks characters using their Unicode display width (with tabs
-/// expanded to [`TAB_WIDTH`] columns).  When a character would overflow the
-/// current line, the accumulated text is flushed and a new line begins.  A
+/// counted and rendered as [`TAB_WIDTH`] spaces).  When a character would overflow
+/// the current line, the accumulated text is flushed and a new line begins.  A
 /// single character wider than the remaining space forces a line break *before*
 /// the character so that progress is always made (avoiding infinite loops on
 /// CJK characters or tabs at the end of a line).
@@ -1605,7 +1613,7 @@ fn wrap_styled_spans(spans: &[RtSpan<'static>], max_cols: usize) -> Vec<Vec<RtSp
                     break;
                 };
                 let ch_len = ch.len_utf8();
-                current_line.push(RtSpan::styled(remaining[..ch_len].to_string(), style));
+                current_line.push(RtSpan::styled(expand_tabs(&remaining[..ch_len]), style));
                 // Use fallback width 1 (not 0) so this branch always advances
                 // even if `ch` has unknown/zero display width.
                 col = ch.width().unwrap_or(if ch == '\t' { TAB_WIDTH } else { 1 });
@@ -1614,7 +1622,7 @@ fn wrap_styled_spans(spans: &[RtSpan<'static>], max_cols: usize) -> Vec<Vec<RtSp
             }
 
             let (chunk, rest) = remaining.split_at(byte_end);
-            current_line.push(RtSpan::styled(chunk.to_string(), style));
+            current_line.push(RtSpan::styled(expand_tabs(chunk), style));
             col += chars_col;
             remaining = rest;
 
@@ -3341,13 +3349,20 @@ mod tests {
     #[test]
     fn wrap_styled_spans_tabs_have_visible_width() {
         // A tab should count as TAB_WIDTH columns, not zero.
-        // With max_cols=8, a tab (4 cols) + "abcde" (5 cols) = 9 cols → must wrap.
+        // With max_cols=8, a tab (4 cols) + "abcde" (5 cols) = 9 cols, so it must wrap.
         let spans = vec![RtSpan::raw("\tabcde")];
         let result = wrap_styled_spans(&spans, /*max_cols*/ 8);
         assert!(
             result.len() >= 2,
             "tab + 5 chars should exceed 8 cols and wrap, got {} line(s): {result:?}",
             result.len()
+        );
+        assert!(
+            result
+                .iter()
+                .flatten()
+                .all(|span| !span.content.contains('\t')),
+            "rendered chunks must not contain literal tabs: {result:?}"
         );
     }
 
@@ -3364,7 +3379,7 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        assert_eq!(line_text, vec!["abcd", "\t", "界"]);
+        assert_eq!(line_text, vec!["abcd", "    ", "界"]);
 
         let line_width = |line: &[RtSpan<'static>]| -> usize {
             line.iter()
