@@ -65,32 +65,81 @@ pub(crate) struct SpawnRequestSummary {
 
 #[derive(Debug)]
 pub(crate) struct BlockingSpawnCell {
-    call_id: String,
-    title_spans: Vec<Span<'static>>,
-    details: Vec<Line<'static>>,
+    entries: Vec<BlockingSpawnEntry>,
     start_time: Instant,
     animations_enabled: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct BlockingSpawnEntry {
+    call_id: String,
+    lines: Vec<Line<'static>>,
+    is_finished: bool,
+}
+
 impl BlockingSpawnCell {
-    pub(crate) fn call_id(&self) -> &str {
-        &self.call_id
+    pub(crate) fn new(entry: BlockingSpawnEntry, animations_enabled: bool) -> Self {
+        Self {
+            entries: vec![entry],
+            start_time: Instant::now(),
+            animations_enabled,
+        }
+    }
+
+    pub(crate) fn contains_call_id(&self, call_id: &str) -> bool {
+        self.entries.iter().any(|entry| entry.call_id == call_id)
+    }
+
+    pub(crate) fn upsert(&mut self, entry: BlockingSpawnEntry) {
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|existing| existing.call_id == entry.call_id)
+        {
+            *existing = entry;
+        } else {
+            self.entries.push(entry);
+        }
+    }
+
+    pub(crate) fn finish(&mut self, call_id: &str, lines: Vec<Line<'static>>) -> bool {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.call_id == call_id)
+        else {
+            return false;
+        };
+        entry.lines = lines;
+        entry.is_finished = true;
+        true
+    }
+
+    pub(crate) fn all_finished(&self) -> bool {
+        self.entries.iter().all(|entry| entry.is_finished)
     }
 }
 
 impl HistoryCell for BlockingSpawnCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        collab_event_lines(
-            title_spans_line_with_bullet(
-                spinner(Some(self.start_time), self.animations_enabled),
-                self.title_spans.clone(),
-            ),
-            self.details.clone(),
-        )
+        let mut lines = Vec::new();
+        for entry in &self.entries {
+            if entry.is_finished {
+                lines.extend(entry.lines.clone());
+            } else {
+                lines.extend(lines_with_animated_bullet(
+                    &entry.lines,
+                    spinner(Some(self.start_time), self.animations_enabled),
+                ));
+            }
+        }
+        lines
     }
 
     fn transcript_animation_tick(&self) -> Option<u64> {
-        self.animations_enabled
+        self.entries
+            .iter()
+            .any(|entry| !entry.is_finished)
             .then(|| self.start_time.elapsed().as_millis() as u64 / 600)
     }
 }
@@ -241,10 +290,7 @@ pub(crate) fn spawn_end(
     collab_event(title, spawn_details(&prompt, tool_summary.as_ref()))
 }
 
-pub(crate) fn blocking_spawn_update(
-    ev: CollabAgentSpawnUpdateEvent,
-    animations_enabled: bool,
-) -> BlockingSpawnCell {
+pub(crate) fn blocking_spawn_entry(ev: CollabAgentSpawnUpdateEvent) -> BlockingSpawnEntry {
     let CollabAgentSpawnUpdateEvent {
         call_id,
         sender_thread_id: _,
@@ -261,21 +307,25 @@ pub(crate) fn blocking_spawn_update(
         model,
         reasoning_effort,
     };
-    BlockingSpawnCell {
+    BlockingSpawnEntry {
         call_id,
-        title_spans: spawn_title_spans(
-            "Starting Subagent ",
-            AgentLabel {
-                thread_id: Some(new_thread_id),
-                nickname: new_agent_nickname.as_deref(),
-                role: new_agent_role.as_deref(),
-            },
-            Some(&spawn_request),
-            CollabAgentToolCallMode::Blocking,
+        lines: collab_event_lines(
+            title_spans_line_with_bullet(
+                "•".dim(),
+                spawn_title_spans(
+                    "Starting Subagent ",
+                    AgentLabel {
+                        thread_id: Some(new_thread_id),
+                        nickname: new_agent_nickname.as_deref(),
+                        role: new_agent_role.as_deref(),
+                    },
+                    Some(&spawn_request),
+                    CollabAgentToolCallMode::Blocking,
+                ),
+            ),
+            spawn_details(&prompt, tool_summary.as_ref()),
         ),
-        details: spawn_details(&prompt, tool_summary.as_ref()),
-        start_time: Instant::now(),
-        animations_enabled,
+        is_finished: false,
     }
 }
 
@@ -430,6 +480,23 @@ fn collab_event_lines(title: Line<'static>, details: Vec<Line<'static>>) -> Vec<
         lines.extend(prefix_lines(details, "  └ ".dim(), "    ".into()));
     }
     lines
+}
+
+fn lines_with_animated_bullet(
+    lines: &[Line<'static>],
+    bullet: Span<'static>,
+) -> Vec<Line<'static>> {
+    let Some((first, rest)) = lines.split_first() else {
+        return Vec::new();
+    };
+    let mut first_spans = first.spans.clone();
+    if let Some(span) = first_spans.first_mut() {
+        *span = bullet;
+    }
+    let mut animated = Vec::with_capacity(lines.len());
+    animated.push(first_spans.into());
+    animated.extend(rest.iter().cloned());
+    animated
 }
 
 fn spawn_details(
@@ -949,8 +1016,8 @@ mod tests {
         let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
             .expect("valid robie thread id");
 
-        let cell = blocking_spawn_update(
-            CollabAgentSpawnUpdateEvent {
+        let cell = BlockingSpawnCell::new(
+            blocking_spawn_entry(CollabAgentSpawnUpdateEvent {
                 call_id: "call-spawn".to_string(),
                 sender_thread_id,
                 new_thread_id: robie_id,
@@ -976,7 +1043,7 @@ mod tests {
                         "Read codex-rs/tui/src/chatwidget.rs".to_string(),
                     ],
                 }),
-            },
+            }),
             /*animations_enabled*/ false,
         );
 
@@ -993,8 +1060,8 @@ mod tests {
         let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
             .expect("valid robie thread id");
 
-        let cell = blocking_spawn_update(
-            CollabAgentSpawnUpdateEvent {
+        let cell = BlockingSpawnCell::new(
+            blocking_spawn_entry(CollabAgentSpawnUpdateEvent {
                 call_id: "call-spawn".to_string(),
                 sender_thread_id,
                 new_thread_id: robie_id,
@@ -1005,7 +1072,7 @@ mod tests {
                 reasoning_effort: ReasoningEffortConfig::High,
                 status: AgentStatus::Running,
                 tool_summary: None,
-            },
+            }),
             /*animations_enabled*/ true,
         );
 

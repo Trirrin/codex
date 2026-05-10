@@ -605,6 +605,122 @@ async fn live_app_server_blocking_spawn_updates_active_cell_with_tool_progress()
 }
 
 #[tokio::test]
+async fn live_app_server_parallel_blocking_spawns_finish_all_active_rows() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b90000000010").expect("valid thread id");
+    let agents = [
+        (
+            "spawn-blocking-a",
+            "019cff70-2599-75e2-af72-b90000000011",
+            "Nash",
+            "Explore root",
+        ),
+        (
+            "spawn-blocking-b",
+            "019cff70-2599-75e2-af72-b90000000012",
+            "Fermat",
+            "Explore workspace",
+        ),
+        (
+            "spawn-blocking-c",
+            "019cff70-2599-75e2-af72-b90000000013",
+            "Godel",
+            "Explore Rust workspace",
+        ),
+    ];
+
+    for (call_id, thread_id, nickname, prompt) in agents {
+        let spawned_thread_id = ThreadId::from_string(thread_id).expect("valid thread id");
+        chat.set_collab_agent_metadata(
+            spawned_thread_id,
+            Some(nickname.to_string()),
+            Some("explorer".to_string()),
+        );
+        chat.handle_server_notification(
+            ServerNotification::ItemStarted(ItemStartedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item: AppServerThreadItem::CollabAgentToolCall {
+                    id: call_id.to_string(),
+                    tool: AppServerCollabAgentTool::SpawnAgent,
+                    status: AppServerCollabAgentToolCallStatus::InProgress,
+                    sender_thread_id: sender_thread_id.to_string(),
+                    receiver_thread_ids: vec![spawned_thread_id.to_string()],
+                    prompt: Some(prompt.to_string()),
+                    model: Some("gpt-5.4-mini".to_string()),
+                    reasoning_effort: Some(ReasoningEffortConfig::Medium),
+                    agents_states: HashMap::from([(
+                        spawned_thread_id.to_string(),
+                        AppServerCollabAgentState {
+                            status: AppServerCollabAgentStatus::Running,
+                            message: None,
+                        },
+                    )]),
+                    tool_progress: None,
+                },
+            }),
+            /*replay_kind*/ None,
+        );
+    }
+
+    assert!(drain_insert_history(&mut rx).is_empty());
+    let active = active_blob(&chat);
+    for nickname in ["Nash", "Fermat", "Godel"] {
+        assert!(
+            active.contains(&format!("Starting Subagent {nickname} [explorer]")),
+            "expected active row for {nickname}, got {active:?}"
+        );
+    }
+
+    for (call_id, thread_id, nickname, prompt) in agents {
+        let spawned_thread_id = ThreadId::from_string(thread_id).expect("valid thread id");
+        chat.handle_server_notification(
+            ServerNotification::ItemCompleted(ItemCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item: AppServerThreadItem::CollabAgentToolCall {
+                    id: call_id.to_string(),
+                    tool: AppServerCollabAgentTool::SpawnAgent,
+                    status: AppServerCollabAgentToolCallStatus::Completed,
+                    sender_thread_id: sender_thread_id.to_string(),
+                    receiver_thread_ids: vec![spawned_thread_id.to_string()],
+                    prompt: Some(prompt.to_string()),
+                    model: Some("gpt-5.4-mini".to_string()),
+                    reasoning_effort: Some(ReasoningEffortConfig::Medium),
+                    agents_states: HashMap::from([(
+                        spawned_thread_id.to_string(),
+                        AppServerCollabAgentState {
+                            status: AppServerCollabAgentStatus::Completed,
+                            message: None,
+                        },
+                    )]),
+                    tool_progress: Some(vec![format!("Read {nickname} result")]),
+                },
+            }),
+            /*replay_kind*/ None,
+        );
+    }
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    let final_rows = lines_to_single_string(&cells[0]);
+    for nickname in ["Nash", "Fermat", "Godel"] {
+        assert!(
+            final_rows.contains(&format!(
+                "Started Subagent {nickname} [explorer] (gpt-5.4-mini medium)"
+            )),
+            "expected completed row for {nickname}, got {final_rows:?}"
+        );
+        assert!(
+            !final_rows.contains(&format!("Starting Subagent {nickname}")),
+            "stale starting row remained for {nickname}: {final_rows:?}"
+        );
+    }
+    assert!(!final_rows.contains("in background"));
+}
+
+#[tokio::test]
 async fn background_spawn_pending_init_footer_renders_running() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let sender_thread_id =

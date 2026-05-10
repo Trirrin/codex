@@ -5274,21 +5274,23 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn on_blocking_spawn_update(&mut self, cell: multi_agents::BlockingSpawnCell) {
+    fn on_blocking_spawn_entry(&mut self, entry: multi_agents::BlockingSpawnEntry) {
         self.flush_answer_stream_with_separator();
-        let call_id = cell.call_id().to_string();
-        if let Some(active) = self.active_cell.as_mut().and_then(|cell| {
-            cell.as_any_mut()
-                .downcast_mut::<multi_agents::BlockingSpawnCell>()
-        }) && active.call_id() == call_id
-        {
-            *active = cell;
-        } else {
-            self.flush_active_cell();
-            self.active_cell = Some(Box::new(cell));
-        }
+        self.upsert_blocking_spawn_entry(entry);
         self.bump_active_cell_revision();
         self.request_redraw();
+    }
+
+    fn upsert_blocking_spawn_entry(&mut self, entry: multi_agents::BlockingSpawnEntry) {
+        if let Some(active) = self.active_blocking_spawn_mut() {
+            active.upsert(entry);
+        } else {
+            self.flush_active_cell();
+            self.active_cell = Some(Box::new(multi_agents::BlockingSpawnCell::new(
+                entry,
+                self.config.animations,
+            )));
+        }
     }
 
     fn finish_active_blocking_spawn(
@@ -5296,21 +5298,18 @@ impl ChatWidget {
         call_id: &str,
         cell: PlainHistoryCell,
     ) -> Option<PlainHistoryCell> {
-        let is_active_spawn = self
-            .active_cell
-            .as_ref()
-            .and_then(|cell| {
-                cell.as_any()
-                    .downcast_ref::<multi_agents::BlockingSpawnCell>()
-            })
-            .is_some_and(|cell| cell.call_id() == call_id);
-        if !is_active_spawn {
+        let final_lines = cell.display_lines(u16::MAX);
+        let Some(active) = self.active_blocking_spawn_mut() else {
+            return Some(cell);
+        };
+        if !active.finish(call_id, final_lines) {
             return Some(cell);
         }
-
-        self.active_cell = Some(Box::new(cell));
+        let all_finished = active.all_finished();
         self.bump_active_cell_revision();
-        self.flush_active_cell();
+        if all_finished {
+            self.flush_active_cell();
+        }
         self.request_redraw();
         None
     }
@@ -5322,7 +5321,14 @@ impl ChatWidget {
                 cell.as_any()
                     .downcast_ref::<multi_agents::BlockingSpawnCell>()
             })
-            .is_some_and(|cell| cell.call_id() == call_id)
+            .is_some_and(|cell| cell.contains_call_id(call_id))
+    }
+
+    fn active_blocking_spawn_mut(&mut self) -> Option<&mut multi_agents::BlockingSpawnCell> {
+        self.active_cell.as_mut().and_then(|cell| {
+            cell.as_any_mut()
+                .downcast_mut::<multi_agents::BlockingSpawnCell>()
+        })
     }
 
     fn collab_tool_progress_summary(
@@ -5419,7 +5425,7 @@ impl ChatWidget {
                             spawned_status.clone(),
                         );
                         if !is_final {
-                            self.on_blocking_spawn_update(multi_agents::blocking_spawn_update(
+                            self.on_blocking_spawn_entry(multi_agents::blocking_spawn_entry(
                                 codex_protocol::protocol::CollabAgentSpawnUpdateEvent {
                                     call_id: id,
                                     sender_thread_id,
@@ -5432,7 +5438,6 @@ impl ChatWidget {
                                     status: spawned_status,
                                     tool_summary: Self::collab_tool_progress_summary(tool_progress),
                                 },
-                                self.config.animations,
                             ));
                         }
                     }
@@ -9003,10 +9008,7 @@ impl ChatWidget {
                     ev.status.clone(),
                 );
                 if !is_final {
-                    self.on_blocking_spawn_update(multi_agents::blocking_spawn_update(
-                        ev,
-                        self.config.animations,
-                    ));
+                    self.on_blocking_spawn_entry(multi_agents::blocking_spawn_entry(ev));
                 }
             }
             EventMsg::CollabAgentSpawnEnd(ev) => {
