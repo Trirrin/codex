@@ -83,11 +83,8 @@ pub fn create_request_user_input_tool(description: String) -> ToolSpec {
     })
 }
 
-pub fn request_user_input_unavailable_message(
-    mode: ModeKind,
-    default_mode_request_user_input: bool,
-) -> Option<String> {
-    if request_user_input_is_available(mode, default_mode_request_user_input) {
+pub fn request_user_input_unavailable_message(mode: ModeKind) -> Option<String> {
+    if mode.allows_request_user_input() {
         None
     } else {
         let mode_name = mode.display_name();
@@ -115,22 +112,17 @@ pub fn normalize_request_user_input_args(
     Ok(args)
 }
 
-pub fn request_user_input_tool_description(default_mode_request_user_input: bool) -> String {
-    let allowed_modes = format_allowed_modes(default_mode_request_user_input);
+pub fn request_user_input_tool_description() -> String {
+    let allowed_modes = format_allowed_modes();
     format!(
         "Request user input for one to three short questions and wait for the response. This tool is only available in {allowed_modes}."
     )
 }
 
-fn request_user_input_is_available(mode: ModeKind, default_mode_request_user_input: bool) -> bool {
-    mode.allows_request_user_input()
-        || (default_mode_request_user_input && mode == ModeKind::Default)
-}
-
-fn format_allowed_modes(default_mode_request_user_input: bool) -> String {
+fn format_allowed_modes() -> String {
     let mode_names: Vec<&str> = TUI_VISIBLE_COLLABORATION_MODES
         .into_iter()
-        .filter(|mode| request_user_input_is_available(*mode, default_mode_request_user_input))
+        .filter(|mode| mode.allows_request_user_input())
         .map(ModeKind::display_name)
         .collect();
 

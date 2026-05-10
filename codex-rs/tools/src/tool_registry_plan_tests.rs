@@ -91,7 +91,7 @@ fn test_full_toolset_specs_for_gpt5_codex_unified_exec_web_search() {
         create_list_shells_tool(),
         create_stop_shell_tool(),
         create_update_plan_tool(),
-        request_user_input_tool_spec(/*default_mode_request_user_input*/ false),
+        request_user_input_tool_spec(),
         create_read_file_tool(),
         create_search_file_tool(),
         create_grep_file_tool(),
@@ -582,9 +582,9 @@ fn test_build_specs_agent_job_worker_tools_enabled() {
 }
 
 #[test]
-fn request_user_input_description_reflects_default_mode_feature_flag() {
+fn request_user_input_description_includes_available_modes() {
     let model_info = model_info();
-    let mut features = Features::with_defaults();
+    let features = Features::with_defaults();
     let available_models = Vec::new();
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &model_info,
@@ -603,33 +603,7 @@ fn request_user_input_description_reflects_default_mode_feature_flag() {
         &[],
     );
     let request_user_input_tool = find_tool(&tools, REQUEST_USER_INPUT_TOOL_NAME);
-    assert_eq!(
-        request_user_input_tool.spec,
-        request_user_input_tool_spec(/*default_mode_request_user_input*/ false)
-    );
-
-    features.enable(Feature::DefaultModeRequestUserInput);
-    let tools_config = ToolsConfig::new(&ToolsConfigParams {
-        model_info: &model_info,
-        available_models: &available_models,
-        features: &features,
-        image_generation_tool_auth_allowed: true,
-        web_search_mode: Some(WebSearchMode::Cached),
-        session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
-        windows_sandbox_level: WindowsSandboxLevel::Disabled,
-    });
-    let (tools, _) = build_specs(
-        &tools_config,
-        /*mcp_tools*/ None,
-        /*deferred_mcp_tools*/ None,
-        &[],
-    );
-    let request_user_input_tool = find_tool(&tools, REQUEST_USER_INPUT_TOOL_NAME);
-    assert_eq!(
-        request_user_input_tool.spec,
-        request_user_input_tool_spec(/*default_mode_request_user_input*/ true)
-    );
+    assert_eq!(request_user_input_tool.spec, request_user_input_tool_spec());
 }
 
 #[test]
@@ -2198,10 +2172,8 @@ fn assert_lacks_tool_name(tools: &[ConfiguredToolSpec], expected_absent: &str) {
     );
 }
 
-fn request_user_input_tool_spec(default_mode_request_user_input: bool) -> ToolSpec {
-    create_request_user_input_tool(request_user_input_tool_description(
-        default_mode_request_user_input,
-    ))
+fn request_user_input_tool_spec() -> ToolSpec {
+    create_request_user_input_tool(request_user_input_tool_description())
 }
 
 fn spawn_agent_tool_options(config: &ToolsConfig) -> SpawnAgentToolOptions<'_> {

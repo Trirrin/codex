@@ -11,9 +11,7 @@ use codex_tools::REQUEST_USER_INPUT_TOOL_NAME;
 use codex_tools::normalize_request_user_input_args;
 use codex_tools::request_user_input_unavailable_message;
 
-pub struct RequestUserInputHandler {
-    pub default_mode_request_user_input: bool,
-}
+pub struct RequestUserInputHandler;
 
 impl ToolHandler for RequestUserInputHandler {
     type Output = FunctionToolOutput;
@@ -47,9 +45,7 @@ impl ToolHandler for RequestUserInputHandler {
         }
 
         let mode = session.collaboration_mode().await.mode;
-        if let Some(message) =
-            request_user_input_unavailable_message(mode, self.default_mode_request_user_input)
-        {
+        if let Some(message) = request_user_input_unavailable_message(mode) {
             return Err(FunctionCallError::RespondToModel(message));
         }
 

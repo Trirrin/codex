@@ -52,15 +52,11 @@ fn default_preset(collaboration_modes_config: CollaborationModesConfig) -> Colla
     }
 }
 
-fn default_mode_instructions(collaboration_modes_config: CollaborationModesConfig) -> String {
+fn default_mode_instructions(_collaboration_modes_config: CollaborationModesConfig) -> String {
     let known_mode_names = format_mode_names(&TUI_VISIBLE_COLLABORATION_MODES);
-    let request_user_input_availability = request_user_input_availability_message(
-        ModeKind::Default,
-        collaboration_modes_config.default_mode_request_user_input,
-    );
-    let asking_questions_guidance = asking_questions_guidance_message(
-        collaboration_modes_config.default_mode_request_user_input,
-    );
+    let request_user_input_availability =
+        request_user_input_availability_message(ModeKind::Default);
+    let asking_questions_guidance = asking_questions_guidance_message();
     COLLABORATION_MODE_DEFAULT_TEMPLATE
         .render([
             (KNOWN_MODE_NAMES_TEMPLATE_KEY, known_mode_names.as_str()),
@@ -86,14 +82,9 @@ fn format_mode_names(modes: &[ModeKind]) -> String {
     }
 }
 
-fn request_user_input_availability_message(
-    mode: ModeKind,
-    default_mode_request_user_input: bool,
-) -> String {
+fn request_user_input_availability_message(mode: ModeKind) -> String {
     let mode_name = mode.display_name();
-    if mode.allows_request_user_input()
-        || (default_mode_request_user_input && mode == ModeKind::Default)
-    {
+    if mode.allows_request_user_input() {
         format!("The `request_user_input` tool is available in {mode_name} mode.")
     } else {
         format!(
@@ -102,12 +93,8 @@ fn request_user_input_availability_message(
     }
 }
 
-fn asking_questions_guidance_message(default_mode_request_user_input: bool) -> String {
-    if default_mode_request_user_input {
-        "In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, prefer using the `request_user_input` tool rather than writing a multiple choice question as a textual assistant message. Never write a multiple choice question as a textual assistant message.".to_string()
-    } else {
-        "In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, ask the user directly with a concise plain-text question. Never write a multiple choice question as a textual assistant message.".to_string()
-    }
+fn asking_questions_guidance_message() -> String {
+    "In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, prefer using the `request_user_input` tool rather than writing a multiple choice question as a textual assistant message. Never write a multiple choice question as a textual assistant message.".to_string()
 }
 
 #[cfg(test)]
