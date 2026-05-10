@@ -176,24 +176,27 @@ impl ToolHandler for Handler {
             .as_ref()
             .and_then(|snapshot| snapshot.reasoning_effort)
             .unwrap_or(args.reasoning_effort.unwrap_or_default());
-        if matches!(mode, AgentToolMode::Blocking)
-            && let Some(thread_id) = new_thread_id
-        {
-            status = wait_for_blocking_spawn_final_status(
-                session.clone(),
-                turn.clone(),
-                BlockingSpawnProgress {
-                    call_id: call_id.clone(),
-                    thread_id,
-                    nickname: new_agent_nickname.clone(),
-                    role: new_agent_role.clone(),
-                    prompt: prompt.clone(),
-                    model: effective_model.clone(),
-                    reasoning_effort: effective_reasoning_effort,
-                },
-                DEFAULT_BLOCKING_AGENT_TIMEOUT_MS,
-            )
-            .await;
+        let spawn_progress = new_thread_id.map(|thread_id| SpawnProgress {
+            call_id: call_id.clone(),
+            thread_id,
+            nickname: new_agent_nickname.clone(),
+            role: new_agent_role.clone(),
+            prompt: prompt.clone(),
+            model: effective_model.clone(),
+            reasoning_effort: effective_reasoning_effort,
+        });
+        if matches!(mode, AgentToolMode::Blocking) {
+            if let Some(progress) = spawn_progress.clone() {
+                status = wait_for_blocking_spawn_final_status(
+                    session.clone(),
+                    turn.clone(),
+                    progress,
+                    DEFAULT_BLOCKING_AGENT_TIMEOUT_MS,
+                )
+                .await;
+            }
+        } else if let Some(progress) = spawn_progress {
+            sync_spawn_final_status_on_completion(session.clone(), turn.clone(), progress);
         }
         let tool_summary = if matches!(mode, AgentToolMode::Blocking) {
             match new_thread_id {

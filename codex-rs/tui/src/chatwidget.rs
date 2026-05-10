@@ -5411,27 +5411,30 @@ impl ChatWidget {
                             .get(&thread_id.to_string())
                             .map(app_server_collab_state_to_core)
                             .unwrap_or(AgentStatus::Running);
+                        let is_final = is_final_agent_status(&spawned_status);
                         self.track_collab_agent_status(
                             thread_id,
                             agent_nickname.clone(),
                             agent_role.clone(),
                             spawned_status.clone(),
                         );
-                        self.on_blocking_spawn_update(multi_agents::blocking_spawn_update(
-                            codex_protocol::protocol::CollabAgentSpawnUpdateEvent {
-                                call_id: id,
-                                sender_thread_id,
-                                new_thread_id: thread_id,
-                                new_agent_nickname: agent_nickname,
-                                new_agent_role: agent_role,
-                                prompt: prompt.unwrap_or_default(),
-                                model: model.unwrap_or_default(),
-                                reasoning_effort: reasoning_effort.unwrap_or_default(),
-                                status: spawned_status,
-                                tool_summary: Self::collab_tool_progress_summary(tool_progress),
-                            },
-                            self.config.animations,
-                        ));
+                        if !is_final {
+                            self.on_blocking_spawn_update(multi_agents::blocking_spawn_update(
+                                codex_protocol::protocol::CollabAgentSpawnUpdateEvent {
+                                    call_id: id,
+                                    sender_thread_id,
+                                    new_thread_id: thread_id,
+                                    new_agent_nickname: agent_nickname,
+                                    new_agent_role: agent_role,
+                                    prompt: prompt.unwrap_or_default(),
+                                    model: model.unwrap_or_default(),
+                                    reasoning_effort: reasoning_effort.unwrap_or_default(),
+                                    status: spawned_status,
+                                    tool_summary: Self::collab_tool_progress_summary(tool_progress),
+                                },
+                                self.config.animations,
+                            ));
+                        }
                     }
                 } else {
                     let is_active_blocking_spawn = self.has_active_blocking_spawn(&id);
@@ -5456,9 +5459,13 @@ impl ChatWidget {
                         .as_ref()
                         .map(|summary| summary.output.clone())
                         .unwrap_or_default();
+                    let is_final_status = is_final_agent_status(&spawned_status);
                     if let Some(thread_id) = first_receiver {
-                        if !is_active_blocking_spawn {
+                        if !is_active_blocking_spawn && !is_final_status {
                             self.background_collab_agent_ids.insert(thread_id);
+                        }
+                        if !is_active_blocking_spawn {
+                            self.track_collab_agent_output(thread_id, tool_output);
                         }
                         self.track_collab_agent_status(
                             thread_id,
@@ -5466,9 +5473,9 @@ impl ChatWidget {
                             agent_role.clone(),
                             spawned_status.clone(),
                         );
-                        if !is_active_blocking_spawn {
-                            self.track_collab_agent_output(thread_id, tool_output);
-                        }
+                    }
+                    if is_final_status && !is_active_blocking_spawn {
+                        return;
                     }
                     let cell = multi_agents::spawn_end(
                         codex_protocol::protocol::CollabAgentSpawnEndEvent {
@@ -8985,16 +8992,22 @@ impl ChatWidget {
                 );
             }
             EventMsg::CollabAgentSpawnUpdate(ev) => {
+                let is_final = is_final_agent_status(&ev.status);
+                if let Some(summary) = ev.tool_summary.as_ref() {
+                    self.track_collab_agent_output(ev.new_thread_id, summary.output.clone());
+                }
                 self.track_collab_agent_status(
                     ev.new_thread_id,
                     ev.new_agent_nickname.clone(),
                     ev.new_agent_role.clone(),
                     ev.status.clone(),
                 );
-                self.on_blocking_spawn_update(multi_agents::blocking_spawn_update(
-                    ev,
-                    self.config.animations,
-                ));
+                if !is_final {
+                    self.on_blocking_spawn_update(multi_agents::blocking_spawn_update(
+                        ev,
+                        self.config.animations,
+                    ));
+                }
             }
             EventMsg::CollabAgentSpawnEnd(ev) => {
                 let is_background =

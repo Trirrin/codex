@@ -439,7 +439,7 @@ pub(crate) fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionC
 }
 
 #[derive(Clone)]
-pub(crate) struct BlockingSpawnProgress {
+pub(crate) struct SpawnProgress {
     pub(crate) call_id: String,
     pub(crate) thread_id: ThreadId,
     pub(crate) nickname: Option<String>,
@@ -449,10 +449,45 @@ pub(crate) struct BlockingSpawnProgress {
     pub(crate) reasoning_effort: ReasoningEffort,
 }
 
+pub(crate) fn sync_spawn_final_status_on_completion(
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    progress: SpawnProgress,
+) {
+    tokio::spawn(async move {
+        let status = match session
+            .services
+            .agent_control
+            .subscribe_status(progress.thread_id)
+            .await
+        {
+            Ok(status_rx) => wait_for_final_status(session.clone(), progress.thread_id, status_rx)
+                .await
+                .map(|(_, status)| status),
+            Err(_) => Some(
+                session
+                    .services
+                    .agent_control
+                    .get_status(progress.thread_id)
+                    .await,
+            ),
+        };
+        let Some(status) = status else {
+            return;
+        };
+        if !crate::agent::status::is_final(&status) {
+            return;
+        }
+
+        let tool_summary = collab_agent_tool_summary(session.clone(), progress.thread_id).await;
+        emit_spawn_update(&session, &turn, &progress, status, tool_summary).await;
+    });
+}
+
 pub(crate) async fn wait_for_blocking_spawn_final_status(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
-    progress: BlockingSpawnProgress,
+    progress: SpawnProgress,
     timeout_ms: i64,
 ) -> AgentStatus {
     let timeout_ms = timeout_ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS);
@@ -500,12 +535,12 @@ pub(crate) async fn wait_for_blocking_spawn_final_status(
 async fn wait_for_blocking_spawn_final_status_inner(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
-    progress: BlockingSpawnProgress,
+    progress: SpawnProgress,
     mut status_rx: Receiver<AgentStatus>,
 ) -> Option<AgentStatus> {
     let mut status = status_rx.borrow().clone();
     let mut last_summary = None;
-    emit_blocking_spawn_update(&session, &turn, &progress, status.clone(), None).await;
+    emit_spawn_update(&session, &turn, &progress, status.clone(), None).await;
     if crate::agent::status::is_final(&status) {
         return Some(status);
     }
@@ -528,17 +563,17 @@ async fn wait_for_blocking_spawn_final_status_inner(
                 let summary = collab_agent_tool_summary(session.clone(), progress.thread_id).await;
                 if summary != last_summary {
                     last_summary = summary.clone();
-                    emit_blocking_spawn_update(&session, &turn, &progress, status.clone(), summary).await;
+                    emit_spawn_update(&session, &turn, &progress, status.clone(), summary).await;
                 }
             }
         }
     }
 }
 
-async fn emit_blocking_spawn_update(
+async fn emit_spawn_update(
     session: &Arc<Session>,
     turn: &Arc<TurnContext>,
-    progress: &BlockingSpawnProgress,
+    progress: &SpawnProgress,
     status: AgentStatus,
     tool_summary: Option<CollabAgentToolSummary>,
 ) {

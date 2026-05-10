@@ -6,6 +6,7 @@ use crate::config::DEFAULT_AGENT_MAX_DEPTH;
 use crate::context::TurnAborted;
 use crate::function_tool::FunctionCallError;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_session_and_context_with_rx;
 use crate::session_prefix::format_subagent_notification_message;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
@@ -834,6 +835,87 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
                         && !communication.trigger_turn
             )
     }));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_background_spawn_completion_syncs_status_without_wait() {
+    let (mut session, mut turn, rx_event) = make_session_and_context_with_rx().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    {
+        let session = Arc::get_mut(&mut session).expect("session should not be shared yet");
+        session.services.agent_control = manager.agent_control();
+        session.conversation_id = root.thread_id;
+    }
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    Arc::get_mut(&mut turn)
+        .expect("turn should not be shared yet")
+        .config = Arc::new(config);
+    let spawn_output = SpawnAgentHandlerV2
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "task_name": "worker"
+            })),
+        ))
+        .await
+        .expect("spawn_agent should succeed");
+    let _ = expect_text_output(spawn_output);
+
+    let child_thread_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.conversation_id, &turn.session_source, "worker")
+        .await
+        .expect("worker should resolve");
+    let child_thread = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+    let child_turn = child_thread.codex.session.new_default_turn().await;
+    child_thread
+        .codex
+        .session
+        .send_event(
+            child_turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: child_turn.sub_id.clone(),
+                last_agent_message: Some("done".to_string()),
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+
+    let update = timeout(Duration::from_secs(5), async {
+        loop {
+            let event = rx_event.recv().await.expect("parent session should emit events");
+            if let EventMsg::CollabAgentSpawnUpdate(update) = event.msg
+                && update.new_thread_id == child_thread_id
+                && matches!(update.status, AgentStatus::Completed(Some(ref message)) if message == "done")
+            {
+                break update;
+            }
+        }
+    })
+    .await
+    .expect("spawn completion status should sync before wait_agent");
+
+    assert_eq!(update.call_id, "call-1");
+    assert_eq!(update.new_agent_role, None);
+    assert_eq!(update.prompt, "inspect this repo");
+    assert_eq!(update.tool_summary, None);
 }
 
 #[tokio::test]

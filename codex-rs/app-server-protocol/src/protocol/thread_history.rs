@@ -619,10 +619,23 @@ impl ThreadHistoryBuilder {
         self.upsert_item_in_current_turn(item);
     }
 
+    fn collab_spawn_update_status(status: &AgentStatus) -> CollabAgentToolCallStatus {
+        match status {
+            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
+            AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted => {
+                CollabAgentToolCallStatus::InProgress
+            }
+            AgentStatus::Completed(_) | AgentStatus::Shutdown => {
+                CollabAgentToolCallStatus::Completed
+            }
+        }
+    }
+
     fn handle_collab_agent_spawn_update(
         &mut self,
         payload: &codex_protocol::protocol::CollabAgentSpawnUpdateEvent,
     ) {
+        let status = Self::collab_spawn_update_status(&payload.status);
         let receiver_id = payload.new_thread_id.to_string();
         let agents_states = [(
             receiver_id.clone(),
@@ -633,7 +646,7 @@ impl ThreadHistoryBuilder {
         self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::SpawnAgent,
-            status: CollabAgentToolCallStatus::InProgress,
+            status,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![receiver_id],
             prompt: Some(payload.prompt.clone()),

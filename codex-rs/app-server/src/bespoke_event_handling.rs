@@ -1134,6 +1134,20 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::CollabAgentSpawnUpdate(update_event) => {
+            let status = match &update_event.status {
+                codex_protocol::protocol::AgentStatus::Errored(_)
+                | codex_protocol::protocol::AgentStatus::NotFound => V2CollabToolCallStatus::Failed,
+                codex_protocol::protocol::AgentStatus::PendingInit
+                | codex_protocol::protocol::AgentStatus::Running
+                | codex_protocol::protocol::AgentStatus::Interrupted => {
+                    V2CollabToolCallStatus::InProgress
+                }
+                codex_protocol::protocol::AgentStatus::Completed(_)
+                | codex_protocol::protocol::AgentStatus::Shutdown => {
+                    V2CollabToolCallStatus::Completed
+                }
+            };
+            let is_final = !matches!(&status, V2CollabToolCallStatus::InProgress);
             let receiver_id = update_event.new_thread_id.to_string();
             let agents_states = [(
                 receiver_id.clone(),
@@ -1144,7 +1158,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             let item = ThreadItem::CollabAgentToolCall {
                 id: update_event.call_id,
                 tool: CollabAgentTool::SpawnAgent,
-                status: V2CollabToolCallStatus::InProgress,
+                status,
                 sender_thread_id: update_event.sender_thread_id.to_string(),
                 receiver_thread_ids: vec![receiver_id],
                 prompt: Some(update_event.prompt),
@@ -1153,14 +1167,25 @@ pub(crate) async fn apply_bespoke_event_handling(
                 agents_states,
                 tool_progress: update_event.tool_summary.map(|summary| summary.output),
             };
-            let notification = ItemStartedNotification {
-                thread_id: conversation_id.to_string(),
-                turn_id: event_turn_id.clone(),
-                item,
-            };
-            outgoing
-                .send_server_notification(ServerNotification::ItemStarted(notification))
-                .await;
+            if is_final {
+                let notification = ItemCompletedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: event_turn_id.clone(),
+                    item,
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::ItemCompleted(notification))
+                    .await;
+            } else {
+                let notification = ItemStartedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: event_turn_id.clone(),
+                    item,
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::ItemStarted(notification))
+                    .await;
+            }
         }
         EventMsg::CollabAgentSpawnEnd(end_event) => {
             let has_receiver = end_event.new_thread_id.is_some();
