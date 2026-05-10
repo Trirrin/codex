@@ -625,7 +625,7 @@ impl ExecCell {
             }
 
             let is_interaction = call.is_unified_exec_interaction();
-            let is_running = call.start_time.is_some() || call.is_background_unified_exec_startup();
+            let is_running = call.start_time.is_some();
             let success = call.output.as_ref().map(|o| o.exit_code == 0);
             let bullet = if is_running {
                 spinner(call.start_time, self.animations_enabled())
@@ -1139,6 +1139,38 @@ mod tests {
             "running command bullet should use the frame-driven spinner, not terminal blink"
         );
         assert_eq!(render_line_text(&lines[0]), "• Running printf done");
+    }
+
+    #[test]
+    fn completed_background_unified_exec_uses_success_title_and_bullet() {
+        let call = ExecCall {
+            call_id: "call-id".to_string(),
+            command: vec!["bash".into(), "-lc".into(), "printf done".into()],
+            parsed: Vec::new(),
+            output: Some(CommandOutput {
+                exit_code: 0,
+                aggregated_output: String::new(),
+                formatted_output: String::new(),
+            }),
+            auto_review_approved: false,
+            source: ExecCommandSource::UnifiedExecStartup,
+            run_mode: Some(ExecCommandRunMode::Background),
+            start_time: None,
+            duration: Some(std::time::Duration::from_millis(5)),
+            interaction_input: None,
+        };
+
+        let cell = ExecCell::new(call, /*animations_enabled*/ true);
+        let lines = cell.command_display_lines(/*width*/ 80);
+        let bullet = &lines[0].spans[0];
+
+        assert_eq!(bullet.content.as_ref(), "•");
+        assert_eq!(bullet.style.fg, Some(Color::Green));
+        assert!(bullet.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            render_line_text(&lines[0]),
+            "• Ran printf done in background (Use down arrow to see details)"
+        );
     }
 
     #[test]

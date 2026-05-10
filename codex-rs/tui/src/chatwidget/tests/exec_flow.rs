@@ -1127,16 +1127,15 @@ async fn exec_history_shows_shell_management_tool_calls() {
 }
 
 #[tokio::test]
-async fn exec_history_shows_background_execute_as_running_without_output() {
+async fn initial_background_execute_response_keeps_running_status_without_output() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();
 
-    let begin = begin_exec_with_source_and_run_mode(
+    let begin = begin_unified_exec_startup(
         &mut chat,
         "call-background",
+        "12345",
         "i=1; while true; do echo $i; sleep 1; done",
-        ExecCommandSource::UnifiedExecStartup,
-        Some(ExecCommandRunMode::Background),
     );
     chat.handle_codex_event(Event {
         id: "sub-output".into(),
@@ -1166,7 +1165,39 @@ async fn exec_history_shows_background_execute_as_running_without_output() {
     );
     assert!(
         !blob.contains("Ran") && !blob.contains("└ 1") && !blob.contains("└ 2"),
-        "background execute should not show Ran or command output: {blob:?}"
+        "initial background response should not show Ran or command output: {blob:?}"
+    );
+}
+
+#[tokio::test]
+async fn background_execute_process_exit_updates_running_status_to_ran() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+
+    let begin =
+        begin_unified_exec_startup(&mut chat, "call-background-done", "12345", "printf done");
+    end_exec(&mut chat, begin.clone(), "", "", /*exit_code*/ 0);
+    assert!(
+        active_blob(&chat).contains("• Running printf done in background"),
+        "initial background response should leave the shell running"
+    );
+
+    let mut exit = begin;
+    exit.process_id = None;
+    end_exec(&mut chat, exit, "done\n", "", /*exit_code*/ 0);
+
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "process exit should update the active background cell in place"
+    );
+    let blob = active_blob(&chat);
+    assert!(
+        blob.contains("• Ran printf done in background (Use down arrow to see details)"),
+        "expected completed background execute status: {blob:?}"
+    );
+    assert!(
+        !blob.contains("Running") && !blob.contains("└ done"),
+        "completed background execute should not show Running or command output: {blob:?}"
     );
 }
 

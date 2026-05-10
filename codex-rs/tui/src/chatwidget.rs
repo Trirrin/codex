@@ -544,6 +544,24 @@ fn is_unified_exec_source(source: ExecCommandSource) -> bool {
     )
 }
 
+fn is_initial_background_tool_response(
+    background_call_ids: &HashSet<String>,
+    seen_initial_background_call_ids: &HashSet<String>,
+    processes: &[UnifiedExecProcessSummary],
+    ev: &ExecCommandEndEvent,
+) -> bool {
+    background_call_ids.contains(&ev.call_id)
+        && !seen_initial_background_call_ids.contains(&ev.call_id)
+        && ev.source == ExecCommandSource::UnifiedExecStartup
+        && ev.process_id.as_ref().is_some_and(|key| {
+            processes.iter().any(|process| {
+                process.key == key.as_str()
+                    && process.call_id == ev.call_id
+                    && matches!(process.run_mode, Some(ExecCommandRunMode::Background))
+            })
+        })
+}
+
 fn is_standard_tool_call(parsed_cmd: &[ParsedCommand]) -> bool {
     !parsed_cmd.is_empty()
         && parsed_cmd
@@ -1037,6 +1055,7 @@ pub(crate) struct ChatWidget {
     running_commands: HashMap<String, RunningCommand>,
     active_model_activities: Vec<ActiveModelActivity>,
     background_unified_exec_call_ids: HashSet<String>,
+    seen_initial_background_unified_exec_call_ids: HashSet<String>,
     unified_exec_interaction_call_ids: HashMap<String, String>,
     background_collab_agent_ids: HashSet<ThreadId>,
     collab_agent_metadata: HashMap<ThreadId, CollabAgentMetadata>,
@@ -3355,6 +3374,7 @@ impl ChatWidget {
         self.running_commands.clear();
         self.clear_model_activities();
         self.background_unified_exec_call_ids.clear();
+        self.seen_initial_background_unified_exec_call_ids.clear();
         self.unified_exec_interaction_call_ids.clear();
         self.suppressed_exec_calls.clear();
         self.pending_auto_review_approvals.clear();
@@ -3822,6 +3842,7 @@ impl ChatWidget {
         self.update_task_running_state();
         self.running_commands.clear();
         self.background_unified_exec_call_ids.clear();
+        self.seen_initial_background_unified_exec_call_ids.clear();
         self.unified_exec_interaction_call_ids.clear();
         self.suppressed_exec_calls.clear();
         self.pending_auto_review_approvals.clear();
@@ -4967,16 +4988,14 @@ impl ChatWidget {
         if ev.source != ExecCommandSource::UnifiedExecStartup {
             return;
         }
-        let is_initial_background_tool_response =
-            self.background_unified_exec_call_ids.remove(&ev.call_id)
-                && ev.process_id.as_ref().is_some_and(|key| {
-                    self.unified_exec_processes.iter().any(|process| {
-                        process.key == key.as_str()
-                            && process.call_id == ev.call_id
-                            && matches!(process.run_mode, Some(ExecCommandRunMode::Background))
-                    })
-                });
-        if is_initial_background_tool_response {
+        if is_initial_background_tool_response(
+            &self.background_unified_exec_call_ids,
+            &self.seen_initial_background_unified_exec_call_ids,
+            &self.unified_exec_processes,
+            ev,
+        ) {
+            self.seen_initial_background_unified_exec_call_ids
+                .insert(ev.call_id.clone());
             return;
         }
         if let Some(key) = ev.process_id.as_ref() {
@@ -6088,28 +6107,50 @@ impl ChatWidget {
         if self.suppressed_exec_calls.remove(&ev.call_id) {
             return;
         }
-        let was_background_unified_exec = self.background_unified_exec_call_ids.remove(&ev.call_id);
+        let is_initial_background_tool_response = is_initial_background_tool_response(
+            &self.background_unified_exec_call_ids,
+            &self.seen_initial_background_unified_exec_call_ids,
+            &self.unified_exec_processes,
+            &ev,
+        );
+        let running_is_background_unified_exec_startup = running.as_ref().is_some_and(|rc| {
+            matches!(rc.source, ExecCommandSource::UnifiedExecStartup)
+                && matches!(rc.run_mode, Some(ExecCommandRunMode::Background))
+        });
         let (command, parsed, source, run_mode) = match running {
             Some(rc) => (rc.command, rc.parsed_cmd, rc.source, rc.run_mode),
             None => (ev.command.clone(), ev.parsed_cmd.clone(), ev.source, None),
         };
-        let is_background_unified_exec = was_background_unified_exec
-            || matches!(run_mode, Some(ExecCommandRunMode::Background))
+        if is_initial_background_tool_response
+            || (running_is_background_unified_exec_startup
+                && self
+                    .seen_initial_background_unified_exec_call_ids
+                    .contains(&ev.call_id))
+        {
+            self.seen_initial_background_unified_exec_call_ids
+                .insert(ev.call_id.clone());
+            self.had_work_activity = true;
+            return;
+        }
+        let was_background_unified_exec = self.background_unified_exec_call_ids.remove(&ev.call_id);
+        let had_initial_background_response = self
+            .seen_initial_background_unified_exec_call_ids
+            .remove(&ev.call_id);
+        let run_mode = if was_background_unified_exec
+            || had_initial_background_response
             || (run_mode.is_none()
                 && matches!(source, ExecCommandSource::UnifiedExecStartup)
-                && ev.process_id.is_some());
-        let run_mode = if is_background_unified_exec {
+                && ev.process_id.is_some())
+        {
             Some(ExecCommandRunMode::Background)
         } else {
             run_mode
         };
-        if is_background_unified_exec {
-            self.had_work_activity = true;
-            return;
-        }
         let parsed = self.annotate_skill_reads_in_parsed_cmd(parsed);
         let is_unified_exec_interaction =
             matches!(source, ExecCommandSource::UnifiedExecInteraction);
+        let is_background_unified_exec = matches!(source, ExecCommandSource::UnifiedExecStartup)
+            && matches!(run_mode, Some(ExecCommandRunMode::Background));
         let is_shell_tool = is_shell_tool_call(&command);
         let is_user_shell = source == ExecCommandSource::UserShell;
         let end_target = match self.active_cell.as_ref() {
@@ -6667,6 +6708,7 @@ impl ChatWidget {
             running_commands: HashMap::new(),
             active_model_activities: Vec::new(),
             background_unified_exec_call_ids: HashSet::new(),
+            seen_initial_background_unified_exec_call_ids: HashSet::new(),
             unified_exec_interaction_call_ids: HashMap::new(),
             background_collab_agent_ids: HashSet::new(),
             collab_agent_metadata: HashMap::new(),

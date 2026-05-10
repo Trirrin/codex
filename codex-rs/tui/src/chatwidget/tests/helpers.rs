@@ -223,6 +223,7 @@ pub(super) async fn make_chatwidget_manual(
         running_commands: HashMap::new(),
         active_model_activities: Vec::new(),
         background_unified_exec_call_ids: HashSet::new(),
+        seen_initial_background_unified_exec_call_ids: HashSet::new(),
         unified_exec_interaction_call_ids: HashMap::new(),
         background_collab_agent_ids: HashSet::new(),
         collab_agent_metadata: HashMap::new(),
