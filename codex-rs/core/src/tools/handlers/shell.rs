@@ -464,24 +464,6 @@ impl ShellHandler {
         )
         .map_err(FunctionCallError::RespondToModel)?;
 
-        // Approval policy guard for explicit escalation in non-OnRequest modes.
-        // Sticky turn permissions have already been approved, so they should
-        // continue through the normal exec approval flow for the command.
-        if effective_additional_permissions
-            .sandbox_permissions
-            .requests_sandbox_override()
-            && !effective_additional_permissions.permissions_preapproved
-            && !matches!(
-                turn.approval_policy.value(),
-                codex_protocol::protocol::AskForApproval::OnRequest
-            )
-        {
-            let approval_policy = turn.approval_policy.value();
-            return Err(FunctionCallError::RespondToModel(format!(
-                "approval policy is {approval_policy:?}; reject command — you should not ask for escalated permissions if the approval policy is {approval_policy:?}"
-            )));
-        }
-
         // Intercept apply_patch if present.
         if let Some(output) = intercept_apply_patch(
             &exec_params.command,

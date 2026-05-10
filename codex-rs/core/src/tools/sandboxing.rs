@@ -317,11 +317,11 @@ pub(crate) trait Approvable<Req> {
     /// Decide we can request an approval for no-sandbox execution.
     fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool {
         match policy {
-            AskForApproval::OnFailure => true,
-            AskForApproval::UnlessTrusted => true,
             AskForApproval::Never => false,
-            AskForApproval::OnRequest => false,
             AskForApproval::Granular(granular_config) => granular_config.sandbox_approval,
+            AskForApproval::OnFailure
+            | AskForApproval::OnRequest
+            | AskForApproval::UnlessTrusted => true,
         }
     }
 

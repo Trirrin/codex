@@ -23,6 +23,7 @@ use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+use crate::tools::sandboxing::ExecApprovalRequirement;
 use crate::unified_exec::ActiveShell;
 use crate::unified_exec::ExecCommandRequest;
 use crate::unified_exec::ShellOutputRequest;
@@ -325,24 +326,6 @@ impl ToolHandler for UnifiedExecHandler {
                     || (session.features().enabled(Feature::RequestPermissionsTool)
                         && effective_additional_permissions.permissions_preapproved);
 
-                // Sticky turn permissions have already been approved, so they should
-                // continue through the normal exec approval flow for the command.
-                if effective_additional_permissions
-                    .sandbox_permissions
-                    .requests_sandbox_override()
-                    && !effective_additional_permissions.permissions_preapproved
-                    && !matches!(
-                        context.turn.approval_policy.value(),
-                        codex_protocol::protocol::AskForApproval::OnRequest
-                    )
-                {
-                    let approval_policy = context.turn.approval_policy.value();
-                    manager.release_process_id(process_id).await;
-                    return Err(FunctionCallError::RespondToModel(format!(
-                        "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
-                    )));
-                }
-
                 let workdir = workdir.filter(|value| !value.is_empty());
 
                 let workdir = workdir.map(|dir| context.turn.resolve_path(Some(dir)));
@@ -400,60 +383,33 @@ impl ToolHandler for UnifiedExecHandler {
                 }
 
                 emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
-                match manager
-                    .exec_command(
-                        ExecCommandRequest {
-                            command,
-                            hook_command: hook_command.clone(),
-                            process_id,
-                            run_mode,
-                            yield_time_ms,
-                            max_output_tokens: Some(max_output_tokens),
-                            workdir,
-                            network: context.turn.network.clone(),
-                            tty,
-                            sandbox_permissions: effective_additional_permissions
-                                .sandbox_permissions,
-                            additional_permissions: normalized_additional_permissions,
-                            additional_permissions_preapproved: effective_additional_permissions
-                                .permissions_preapproved,
-                            justification,
-                            prefix_rule,
-                        },
-                        &context,
-                    )
-                    .await
-                {
-                    Ok(response) => match mode {
-                        ExecuteMode::Background => response,
-                        ExecuteMode::Blocking => {
-                            wait_for_process_exit(manager, response, max_output_tokens).await?
-                        }
-                    },
-                    Err(UnifiedExecError::SandboxDenied { output, .. }) => {
-                        let output_text = output.aggregated_output.text;
-                        let original_token_count = approx_token_count(&output_text);
-                        ExecCommandToolOutput {
-                            event_call_id: context.call_id.clone(),
-                            chunk_id: generate_chunk_id(),
-                            wall_time: output.duration,
-                            raw_output: output_text.into_bytes(),
-                            max_output_tokens: Some(max_output_tokens),
-                            shell_id: None,
-                            // Sandbox denial is terminal, so there is no live
-                            // process for background follow-up polling to resume.
-                            process_id: None,
-                            exit_code: Some(output.exit_code),
-                            original_token_count: Some(original_token_count),
-                            hook_command: Some(hook_command),
-                        }
-                    }
-                    Err(err) => {
-                        return Err(FunctionCallError::RespondToModel(format!(
-                            "execute failed for `{command_for_display}`: {err:?}"
-                        )));
-                    }
-                }
+                let request = ExecCommandRequest {
+                    command,
+                    hook_command: hook_command.clone(),
+                    process_id,
+                    run_mode,
+                    yield_time_ms,
+                    max_output_tokens: Some(max_output_tokens),
+                    workdir,
+                    network: context.turn.network.clone(),
+                    tty,
+                    sandbox_permissions: effective_additional_permissions.sandbox_permissions,
+                    additional_permissions: normalized_additional_permissions,
+                    additional_permissions_preapproved: effective_additional_permissions
+                        .permissions_preapproved,
+                    justification,
+                    exec_approval_requirement_override: None,
+                    prefix_rule,
+                };
+                execute_with_blocking_wait(
+                    manager,
+                    &context,
+                    request,
+                    mode,
+                    max_output_tokens,
+                    &command_for_display,
+                )
+                .await?
             }
             "read_shell_output" => {
                 let args: ShellOutputArgs = parse_arguments(&arguments)?;
@@ -833,6 +789,67 @@ fn format_duration(duration: std::time::Duration) -> String {
     }
 }
 
+async fn execute_with_blocking_wait(
+    manager: &UnifiedExecProcessManager,
+    context: &UnifiedExecContext,
+    mut request: ExecCommandRequest,
+    mode: ExecuteMode,
+    max_output_tokens: usize,
+    command_for_display: &str,
+) -> Result<ExecCommandToolOutput, FunctionCallError> {
+    loop {
+        let response = manager.exec_command(request.clone(), context).await;
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "execute failed for `{command_for_display}`: {err:?}"
+                )));
+            }
+        };
+
+        match mode {
+            ExecuteMode::Background => return Ok(response),
+            ExecuteMode::Blocking => {
+                match wait_for_process_exit(manager, response, max_output_tokens).await {
+                    Ok(response) => return Ok(response),
+                    Err(WaitForProcessExitError::SandboxDenied) => {
+                        escalate_request_for_retry(manager, &mut request, "execute blocking wait")
+                            .await
+                            .map_err(FunctionCallError::RespondToModel)?;
+                    }
+                    Err(WaitForProcessExitError::Message(message)) => {
+                        return Err(FunctionCallError::RespondToModel(message));
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn escalate_request_for_retry(
+    manager: &UnifiedExecProcessManager,
+    request: &mut ExecCommandRequest,
+    operation: &str,
+) -> Result<(), String> {
+    if matches!(
+        request.sandbox_permissions,
+        SandboxPermissions::RequireEscalated
+    ) {
+        return Err(format!("{operation} failed: command denied by sandbox"));
+    }
+
+    request.exec_approval_requirement_override = Some(ExecApprovalRequirement::NeedsApproval {
+        reason: Some("command failed; retry without sandbox?".to_string()),
+        proposed_execpolicy_amendment: None,
+    });
+    request.process_id = manager.allocate_process_id().await;
+    request.sandbox_permissions = SandboxPermissions::RequireEscalated;
+    request.additional_permissions = None;
+    request.additional_permissions_preapproved = false;
+    Ok(())
+}
+
 fn exec_output_from_response(response: &ExecCommandToolOutput) -> ExecToolCallOutput {
     let output = String::from_utf8_lossy(&response.raw_output).to_string();
     ExecToolCallOutput {
@@ -861,11 +878,17 @@ fn emit_unified_exec_tty_metric(session_telemetry: &SessionTelemetry, tty: bool)
     );
 }
 
+#[derive(Debug)]
+enum WaitForProcessExitError {
+    Message(String),
+    SandboxDenied,
+}
+
 async fn wait_for_process_exit(
     manager: &UnifiedExecProcessManager,
     mut response: ExecCommandToolOutput,
     max_output_tokens: usize,
-) -> Result<ExecCommandToolOutput, FunctionCallError> {
+) -> Result<ExecCommandToolOutput, WaitForProcessExitError> {
     let Some(mut process_id) = response.process_id else {
         return Ok(response);
     };
@@ -892,14 +915,17 @@ async fn wait_for_process_exit(
                     })
                     .await
                     .map_err(|err| {
-                        FunctionCallError::RespondToModel(format!(
+                        WaitForProcessExitError::Message(format!(
                             "execute blocking wait failed: {err}"
                         ))
                     })?;
                 (snapshot, true)
             }
+            Err(UnifiedExecError::SandboxDenied { .. }) => {
+                return Err(WaitForProcessExitError::SandboxDenied);
+            }
             Err(err) => {
-                return Err(FunctionCallError::RespondToModel(format!(
+                return Err(WaitForProcessExitError::Message(format!(
                     "execute blocking wait failed: {err}"
                 )));
             }

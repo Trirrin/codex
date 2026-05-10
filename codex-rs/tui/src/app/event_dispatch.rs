@@ -1595,7 +1595,8 @@ impl App {
                 ApprovalRequest::Exec { command, .. } => {
                     let _ = tui.enter_alt_screen();
                     let full_cmd = strip_bash_lc_and_escape(&command);
-                    let full_cmd_lines = highlight_bash_to_lines(&full_cmd);
+                    let cmd_display = truncate_execute_command_display(&full_cmd);
+                    let full_cmd_lines = highlight_bash_to_lines(&cmd_display);
                     self.overlay = Some(Overlay::new_static_with_lines(
                         full_cmd_lines,
                         "E X E C".to_string(),

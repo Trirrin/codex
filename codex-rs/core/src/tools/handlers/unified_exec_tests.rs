@@ -295,6 +295,7 @@ async fn blocking_wait_recovers_after_exit_watcher_completes_process() -> anyhow
                 additional_permissions: None,
                 additional_permissions_preapproved: false,
                 justification: None,
+                exec_approval_requirement_override: None,
                 prefix_rule: None,
             },
             &context,

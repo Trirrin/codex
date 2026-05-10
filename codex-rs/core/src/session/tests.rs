@@ -827,6 +827,65 @@ async fn new_turn_refreshes_managed_network_proxy_for_sandbox_change() -> anyhow
     Ok(())
 }
 
+#[derive(Default)]
+struct ProbeToolRuntime {
+    approval_call_ids: Vec<String>,
+    approval_retry_reasons: Vec<Option<String>>,
+    attempts: Vec<codex_sandboxing::SandboxType>,
+    deny_first_sandboxed_attempt: bool,
+    enforce_managed_network: Vec<bool>,
+}
+
+impl crate::tools::sandboxing::Approvable<()> for ProbeToolRuntime {
+    type ApprovalKey = String;
+
+    fn approval_keys(&self, _req: &()) -> Vec<Self::ApprovalKey> {
+        vec!["probe".to_string()]
+    }
+
+    fn start_approval_async<'a>(
+        &'a mut self,
+        _req: &'a (),
+        ctx: crate::tools::sandboxing::ApprovalCtx<'a>,
+    ) -> futures::future::BoxFuture<'a, ReviewDecision> {
+        self.approval_call_ids.push(ctx.call_id.to_string());
+        self.approval_retry_reasons.push(ctx.retry_reason);
+        Box::pin(async { ReviewDecision::Approved })
+    }
+}
+
+impl crate::tools::sandboxing::Sandboxable for ProbeToolRuntime {
+    fn sandbox_preference(&self) -> codex_sandboxing::SandboxablePreference {
+        codex_sandboxing::SandboxablePreference::Auto
+    }
+}
+
+impl crate::tools::sandboxing::ToolRuntime<(), ()> for ProbeToolRuntime {
+    async fn run(
+        &mut self,
+        _req: &(),
+        attempt: &crate::tools::sandboxing::SandboxAttempt<'_>,
+        _ctx: &crate::tools::sandboxing::ToolCtx,
+    ) -> Result<(), crate::tools::sandboxing::ToolError> {
+        self.attempts.push(attempt.sandbox);
+        self.enforce_managed_network
+            .push(attempt.enforce_managed_network);
+
+        if self.deny_first_sandboxed_attempt && self.attempts.len() == 1 {
+            return Err(crate::tools::sandboxing::ToolError::Codex(
+                codex_protocol::error::CodexErr::Sandbox(
+                    codex_protocol::error::SandboxErr::Denied {
+                        output: Box::new(ExecToolCallOutput::default()),
+                        network_policy_decision: None,
+                    },
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn danger_full_access_turns_do_not_expose_managed_network_proxy() -> anyhow::Result<()> {
     let network_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
@@ -855,46 +914,6 @@ async fn danger_full_access_turns_do_not_expose_managed_network_proxy() -> anyho
 
 #[tokio::test]
 async fn danger_full_access_tool_attempts_do_not_enforce_managed_network() -> anyhow::Result<()> {
-    #[derive(Default)]
-    struct ProbeToolRuntime {
-        enforce_managed_network: Vec<bool>,
-    }
-
-    impl crate::tools::sandboxing::Approvable<()> for ProbeToolRuntime {
-        type ApprovalKey = String;
-
-        fn approval_keys(&self, _req: &()) -> Vec<Self::ApprovalKey> {
-            vec!["probe".to_string()]
-        }
-
-        fn start_approval_async<'a>(
-            &'a mut self,
-            _req: &'a (),
-            _ctx: crate::tools::sandboxing::ApprovalCtx<'a>,
-        ) -> futures::future::BoxFuture<'a, ReviewDecision> {
-            Box::pin(async { ReviewDecision::Approved })
-        }
-    }
-
-    impl crate::tools::sandboxing::Sandboxable for ProbeToolRuntime {
-        fn sandbox_preference(&self) -> codex_sandboxing::SandboxablePreference {
-            codex_sandboxing::SandboxablePreference::Auto
-        }
-    }
-
-    impl crate::tools::sandboxing::ToolRuntime<(), ()> for ProbeToolRuntime {
-        async fn run(
-            &mut self,
-            _req: &(),
-            attempt: &crate::tools::sandboxing::SandboxAttempt<'_>,
-            _ctx: &crate::tools::sandboxing::ToolCtx,
-        ) -> Result<(), crate::tools::sandboxing::ToolError> {
-            self.enforce_managed_network
-                .push(attempt.enforce_managed_network);
-            Ok(())
-        }
-    }
-
     let network_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
         NetworkProxyConfig::default(),
         Some(NetworkConstraints {
@@ -963,6 +982,61 @@ async fn danger_full_access_tool_attempts_do_not_enforce_managed_network() -> an
         .expect("probe runtime should succeed");
 
     assert_eq!(tool.enforce_managed_network, vec![false]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn on_request_sandbox_denial_prompts_for_escalated_retry() -> anyhow::Result<()> {
+    let session = make_session_with_config(|config| {
+        let cwd = config.cwd.clone();
+        config
+            .permissions
+            .set_legacy_sandbox_policy(SandboxPolicy::new_read_only_policy(), cwd.as_path())
+            .expect("test setup should allow sandbox policy");
+        config
+            .permissions
+            .approval_policy
+            .set(AskForApproval::OnRequest)
+            .expect("approval policy should be set");
+    })
+    .await?;
+
+    let turn = session.new_default_turn().await;
+    let mut orchestrator = crate::tools::orchestrator::ToolOrchestrator::new();
+    let mut tool = ProbeToolRuntime {
+        deny_first_sandboxed_attempt: true,
+        ..Default::default()
+    };
+    let tool_ctx = crate::tools::sandboxing::ToolCtx {
+        session: Arc::clone(&session),
+        turn: Arc::clone(&turn),
+        call_id: "probe-call".to_string(),
+        tool_name: "probe".to_string(),
+    };
+
+    orchestrator
+        .run(
+            &mut tool,
+            &(),
+            &tool_ctx,
+            turn.as_ref(),
+            AskForApproval::OnRequest,
+        )
+        .await
+        .expect("probe runtime should retry after approval");
+
+    assert_eq!(tool.attempts.len(), 2);
+    assert_ne!(tool.attempts[0], codex_sandboxing::SandboxType::None);
+    assert_eq!(tool.attempts[1], codex_sandboxing::SandboxType::None);
+    assert_eq!(tool.approval_call_ids, vec!["probe-call", "probe-call"]);
+    assert_eq!(
+        tool.approval_retry_reasons,
+        vec![
+            None,
+            Some("command failed; retry without sandbox?".to_string())
+        ]
+    );
 
     Ok(())
 }

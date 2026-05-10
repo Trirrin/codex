@@ -3,8 +3,7 @@ Module: orchestrator
 
 Central place for approvals + sandbox selection + retry semantics. Drives a
 simple sequence for any ToolRuntime: approval → select sandbox → attempt →
-retry with an escalated sandbox strategy on denial (no re‑approval thanks to
-caching).
+approve retry when needed → retry with an escalated sandbox strategy on denial.
 */
 use crate::guardian::guardian_rejection_message;
 use crate::guardian::guardian_timeout_message;
@@ -260,9 +259,8 @@ impl ToolOrchestrator {
                         network_policy_decision,
                     })));
                 }
-                // Under `Never` or `OnRequest`, do not retry without sandbox;
-                // surface a concise sandbox denial that preserves the
-                // original output.
+                // When policy allows user interaction, ask before retrying without sandbox
+                // instead of forcing the model to resubmit with explicit escalation.
                 if !tool.wants_no_sandbox_approval(approval_policy) {
                     let allow_on_request_network_prompt =
                         matches!(approval_policy, AskForApproval::OnRequest)
@@ -293,8 +291,10 @@ impl ToolOrchestrator {
 
                 // Strict auto-review approval covers the sandboxed attempt only;
                 // retrying without the sandbox requires a fresh guardian review.
+                let already_approved_no_sandbox =
+                    already_approved && matches!(initial_sandbox, SandboxType::None);
                 let bypass_retry_approval = !strict_auto_review
-                    && tool.should_bypass_approval(approval_policy, already_approved)
+                    && tool.should_bypass_approval(approval_policy, already_approved_no_sandbox)
                     && network_approval_context.is_none();
                 if !bypass_retry_approval {
                     let guardian_review_id = use_guardian.then(new_guardian_review_id);

@@ -6,6 +6,7 @@ use super::model::ExecCell;
 use super::model::ExecCellDisplayOptions;
 use super::model::ExploredToolsDisplay;
 use crate::exec_command::strip_bash_lc_and_escape;
+use crate::exec_command::truncate_execute_command_display;
 use crate::history_cell::HistoryCell;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::line_utils::prefix_lines;
@@ -32,7 +33,6 @@ use unicode_width::UnicodeWidthStr;
 pub(crate) const TOOL_CALL_MAX_LINES: usize = 5;
 const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
 const MAX_INTERACTION_PREVIEW_CHARS: usize = 80;
-const MAX_EXECUTE_COMMAND_DISPLAY_CHARS: usize = 20;
 const TRANSCRIPT_HINT: &str = "ctrl + t to view transcript";
 
 pub(crate) struct OutputLinesParams {
@@ -655,16 +655,14 @@ impl ExecCell {
 
             let cmd_display = if call.is_unified_exec_interaction() {
                 format_unified_exec_interaction(&call.command, call.interaction_input.as_deref())
-            } else if call.is_unified_exec_startup() {
-                let display =
-                    truncate_execute_command_display(&strip_bash_lc_and_escape(&call.command));
+            } else {
+                let command = strip_bash_lc_and_escape(&call.command);
+                let display = truncate_execute_command_display(&command);
                 if call.is_background_unified_exec_startup() {
                     format!("{display} in background (Use down arrow to see details)")
                 } else {
                     display
                 }
-            } else {
-                strip_bash_lc_and_escape(&call.command)
             };
             let highlighted_lines = highlight_bash_to_lines(&cmd_display);
 
@@ -939,19 +937,6 @@ impl ExecCell {
     }
 }
 
-fn truncate_execute_command_display(command: &str) -> String {
-    let mut chars = command.chars();
-    let head = chars
-        .by_ref()
-        .take(MAX_EXECUTE_COMMAND_DISPLAY_CHARS)
-        .collect::<String>();
-    if chars.next().is_some() {
-        format!("{head}…")
-    } else {
-        head
-    }
-}
-
 #[derive(Clone, Copy)]
 struct PrefixedBlock {
     initial_prefix: &'static str,
@@ -1121,6 +1106,11 @@ mod tests {
 
     #[test]
     fn running_command_with_live_output_uses_frame_driven_bullet_not_success_bullet() {
+        assert_eq!(
+            truncate_execute_command_display("printf first\nprintf second"),
+            "printf first…"
+        );
+
         let call = ExecCall {
             call_id: "call-id".to_string(),
             command: vec!["bash".into(), "-lc".into(), "printf done".into()],
@@ -1180,6 +1170,63 @@ mod tests {
             /*animations_enabled*/ true,
         );
         assert_eq!(completed.transcript_animation_tick(), None);
+    }
+
+    #[test]
+    fn agent_shell_command_display_truncates_before_wrapping() {
+        let call = ExecCall {
+            call_id: "call-id".to_string(),
+            command: vec![
+                "bash".into(),
+                "-lc".into(),
+                "printf first line && printf second line".into(),
+            ],
+            parsed: Vec::new(),
+            output: None,
+            auto_review_approved: false,
+            source: ExecCommandSource::Agent,
+            run_mode: None,
+            start_time: Some(Instant::now()),
+            duration: None,
+            interaction_input: None,
+        };
+
+        let cell = ExecCell::new(call, /*animations_enabled*/ false);
+        let lines = cell.command_display_lines(/*width*/ 80);
+
+        assert_eq!(
+            render_line_text(&lines[0]),
+            "• Running printf first line && …"
+        );
+    }
+
+    #[test]
+    fn command_display_truncates_at_newline_without_continuation_line() {
+        let call = ExecCall {
+            call_id: "call-id".to_string(),
+            command: vec![
+                "bash".into(),
+                "-lc".into(),
+                "printf first\nprintf second".into(),
+            ],
+            parsed: Vec::new(),
+            output: None,
+            auto_review_approved: false,
+            source: ExecCommandSource::UnifiedExecStartup,
+            run_mode: Some(ExecCommandRunMode::Blocking),
+            start_time: Some(Instant::now()),
+            duration: None,
+            interaction_input: None,
+        };
+
+        let cell = ExecCell::new(call, /*animations_enabled*/ false);
+        let rendered: Vec<String> = cell
+            .command_display_lines(/*width*/ 80)
+            .iter()
+            .map(render_line_text)
+            .collect();
+
+        assert_eq!(rendered, vec!["• Running printf first…".to_string()]);
     }
 
     #[test]

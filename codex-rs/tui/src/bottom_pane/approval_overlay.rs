@@ -10,6 +10,7 @@ use crate::bottom_pane::list_selection_view::ListSelectionView;
 use crate::bottom_pane::list_selection_view::SelectionItem;
 use crate::bottom_pane::list_selection_view::SelectionViewParams;
 use crate::exec_command::strip_bash_lc_and_escape;
+use crate::exec_command::truncate_execute_command_display;
 use crate::history_cell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
@@ -598,7 +599,8 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
                 header.push(Line::from(""));
             }
             let full_cmd = strip_bash_lc_and_escape(command);
-            let mut full_cmd_lines = highlight_bash_to_lines(&full_cmd);
+            let cmd_display = truncate_execute_command_display(&full_cmd);
+            let mut full_cmd_lines = highlight_bash_to_lines(&cmd_display);
             if let Some(first) = full_cmd_lines.first_mut() {
                 first.spans.insert(0, Span::from("$ "));
             }
@@ -1280,6 +1282,32 @@ mod tests {
                 .any(|line| line.contains("echo hello world")),
             "expected header to include command snippet, got {rendered:?}"
         );
+    }
+
+    #[test]
+    fn header_truncates_command_at_newline() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx);
+        let exec_request = ApprovalRequest::Exec {
+            thread_id: ThreadId::new(),
+            thread_label: None,
+            id: "test".into(),
+            command: vec![
+                "bash".into(),
+                "-lc".into(),
+                "printf first\nprintf second".into(),
+            ],
+            reason: None,
+            available_decisions: vec![ReviewDecision::Approved, ReviewDecision::Abort],
+            network_approval_context: None,
+            additional_permissions: None,
+        };
+
+        let view = ApprovalOverlay::new(exec_request, tx, Features::with_defaults());
+        let rendered = render_overlay_lines(&view, /*width*/ 80);
+
+        assert!(rendered.contains("$ printf first…"));
+        assert!(!rendered.contains("printf second"));
     }
 
     #[test]

@@ -16,6 +16,24 @@ pub(crate) fn strip_bash_lc_and_escape(command: &[String]) -> String {
     escape_command(command)
 }
 
+pub(crate) const MAX_EXECUTE_COMMAND_DISPLAY_CHARS: usize = 20;
+
+pub(crate) fn truncate_execute_command_display(command: &str) -> String {
+    let mut out = String::new();
+    for (index, ch) in command.chars().enumerate() {
+        if matches!(ch, '\n' | '\r') {
+            out.push('…');
+            return out;
+        }
+        if index == MAX_EXECUTE_COMMAND_DISPLAY_CHARS {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 pub(crate) fn split_command_string(command: &str) -> Vec<String> {
     let Some(parts) = shlex::split(command) else {
         return vec![command.to_string()];

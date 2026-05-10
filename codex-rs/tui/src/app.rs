@@ -34,6 +34,7 @@ use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::split_command_string;
 use crate::exec_command::strip_bash_lc_and_escape;
+use crate::exec_command::truncate_execute_command_display;
 use crate::external_agent_config_migration_startup::ExternalAgentConfigMigrationStartupOutcome;
 use crate::external_agent_config_migration_startup::handle_external_agent_config_migration_prompt_if_needed;
 use crate::external_editor;
