@@ -39,6 +39,7 @@ use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandRunMode;
 use codex_protocol::protocol::ExecCommandSource;
@@ -408,6 +409,7 @@ impl ToolHandler for UnifiedExecHandler {
                     mode,
                     max_output_tokens,
                     &command_for_display,
+                    context.turn.approval_policy.value(),
                 )
                 .await?
             }
@@ -796,11 +798,23 @@ async fn execute_with_blocking_wait(
     mode: ExecuteMode,
     max_output_tokens: usize,
     command_for_display: &str,
+    approval_policy: AskForApproval,
 ) -> Result<ExecCommandToolOutput, FunctionCallError> {
     loop {
         let response = manager.exec_command(request.clone(), context).await;
         let response = match response {
             Ok(response) => response,
+            Err(UnifiedExecError::SandboxDenied { .. }) => {
+                escalate_request_for_retry(
+                    manager,
+                    &mut request,
+                    "execute startup",
+                    approval_policy,
+                )
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+                continue;
+            }
             Err(err) => {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "execute failed for `{command_for_display}`: {err:?}"
@@ -814,9 +828,14 @@ async fn execute_with_blocking_wait(
                 match wait_for_process_exit(manager, response, max_output_tokens).await {
                     Ok(response) => return Ok(response),
                     Err(WaitForProcessExitError::SandboxDenied) => {
-                        escalate_request_for_retry(manager, &mut request, "execute blocking wait")
-                            .await
-                            .map_err(FunctionCallError::RespondToModel)?;
+                        escalate_request_for_retry(
+                            manager,
+                            &mut request,
+                            "execute blocking wait",
+                            approval_policy,
+                        )
+                        .await
+                        .map_err(FunctionCallError::RespondToModel)?;
                     }
                     Err(WaitForProcessExitError::Message(message)) => {
                         return Err(FunctionCallError::RespondToModel(message));
@@ -831,11 +850,15 @@ async fn escalate_request_for_retry(
     manager: &UnifiedExecProcessManager,
     request: &mut ExecCommandRequest,
     operation: &str,
+    approval_policy: AskForApproval,
 ) -> Result<(), String> {
     if matches!(
         request.sandbox_permissions,
         SandboxPermissions::RequireEscalated
     ) {
+        return Err(format!("{operation} failed: command denied by sandbox"));
+    }
+    if !approval_policy_allows_sandbox_retry(approval_policy) {
         return Err(format!("{operation} failed: command denied by sandbox"));
     }
 
@@ -848,6 +871,16 @@ async fn escalate_request_for_retry(
     request.additional_permissions = None;
     request.additional_permissions_preapproved = false;
     Ok(())
+}
+
+fn approval_policy_allows_sandbox_retry(policy: AskForApproval) -> bool {
+    match policy {
+        AskForApproval::Never => false,
+        AskForApproval::Granular(config) => config.sandbox_approval,
+        AskForApproval::OnFailure | AskForApproval::OnRequest | AskForApproval::UnlessTrusted => {
+            true
+        }
+    }
 }
 
 fn exec_output_from_response(response: &ExecCommandToolOutput) -> ExecToolCallOutput {

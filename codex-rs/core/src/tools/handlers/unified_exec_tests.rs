@@ -4,6 +4,8 @@ use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_workdir_base_path;
 use codex_protocol::models::AdditionalPermissionProfile as PermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::ExecCommandRunMode;
 use codex_tools::UnifiedExecShellMode;
 use codex_tools::ZshForkConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -318,6 +320,114 @@ async fn blocking_wait_recovers_after_exit_watcher_completes_process() -> anyhow
     assert_eq!(output.exit_code, Some(0));
     assert_eq!(text.matches("start").count(), 1);
     assert_eq!(text.matches("end").count(), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sandbox_retry_request_requires_policy_that_allows_prompt() -> anyhow::Result<()> {
+    let (session, _turn) = make_session_and_context().await;
+    let manager = &session.services.unified_exec_manager;
+    let mut request = ExecCommandRequest {
+        command: vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "echo retry".to_string(),
+        ],
+        hook_command: "echo retry".to_string(),
+        process_id: manager.allocate_process_id().await,
+        run_mode: ExecCommandRunMode::Blocking,
+        yield_time_ms: 1000,
+        max_output_tokens: None,
+        workdir: None,
+        network: None,
+        tty: false,
+        sandbox_permissions: SandboxPermissions::UseDefault,
+        additional_permissions: None,
+        additional_permissions_preapproved: false,
+        justification: None,
+        exec_approval_requirement_override: None,
+        prefix_rule: None,
+    };
+    let original_process_id = request.process_id;
+
+    escalate_request_for_retry(
+        manager,
+        &mut request,
+        "execute startup",
+        AskForApproval::OnFailure,
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(
+        request.sandbox_permissions,
+        SandboxPermissions::RequireEscalated
+    );
+    assert_eq!(request.additional_permissions, None);
+    assert!(!request.additional_permissions_preapproved);
+    assert_ne!(request.process_id, original_process_id);
+    assert_eq!(
+        request.exec_approval_requirement_override,
+        Some(ExecApprovalRequirement::NeedsApproval {
+            reason: Some("command failed; retry without sandbox?".to_string()),
+            proposed_execpolicy_amendment: None,
+        })
+    );
+
+    let err = escalate_request_for_retry(
+        manager,
+        &mut request,
+        "execute startup",
+        AskForApproval::OnFailure,
+    )
+    .await
+    .expect_err("require escalated retries should not recurse");
+    assert_eq!(err, "execute startup failed: command denied by sandbox");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sandbox_retry_request_respects_never_policy() -> anyhow::Result<()> {
+    let (session, _turn) = make_session_and_context().await;
+    let manager = &session.services.unified_exec_manager;
+    let mut request = ExecCommandRequest {
+        command: vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "echo retry".to_string(),
+        ],
+        hook_command: "echo retry".to_string(),
+        process_id: manager.allocate_process_id().await,
+        run_mode: ExecCommandRunMode::Blocking,
+        yield_time_ms: 1000,
+        max_output_tokens: None,
+        workdir: None,
+        network: None,
+        tty: false,
+        sandbox_permissions: SandboxPermissions::UseDefault,
+        additional_permissions: None,
+        additional_permissions_preapproved: false,
+        justification: None,
+        exec_approval_requirement_override: None,
+        prefix_rule: None,
+    };
+    let original_process_id = request.process_id;
+
+    let err = escalate_request_for_retry(
+        manager,
+        &mut request,
+        "execute startup",
+        AskForApproval::Never,
+    )
+    .await
+    .expect_err("Never policy should not ask for a sandbox retry approval");
+
+    assert_eq!(err, "execute startup failed: command denied by sandbox");
+    assert_eq!(request.sandbox_permissions, SandboxPermissions::UseDefault);
+    assert_eq!(request.exec_approval_requirement_override, None);
+    assert_eq!(request.process_id, original_process_id);
 
     Ok(())
 }
