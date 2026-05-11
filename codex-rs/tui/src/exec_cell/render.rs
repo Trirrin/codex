@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Instant;
 
 use super::model::CommandOutput;
@@ -34,6 +35,9 @@ pub(crate) const TOOL_CALL_MAX_LINES: usize = 5;
 const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
 const MAX_INTERACTION_PREVIEW_CHARS: usize = 80;
 const TRANSCRIPT_HINT: &str = "ctrl + t to view transcript";
+const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
+const DEFAULT_CODEX_HOME_DIR: &str = ".codex";
+const MEMORIES_DIR_NAME: &str = "memories";
 
 pub(crate) struct OutputLinesParams {
     pub(crate) line_limit: usize,
@@ -384,6 +388,7 @@ enum ExploredToolKind {
     Grep,
     Glob,
     Search,
+    Recall,
 }
 
 struct ExploredToolCount {
@@ -393,6 +398,10 @@ struct ExploredToolCount {
 
 impl ExploredToolKind {
     fn from_parsed(parsed: &ParsedCommand) -> Option<Self> {
+        if is_memory_parsed_command(parsed) {
+            return Some(Self::Recall);
+        }
+
         match parsed {
             ParsedCommand::Read { .. } => Some(Self::Read),
             ParsedCommand::ListFiles { .. } => Some(Self::List),
@@ -413,6 +422,7 @@ impl ExploredToolKind {
             Self::Grep => "Grep".magenta().bold(),
             Self::Glob => "Glob".red().bold(),
             Self::Search => "Search".bold(),
+            Self::Recall => "Recall".cyan().bold(),
         }
     }
 
@@ -426,7 +436,49 @@ impl ExploredToolKind {
             (Self::Grep, _) => "searches",
             (Self::Glob, 1) => "pattern",
             (Self::Glob, _) => "patterns",
+            (Self::Recall, 1) => "memory",
+            (Self::Recall, _) => "memories",
         }
+    }
+}
+
+fn is_memory_path(value: &str) -> bool {
+    let path = Path::new(value);
+    std::env::var_os(CODEX_HOME_ENV_VAR).is_some_and(|home| {
+        let memories_dir = Path::new(&home).join(MEMORIES_DIR_NAME);
+        is_under_directory(path, memories_dir.as_path())
+            || command_mentions_directory(value, &memories_dir)
+    }) || dirs::home_dir().is_some_and(|home| {
+        let memories_dir = home.join(DEFAULT_CODEX_HOME_DIR).join(MEMORIES_DIR_NAME);
+        is_under_directory(path, memories_dir.as_path())
+            || command_mentions_directory(value, &memories_dir)
+    }) || value.ends_with("/.codex/memories")
+        || value.contains("/.codex/memories/")
+}
+
+fn command_mentions_directory(value: &str, directory: &Path) -> bool {
+    value.contains(&directory.to_string_lossy().to_string())
+}
+
+fn is_under_directory(path: &Path, directory: &Path) -> bool {
+    path == directory || path.starts_with(directory)
+}
+
+fn memory_count_spans(count: usize) -> Vec<Span<'static>> {
+    vec![
+        count.to_string().into(),
+        format!(" {}", ExploredToolKind::Recall.noun(count)).dim(),
+    ]
+}
+
+fn is_memory_parsed_command(parsed: &ParsedCommand) -> bool {
+    match parsed {
+        ParsedCommand::Read { path, .. } => is_memory_path(&path.to_string_lossy()),
+        ParsedCommand::ListFiles { path, .. } => path.as_deref().is_some_and(is_memory_path),
+        ParsedCommand::Search { cmd, path, .. } => {
+            path.as_deref().is_some_and(is_memory_path) || is_memory_path(cmd)
+        }
+        ParsedCommand::Unknown { .. } => false,
     }
 }
 
@@ -555,8 +607,11 @@ impl ExecCell {
                 .parsed
                 .iter()
                 .all(|parsed| matches!(parsed, ParsedCommand::Read { .. }));
+            let recall_only = call.parsed.iter().all(is_memory_parsed_command);
 
-            let call_lines: Vec<(&str, Vec<Span<'static>>)> = if reads_only {
+            let call_lines: Vec<(&str, Vec<Span<'static>>)> = if recall_only {
+                vec![("Recall", memory_count_spans(call.parsed.len()))]
+            } else if reads_only {
                 let names = call
                     .parsed
                     .iter()
@@ -573,21 +628,36 @@ impl ExecCell {
                 let mut lines = Vec::new();
                 for parsed in &call.parsed {
                     match parsed {
-                        ParsedCommand::Read { name, cmd, .. } => {
-                            lines.push(("Read", Self::read_display_spans(name, cmd)));
+                        ParsedCommand::Read { name, cmd, path } => {
+                            if is_memory_path(&path.to_string_lossy()) {
+                                lines.push(("Recall", memory_count_spans(1)));
+                            } else {
+                                lines.push(("Read", Self::read_display_spans(name, cmd)));
+                            }
                         }
                         ParsedCommand::ListFiles { cmd, path } => {
-                            lines.push(("List", vec![path.clone().unwrap_or(cmd.clone()).into()]));
+                            if path.as_deref().is_some_and(is_memory_path) {
+                                lines.push(("Recall", memory_count_spans(1)));
+                            } else {
+                                lines.push((
+                                    "List",
+                                    vec![path.clone().unwrap_or(cmd.clone()).into()],
+                                ));
+                            }
                         }
                         ParsedCommand::Search { cmd, query, path } => {
-                            let spans = match (query, path) {
-                                (Some(q), Some(p)) => {
-                                    vec![q.clone().into(), " in ".dim(), p.clone().into()]
-                                }
-                                (Some(q), None) => vec![q.clone().into()],
-                                _ => vec![cmd.clone().into()],
-                            };
-                            lines.push((Self::search_title(cmd), spans));
+                            if is_memory_parsed_command(parsed) {
+                                lines.push(("Recall", memory_count_spans(1)));
+                            } else {
+                                let spans = match (query, path) {
+                                    (Some(q), Some(p)) => {
+                                        vec![q.clone().into(), " in ".dim(), p.clone().into()]
+                                    }
+                                    (Some(q), None) => vec![q.clone().into()],
+                                    _ => vec![cmd.clone().into()],
+                                };
+                                lines.push((Self::search_title(cmd), spans));
+                            }
                         }
                         ParsedCommand::Unknown { cmd } => {
                             lines.push(("Run", vec![cmd.clone().into()]));
@@ -1004,6 +1074,10 @@ mod tests {
 
     #[test]
     fn compact_explored_summary_counts_tools_with_styles() {
+        assert!(!is_memory_path(
+            "/home/Trirrin/.codex/memories-old/MEMORY.md"
+        ));
+
         let cell = ExecCell::new(
             ExecCall {
                 call_id: "call-id".to_string(),
@@ -1068,6 +1142,88 @@ mod tests {
                 Some(Color::Green),
             ]
         );
+    }
+
+    #[test]
+    fn compact_memory_exploration_renders_as_recall() {
+        let cell = ExecCell::new(
+            ExecCall {
+                call_id: "call-id".to_string(),
+                command: vec!["bash".into(), "-lc".into(), "explore".into()],
+                parsed: vec![
+                    ParsedCommand::Read {
+                        name: "MEMORY.md".into(),
+                        cmd: "read_file /home/Trirrin/.codex/memories/MEMORY.md".into(),
+                        path: "/home/Trirrin/.codex/memories/MEMORY.md".into(),
+                    },
+                    ParsedCommand::Search {
+                        cmd: "grep_file memory /home/Trirrin/.codex/memories/MEMORY.md".into(),
+                        query: Some("memory".into()),
+                        path: Some("/home/Trirrin/.codex/memories/MEMORY.md".into()),
+                    },
+                    ParsedCommand::Search {
+                        cmd: "glob_file /home/Trirrin/.codex/memories/rollout_summaries/*.jsonl"
+                            .into(),
+                        query: Some("rollout_summaries/*.jsonl".into()),
+                        path: None,
+                    },
+                ],
+                output: Some(CommandOutput::default()),
+                auto_review_approved: false,
+                source: ExecCommandSource::Agent,
+                run_mode: None,
+                start_time: None,
+                duration: Some(std::time::Duration::from_millis(1)),
+                interaction_input: None,
+            },
+            /*animations_enabled*/ false,
+        );
+
+        let lines = cell.display_lines(/*width*/ 80);
+        assert_eq!(render_line_text(&lines[0]), "• Recall 3 memories");
+    }
+
+    #[test]
+    fn detailed_memory_exploration_renders_as_recall() {
+        let cell = ExecCell::new(
+            ExecCall {
+                call_id: "call-id".to_string(),
+                command: vec!["bash".into(), "-lc".into(), "explore".into()],
+                parsed: vec![
+                    ParsedCommand::Read {
+                        name: "MEMORY.md".into(),
+                        cmd: "read_file /home/Trirrin/.codex/memories/MEMORY.md".into(),
+                        path: "/home/Trirrin/.codex/memories/MEMORY.md".into(),
+                    },
+                    ParsedCommand::Search {
+                        cmd: "grep_file memory /home/Trirrin/.codex/memories/MEMORY.md".into(),
+                        query: Some("memory".into()),
+                        path: Some("/home/Trirrin/.codex/memories/MEMORY.md".into()),
+                    },
+                ],
+                output: Some(CommandOutput::default()),
+                auto_review_approved: false,
+                source: ExecCommandSource::Agent,
+                run_mode: None,
+                start_time: None,
+                duration: Some(std::time::Duration::from_millis(1)),
+                interaction_input: None,
+            },
+            /*animations_enabled*/ false,
+        )
+        .with_explored_tools_display(ExploredToolsDisplay::Detailed);
+
+        let rendered = cell
+            .display_lines(/*width*/ 80)
+            .iter()
+            .map(render_line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("• Explored"));
+        assert!(rendered.contains("Recall 2 memories"));
+        assert!(!rendered.contains("Read MEMORY.md"));
+        assert!(!rendered.contains("Grep memory"));
     }
 
     #[test]
