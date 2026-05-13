@@ -5,7 +5,7 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
 
 
 
-• Ran rm -f /tmp/guardian-approved.sqlite
+• Ran rm -f /tmp/guardian-…
   └ Approved by Auto reviewer.
   └ (no output)
 

@@ -48,6 +48,9 @@ The solution is to detect paste-like _bursts_ and buffer them into a single expl
   history navigation, etc).
 - After handling the key, `sync_popups()` runs so popup visibility/filters stay consistent with the
   latest text + cursor.
+- When a file search item is accepted, the active `@...` token is replaced with an atomic
+  `@path` text element. The element renders distinctly, survives local recall, and is later
+  expanded by `ChatWidget` only in the model-facing input.
 - When a slash command name is completed and the user types a space, the `/command` token is
   promoted into a text element so it renders distinctly and edits atomically.
 
@@ -112,9 +115,11 @@ the input starts with `!` (shell command).
 `handle_submission` calls `prepare_submission_text` for both submit and queue. That method:
 
 1. Expands any pending paste placeholders so element ranges align with the final text.
-2. Trims whitespace and rebases element ranges to the trimmed buffer.
-3. Prunes attachments so only placeholders that survive trimming are sent.
-4. Clears pending pastes on success and suppresses submission if the final text is empty and there
+2. Preserves selected `@file` text elements; `ChatWidget` reads those files and replaces only the
+   model-facing token with a truncated `<file ...>` block.
+3. Trims whitespace and rebases element ranges to the trimmed buffer.
+4. Prunes attachments so only placeholders that survive trimming are sent.
+5. Clears pending pastes on success and suppresses submission if the final text is empty and there
    are no attachments.
 
 The same preparation path is reused for slash commands with arguments (for example `/plan` and

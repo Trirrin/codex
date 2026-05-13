@@ -4,6 +4,7 @@
 //!
 //! - Editing the input buffer (a [`TextArea`]), including placeholder "elements" for attachments.
 //! - Routing keys to the active popup (slash commands, file search, skill/apps mentions).
+//! - Promoting selected file and tool mentions into atomic elements.
 //! - Promoting typed slash commands into atomic elements when the command name is completed.
 //! - Handling submit vs newline on Enter.
 //! - Turning raw key streams into explicit paste operations on platforms where terminals
@@ -45,6 +46,7 @@
 //! On submit/queue paths, the composer:
 //!
 //! - Expands pending paste placeholders so element ranges align with the final text.
+//! - Keeps selected `@file` mentions as atomic elements for downstream model-input expansion.
 //! - Trims whitespace and rebases text elements accordingly.
 //! - Prunes local attached images so only placeholders that survive expansion are sent.
 //! - Preserves remote image URLs as separate attachments even when text is empty.
@@ -411,6 +413,7 @@ struct ComposerDraft {
 
 #[derive(Clone, Debug)]
 struct ComposerMentionBinding {
+    token: String,
     mention: String,
     path: String,
 }
@@ -594,11 +597,11 @@ impl ChatComposer {
     }
 
     pub(crate) fn take_mention_bindings(&mut self) -> Vec<MentionBinding> {
-        let elements = self.current_mention_elements();
+        let elements = self.current_bound_elements();
         let mut ordered = Vec::new();
-        for (id, mention) in elements {
+        for (id, token) in elements {
             if let Some(binding) = self.mention_bindings.remove(&id)
-                && binding.mention == mention
+                && binding.token == token
             {
                 ordered.push(MentionBinding {
                     mention: binding.mention,
@@ -2163,76 +2166,57 @@ impl ChatComposer {
         Self::current_prefixed_token(&self.textarea, '$', /*allow_empty*/ true)
     }
 
-    /// Replace the active `@token` (the one under the cursor) with `path`.
-    ///
-    /// The algorithm mirrors `current_at_token` so replacement works no matter
-    /// where the cursor is within the token and regardless of how many
-    /// `@tokens` exist in the line.
-    fn insert_selected_path(&mut self, path: &str) {
+    fn active_token_range(&self) -> Option<Range<usize>> {
         let cursor_offset = self.textarea.cursor();
         let text = self.textarea.text();
-        // Clamp to a valid char boundary to avoid panics when slicing.
         let safe_cursor = Self::clamp_to_char_boundary(text, cursor_offset);
-
         let before_cursor = &text[..safe_cursor];
         let after_cursor = &text[safe_cursor..];
 
-        // Determine token boundaries.
         let start_idx = before_cursor
             .char_indices()
             .rfind(|(_, c)| c.is_whitespace())
             .map(|(idx, c)| idx + c.len_utf8())
             .unwrap_or(0);
-
         let end_rel_idx = after_cursor
             .char_indices()
             .find(|(_, c)| c.is_whitespace())
             .map(|(idx, _)| idx)
             .unwrap_or(after_cursor.len());
-        let end_idx = safe_cursor + end_rel_idx;
+        Some(start_idx..safe_cursor + end_rel_idx)
+    }
 
-        // If the path contains whitespace, wrap it in double quotes so the
-        // local prompt arg parser treats it as a single argument. Avoid adding
-        // quotes when the path already contains one to keep behavior simple.
-        let needs_quotes = path.chars().any(char::is_whitespace);
-        let inserted = if needs_quotes && !path.contains('"') {
-            format!("\"{path}\"")
-        } else {
-            path.to_string()
+    /// Replace the active `@token` with an atomic file mention.
+    fn insert_selected_path(&mut self, path: &str) {
+        let Some(token_range) = self.active_token_range() else {
+            return;
         };
+        let insert_text = format!("@{path}");
 
-        // Replace just the active `@token` so unrelated text elements, such as
-        // large-paste placeholders, remain atomic and can still expand on submit.
+        self.textarea.replace_range(token_range.clone(), "");
+        self.textarea.set_cursor(token_range.start);
+        let id = self.textarea.insert_element(&insert_text);
+        self.mention_bindings.insert(
+            id,
+            ComposerMentionBinding {
+                token: insert_text,
+                mention: path.to_string(),
+                path: path.to_string(),
+            },
+        );
+        self.textarea.insert_str(" ");
         self.textarea
-            .replace_range(start_idx..end_idx, &format!("{inserted} "));
-        let new_cursor = start_idx.saturating_add(inserted.len()).saturating_add(1);
-        self.textarea.set_cursor(new_cursor);
+            .set_cursor(token_range.start + path.len().saturating_add(2));
     }
 
     fn insert_selected_mention(&mut self, insert_text: &str, path: Option<&str>) {
-        let cursor_offset = self.textarea.cursor();
-        let text = self.textarea.text();
-        let safe_cursor = Self::clamp_to_char_boundary(text, cursor_offset);
-
-        let before_cursor = &text[..safe_cursor];
-        let after_cursor = &text[safe_cursor..];
-
-        let start_idx = before_cursor
-            .char_indices()
-            .rfind(|(_, c)| c.is_whitespace())
-            .map(|(idx, c)| idx + c.len_utf8())
-            .unwrap_or(0);
-
-        let end_rel_idx = after_cursor
-            .char_indices()
-            .find(|(_, c)| c.is_whitespace())
-            .map(|(idx, _)| idx)
-            .unwrap_or(after_cursor.len());
-        let end_idx = safe_cursor + end_rel_idx;
+        let Some(token_range) = self.active_token_range() else {
+            return;
+        };
 
         // Remove the active token and insert the selected mention as an atomic element.
-        self.textarea.replace_range(start_idx..end_idx, "");
-        self.textarea.set_cursor(start_idx);
+        self.textarea.replace_range(token_range.clone(), "");
+        self.textarea.set_cursor(token_range.start);
         let id = self.textarea.insert_element(insert_text);
 
         if let (Some(path), Some(mention)) =
@@ -2241,6 +2225,7 @@ impl ChatComposer {
             self.mention_bindings.insert(
                 id,
                 ComposerMentionBinding {
+                    token: format!("${mention}"),
                     mention,
                     path: path.to_string(),
                 },
@@ -2248,7 +2233,8 @@ impl ChatComposer {
         }
 
         self.textarea.insert_str(" ");
-        let new_cursor = start_idx
+        let new_cursor = token_range
+            .start
             .saturating_add(insert_text.len())
             .saturating_add(1);
         self.textarea.set_cursor(new_cursor);
@@ -2270,22 +2256,19 @@ impl ChatComposer {
         }
     }
 
-    fn current_mention_elements(&self) -> Vec<(u64, String)> {
+    fn current_bound_elements(&self) -> Vec<(u64, String)> {
         self.textarea
             .text_element_snapshots()
             .into_iter()
-            .filter_map(|snapshot| {
-                Self::mention_name_from_insert_text(snapshot.text.as_str())
-                    .map(|mention| (snapshot.id, mention))
-            })
+            .map(|snapshot| (snapshot.id, snapshot.text))
             .collect()
     }
 
     fn snapshot_mention_bindings(&self) -> Vec<MentionBinding> {
         let mut ordered = Vec::new();
-        for (id, mention) in self.current_mention_elements() {
+        for (id, token) in self.current_bound_elements() {
             if let Some(binding) = self.mention_bindings.get(&id)
-                && binding.mention == mention
+                && binding.token == token
             {
                 ordered.push(MentionBinding {
                     mention: binding.mention.clone(),
@@ -2305,7 +2288,7 @@ impl ChatComposer {
         let text = self.textarea.text().to_string();
         let mut scan_from = 0usize;
         for binding in mention_bindings {
-            let token = format!("${}", binding.mention);
+            let token = binding_token(&binding);
             let Some(range) =
                 find_next_mention_token_range(text.as_str(), token.as_str(), scan_from)
             else {
@@ -2322,6 +2305,7 @@ impl ChatComposer {
                 self.mention_bindings.insert(
                     id,
                     ComposerMentionBinding {
+                        token,
                         mention: binding.mention,
                         path: binding.path,
                     },
@@ -3808,6 +3792,30 @@ fn skill_description(skill: &SkillMetadata) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn binding_token(binding: &MentionBinding) -> String {
+    if binding.mention.starts_with(['$', '@']) {
+        return binding.mention.clone();
+    }
+    if is_file_binding(binding) {
+        format!("@{}", binding.mention)
+    } else {
+        format!("${}", binding.mention)
+    }
+}
+
+fn is_file_binding(binding: &MentionBinding) -> bool {
+    binding.mention == binding.path
+        && !binding.path.starts_with("skill://")
+        && !binding.path.starts_with("plugin://")
+        && !binding.path.starts_with("app://")
+        && !binding.path.starts_with("mcp://")
+        && !binding
+            .path
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"))
+}
+
 fn is_mention_name_char(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-')
 }
@@ -3821,11 +3829,6 @@ fn find_next_mention_token_range(text: &str, token: &str, from: usize) -> Option
     let mut index = from;
 
     while index < bytes.len() {
-        if bytes[index] != b'$' {
-            index += 1;
-            continue;
-        }
-
         let end = index.saturating_add(token_bytes.len());
         if end > bytes.len() {
             return None;
@@ -3835,10 +3838,14 @@ fn find_next_mention_token_range(text: &str, token: &str, from: usize) -> Option
             continue;
         }
 
-        if bytes
+        let bounded_before = index == 0
+            || bytes
+                .get(index - 1)
+                .is_some_and(u8::is_ascii_whitespace);
+        let bounded_after = bytes
             .get(end)
-            .is_none_or(|byte| !is_mention_name_char(*byte))
-        {
+            .is_none_or(|byte| byte.is_ascii_whitespace() || !is_mention_name_char(*byte));
+        if bounded_before && bounded_after {
             return Some(index..end);
         }
 
@@ -4519,6 +4526,25 @@ mod tests {
             .draw(|f| composer.render(f.area(), f.buffer_mut()))
             .unwrap();
         insta::assert_snapshot!(name, terminal.backend());
+    }
+
+    #[test]
+    fn file_mention_element_snapshot() {
+        snapshot_composer_state(
+            "file_mention_element",
+            /*enhanced_keys_supported*/ true,
+            |composer| {
+                composer.set_text_content_with_mention_bindings(
+                    "read @src/main.rs".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![MentionBinding {
+                        mention: "src/main.rs".to_string(),
+                        path: "src/main.rs".to_string(),
+                    }],
+                );
+            },
+        );
     }
 
     #[test]
@@ -7392,10 +7418,18 @@ mod tests {
             composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
         let text = composer.textarea.text().to_string();
-        assert_eq!(text, format!("{placeholder} src/main.rs "));
+        assert_eq!(text, format!("{placeholder} @src/main.rs "));
         let elements = composer.textarea.text_elements();
-        assert_eq!(elements.len(), 1);
+        assert_eq!(elements.len(), 2);
         assert_eq!(elements[0].placeholder(&text), Some(placeholder.as_str()));
+        assert_eq!(elements[1].placeholder(&text), Some("@src/main.rs"));
+        assert_eq!(
+            composer.mention_bindings(),
+            vec![MentionBinding {
+                mention: "src/main.rs".to_string(),
+                path: "src/main.rs".to_string(),
+            }]
+        );
 
         let (result, _needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -7405,8 +7439,16 @@ mod tests {
                 text,
                 text_elements,
             } => {
-                assert_eq!(text, format!("{large} src/main.rs"));
-                assert!(text_elements.is_empty());
+                assert_eq!(text, format!("{large} @src/main.rs"));
+                assert_eq!(text_elements.len(), 1);
+                assert_eq!(text_elements[0].placeholder(&text), Some("@src/main.rs"));
+                assert_eq!(
+                    composer.take_recent_submission_mention_bindings(),
+                    vec![MentionBinding {
+                        mention: "src/main.rs".to_string(),
+                        path: "src/main.rs".to_string(),
+                    }]
+                );
             }
             _ => panic!("expected Submitted"),
         }
@@ -7767,6 +7809,36 @@ mod tests {
             mention_bindings
         );
         assert!(composer.take_mention_bindings().is_empty());
+    }
+
+    #[test]
+    fn set_text_content_with_mention_bindings_restores_file_mentions() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+
+        let mention_bindings = vec![MentionBinding {
+            mention: "src/main.rs".to_string(),
+            path: "src/main.rs".to_string(),
+        }];
+        composer.set_text_content_with_mention_bindings(
+            "read @src/main.rs".to_string(),
+            Vec::new(),
+            Vec::new(),
+            mention_bindings.clone(),
+        );
+
+        let text = composer.textarea.text().to_string();
+        let text_elements = composer.textarea.text_elements();
+        assert_eq!(text_elements.len(), 1);
+        assert_eq!(text_elements[0].placeholder(&text), Some("@src/main.rs"));
+        assert_eq!(composer.take_mention_bindings(), mention_bindings);
     }
 
     #[test]

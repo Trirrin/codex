@@ -690,6 +690,7 @@ const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
 const NUDGE_MODEL_SLUG: &str = "gpt-5.4-mini";
 const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
 const MAX_AGENT_COPY_HISTORY: usize = 32;
+const FILE_MENTION_MAX_CHARS: usize = 32_000;
 
 #[derive(Debug)]
 struct AgentTurnMarkdown {
@@ -1566,6 +1567,113 @@ fn remap_placeholders_in_text(
     }
 
     (rebuilt, rebuilt_elements)
+}
+
+fn expand_file_mentions_for_model(
+    text: &str,
+    text_elements: &[TextElement],
+    mention_bindings: &[MentionBinding],
+    cwd: &Path,
+) -> (String, Vec<TextElement>) {
+    if text.is_empty() || text_elements.is_empty() || mention_bindings.is_empty() {
+        return (text.to_string(), text_elements.to_vec());
+    }
+
+    let mut elements = text_elements.to_vec();
+    elements.sort_by_key(|elem| elem.byte_range.start);
+
+    let mut cursor = 0usize;
+    let mut rebuilt = String::with_capacity(text.len());
+    let mut changed = false;
+
+    for elem in elements {
+        let start = elem.byte_range.start.min(text.len());
+        let end = elem.byte_range.end.min(text.len());
+        if start < cursor || start > end {
+            continue;
+        }
+        if let Some(segment) = text.get(cursor..start) {
+            rebuilt.push_str(segment);
+        }
+
+        let Some(token) = text.get(start..end) else {
+            cursor = end;
+            continue;
+        };
+        if let Some(expanded) = mention_bindings
+            .iter()
+            .find(|binding| file_mention_token(binding).as_deref() == Some(token))
+            .and_then(|binding| read_file_mention_block(binding, cwd))
+        {
+            rebuilt.push_str(&expanded);
+            changed = true;
+        } else {
+            rebuilt.push_str(token);
+        }
+        cursor = end;
+    }
+    if let Some(segment) = text.get(cursor..) {
+        rebuilt.push_str(segment);
+    }
+
+    if changed {
+        (rebuilt, Vec::new())
+    } else {
+        (text.to_string(), text_elements.to_vec())
+    }
+}
+
+fn file_mention_token(binding: &MentionBinding) -> Option<String> {
+    if binding.mention.is_empty()
+        || binding.path.starts_with("skill://")
+        || binding.path.starts_with("plugin://")
+        || binding.path.starts_with("app://")
+        || binding.path.starts_with("mcp://")
+        || Path::new(&binding.path)
+            .file_name()
+            .is_some_and(|name| name == "SKILL.md")
+    {
+        return None;
+    }
+
+    Some(format!("@{}", binding.mention))
+}
+
+fn read_file_mention_block(binding: &MentionBinding, cwd: &Path) -> Option<String> {
+    let path = Path::new(&binding.path);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let content = match std::fs::read_to_string(&resolved) {
+        Ok(content) => content,
+        Err(err) => {
+            tracing::warn!(path = %resolved.display(), %err, "failed to read file mention");
+            return None;
+        }
+    };
+    Some(format_file_mention_block(&binding.mention, &content))
+}
+
+fn format_file_mention_block(display_path: &str, content: &str) -> String {
+    let (content, truncated) = truncate_file_mention_content(content, FILE_MENTION_MAX_CHARS);
+    let truncation_note = if truncated {
+        format!("\n[File truncated after {FILE_MENTION_MAX_CHARS} characters.]")
+    } else {
+        String::new()
+    };
+    format!("<file path=\"{display_path}\">\n{content}{truncation_note}\n</file>")
+}
+
+fn truncate_file_mention_content(content: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = content.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        (truncated, true)
+    } else {
+        (content.to_string(), false)
+    }
 }
 
 // When merging multiple queued drafts (e.g., after interrupt), each draft starts numbering
@@ -7434,9 +7542,15 @@ impl ChatWidget {
         }
 
         if !text.is_empty() {
+            let (model_text, model_text_elements) = expand_file_mentions_for_model(
+                &text,
+                &text_elements,
+                &mention_bindings,
+                self.config.cwd.as_path(),
+            );
             items.push(UserInput::Text {
-                text: text.clone(),
-                text_elements: text_elements.clone(),
+                text: model_text,
+                text_elements: model_text_elements,
             });
         }
 

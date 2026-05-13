@@ -81,9 +81,9 @@ pub(crate) struct LocalImageAttachment {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MentionBinding {
-    /// Mention token text without the leading `$`.
+    /// Display name or file path without the leading mention prefix.
     pub(crate) mention: String,
-    /// Canonical mention target (for example `app://...` or absolute SKILL.md path).
+    /// Canonical mention target (for example `app://...`, absolute SKILL.md path, or file path).
     pub(crate) path: String,
 }
 mod chat_composer;

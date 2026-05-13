@@ -86,6 +86,156 @@ async fn submission_preserves_text_elements_and_local_images() {
 }
 
 #[tokio::test]
+async fn submission_expands_file_mentions_for_model_only() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let project = tempfile::tempdir().expect("tempdir");
+    let src_dir = project.path().join("src");
+    std::fs::create_dir(&src_dir).expect("create src dir");
+    std::fs::write(src_dir.join("main.rs"), "fn main() {}\n").expect("write file");
+
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_protocol::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: PermissionProfile::read_only(),
+        cwd: project.path().to_path_buf().abs(),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    drain_insert_history(&mut rx);
+
+    let text = "read @src/main.rs".to_string();
+    let mention_start = text.find("@src/main.rs").expect("mention");
+    let text_elements = vec![TextElement::new(
+        (mention_start..mention_start + "@src/main.rs".len()).into(),
+        Some("@src/main.rs".to_string()),
+    )];
+    chat.bottom_pane.set_composer_text_with_mention_bindings(
+        text.clone(),
+        text_elements.clone(),
+        Vec::new(),
+        vec![MentionBinding {
+            mention: "src/main.rs".to_string(),
+            path: "src/main.rs".to_string(),
+        }],
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    };
+    assert_eq!(items.len(), 1);
+    let model_text = match &items[0] {
+        UserInput::Text {
+            text,
+            text_elements,
+        } => {
+            assert!(text_elements.is_empty());
+            text
+        }
+        other => panic!("expected text input, got {other:?}"),
+    };
+    assert_eq!(
+        model_text,
+        "read <file path=\"src/main.rs\">\nfn main() {}\n\n</file>"
+    );
+
+    let mut user_cell = None;
+    while let Ok(ev) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = ev
+            && let Some(cell) = cell.as_any().downcast_ref::<UserHistoryCell>()
+        {
+            user_cell = Some((cell.message.clone(), cell.text_elements.clone()));
+            break;
+        }
+    }
+    let (stored_message, stored_elements) =
+        user_cell.expect("expected submitted user history cell");
+    assert_eq!(stored_message, text);
+    assert_eq!(stored_elements, text_elements);
+}
+
+#[tokio::test]
+async fn submission_truncates_long_file_mentions() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let project = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        project.path().join("large.txt"),
+        format!("{}tail", "a".repeat(FILE_MENTION_MAX_CHARS)),
+    )
+    .expect("write file");
+
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_protocol::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: PermissionProfile::read_only(),
+        cwd: project.path().to_path_buf().abs(),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    drain_insert_history(&mut rx);
+
+    let text = "read @large.txt".to_string();
+    let mention_start = text.find("@large.txt").expect("mention");
+    chat.bottom_pane.set_composer_text_with_mention_bindings(
+        text,
+        vec![TextElement::new(
+            (mention_start..mention_start + "@large.txt".len()).into(),
+            Some("@large.txt".to_string()),
+        )],
+        Vec::new(),
+        vec![MentionBinding {
+            mention: "large.txt".to_string(),
+            path: "large.txt".to_string(),
+        }],
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    };
+    let model_text = match &items[0] {
+        UserInput::Text { text, .. } => text,
+        other => panic!("expected text input, got {other:?}"),
+    };
+    assert!(model_text.contains("[File truncated after 32000 characters.]"));
+    assert!(!model_text.contains("tail"));
+}
+
+#[tokio::test]
 async fn submission_includes_configured_permission_profile() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
