@@ -80,6 +80,7 @@ pub(crate) struct UnifiedExecProcess {
     output_closed_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
     output_drained: Arc<Notify>,
+    output_drained_closed: Arc<AtomicBool>,
     state_tx: watch::Sender<ProcessState>,
     state_rx: watch::Receiver<ProcessState>,
     output_task: Option<JoinHandle<()>>,
@@ -109,6 +110,7 @@ impl UnifiedExecProcess {
         let output_closed_notify = Arc::new(Notify::new());
         let cancellation_token = CancellationToken::new();
         let output_drained = Arc::new(Notify::new());
+        let output_drained_closed = Arc::new(AtomicBool::new(false));
         let (output_tx, _) = broadcast::channel(64);
         let (state_tx, state_rx) = watch::channel(ProcessState::default());
 
@@ -121,6 +123,7 @@ impl UnifiedExecProcess {
             output_closed_notify,
             cancellation_token,
             output_drained,
+            output_drained_closed,
             state_tx,
             state_rx,
             output_task: None,
@@ -172,8 +175,11 @@ impl UnifiedExecProcess {
         self.cancellation_token.clone()
     }
 
-    pub(super) fn output_drained_notify(&self) -> Arc<Notify> {
-        Arc::clone(&self.output_drained)
+    pub(super) fn output_drained_state(&self) -> (Arc<AtomicBool>, Arc<Notify>) {
+        (
+            Arc::clone(&self.output_drained_closed),
+            Arc::clone(&self.output_drained),
+        )
     }
 
     pub(super) fn has_exited(&self) -> bool {
@@ -207,6 +213,7 @@ impl UnifiedExecProcess {
             }
         }
         self.cancellation_token.cancel();
+        self.signal_output_drained();
         if let Some(output_task) = &self.output_task {
             output_task.abort();
         }
@@ -489,6 +496,11 @@ impl UnifiedExecProcess {
         let state = self.state_rx.borrow().clone();
         let _ = self.state_tx.send_replace(state.exited(exit_code));
         self.cancellation_token.cancel();
+    }
+
+    fn signal_output_drained(&self) {
+        self.output_drained_closed.store(true, Ordering::Release);
+        self.output_drained.notify_waiters();
     }
 }
 

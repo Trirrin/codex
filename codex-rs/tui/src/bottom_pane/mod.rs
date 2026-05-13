@@ -655,7 +655,7 @@ impl BottomPane {
                         (_, KeyCode::Char('k')) => {
                             self.app_event_tx
                                 .send(AppEvent::CodexOp(Op::CleanBackgroundActivity));
-                            self.close_background_activity_controls();
+                            self.clear_background_activity_footer();
                             self.request_redraw();
                             return InputResult::None;
                         }
@@ -689,7 +689,7 @@ impl BottomPane {
                     KeyCode::Char('k') => {
                         self.app_event_tx
                             .send(AppEvent::CodexOp(Op::CleanBackgroundActivity));
-                        self.close_background_activity_controls();
+                        self.clear_background_activity_footer();
                         self.request_redraw();
                         return InputResult::None;
                     }
@@ -1196,6 +1196,14 @@ impl BottomPane {
             self.clear_background_footer_focus_if_empty();
             self.sync_status_inline_message();
             self.request_redraw();
+        }
+    }
+
+    fn clear_background_activity_footer(&mut self) {
+        let changed = self.unified_exec_footer.clear();
+        self.close_background_activity_controls();
+        if changed {
+            self.sync_status_inline_message();
         }
     }
 
@@ -1711,6 +1719,7 @@ mod tests {
     use crate::status_indicator_widget::StatusDetailsCapitalization;
     use crate::test_support::PathBufExt;
     use crate::test_support::test_path_buf;
+    use codex_protocol::protocol::ExecCommandRunMode;
     use codex_protocol::protocol::Op;
     use codex_protocol::protocol::ReviewDecision;
     use codex_protocol::protocol::SkillScope;
@@ -2389,6 +2398,38 @@ mod tests {
 
         assert!(pane.cursor_pos(Rect::new(0, 0, 80, 20)).is_some());
         assert!(pane.desired_height(/*width*/ 80) < BACKGROUND_ACTIVITY_DETAILS_MAX_HEIGHT as u16);
+    }
+
+    #[test]
+    fn background_activity_k_clears_footer_and_sends_cleanup() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = test_pane(tx);
+
+        pane.set_unified_exec_processes(vec![CommandActivity {
+            command: "sleep 5".to_string(),
+            shell_id: "1000".to_string(),
+            run_mode: Some(ExecCommandRunMode::Background),
+            started_at: Instant::now(),
+            status: "running".to_string(),
+            recent_output: Vec::new(),
+        }]);
+
+        assert!(
+            render_snapshot(&pane, Rect::new(0, 0, 80, 8)).contains("background command running")
+        );
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        pane.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppEvent::CodexOp(Op::CleanBackgroundActivity))
+        ));
+        let rendered = render_snapshot(&pane, Rect::new(0, 0, 80, 8));
+        assert!(!rendered.contains("background command running"));
+        assert!(pane.is_normal_backtrack_mode());
+        assert!(pane.no_modal_or_popup_active());
     }
 
     #[test]

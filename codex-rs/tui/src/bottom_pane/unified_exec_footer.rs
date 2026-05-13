@@ -59,6 +59,13 @@ impl UnifiedExecFooter {
         true
     }
 
+    pub(crate) fn clear(&mut self) -> bool {
+        let changed = !self.processes.is_empty() || !self.subagents.is_empty();
+        self.processes.clear();
+        self.subagents.clear();
+        changed
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.processes.is_empty() && self.subagents.is_empty()
     }

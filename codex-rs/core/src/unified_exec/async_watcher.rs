@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::sync::Mutex;
 use tokio::time::Duration;
@@ -46,7 +47,7 @@ pub(crate) fn start_streaming_output(
     transcript: Arc<Mutex<HeadTailBuffer>>,
 ) {
     let mut receiver = process.output_receiver();
-    let output_drained = process.output_drained_notify();
+    let (output_drained_closed, output_drained) = process.output_drained_state();
     let exit_token = process.cancellation_token();
 
     let session_ref = Arc::clone(&context.session);
@@ -73,7 +74,8 @@ pub(crate) fn start_streaming_output(
                         sleep.as_mut().await;
                     }
                 }, if grace_sleep.is_some() => {
-                    output_drained.notify_one();
+                    output_drained_closed.store(true, Ordering::Release);
+                    output_drained.notify_waiters();
                     break;
                 }
 
@@ -84,7 +86,8 @@ pub(crate) fn start_streaming_output(
                             continue;
                         },
                         Err(RecvError::Closed) => {
-                            output_drained.notify_one();
+                            output_drained_closed.store(true, Ordering::Release);
+                            output_drained.notify_waiters();
                             break;
                         }
                     };
@@ -181,11 +184,17 @@ pub(crate) fn spawn_exit_watcher(
     started_at: Instant,
 ) {
     let exit_token = process.cancellation_token();
-    let output_drained = process.output_drained_notify();
+    let (output_drained_closed, output_drained) = process.output_drained_state();
 
     tokio::spawn(async move {
         exit_token.cancelled().await;
-        output_drained.notified().await;
+        loop {
+            let drained = output_drained.notified();
+            if output_drained_closed.load(Ordering::Acquire) {
+                break;
+            }
+            drained.await;
+        }
 
         let duration = Instant::now().saturating_duration_since(started_at);
         let exit_code = if let Some(message) = process.failure_message() {
@@ -230,7 +239,7 @@ pub(crate) fn spawn_exit_watcher(
 
 /// Spawn an exit watcher for a reattached session.
 ///
-/// The primary watcher consumes `output_drained_notify`, so this watcher uses a
+/// The primary watcher waits for the output-drained latch, so this watcher uses a
 /// short grace period after process exit before notifying the reattached UI.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_reattached_exit_watcher(
