@@ -1089,8 +1089,9 @@ async fn submit_user_message_emits_structured_plugin_mentions_from_bindings() {
         remote_image_urls: Vec::new(),
         text_elements: Vec::new(),
         mention_bindings: vec![MentionBinding {
-            mention: "sample".to_string(),
+            display: "sample".to_string(),
             path: "plugin://sample@test".to_string(),
+            is_directory: false,
         }],
     });
 

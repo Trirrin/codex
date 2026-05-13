@@ -57,8 +57,9 @@ impl HistoryEntry {
                 .mentions
                 .into_iter()
                 .map(|mention| MentionBinding {
-                    mention: mention.mention,
+                    display: mention.mention,
                     path: mention.path,
+                    is_directory: false,
                 })
                 .collect(),
             pending_pastes: Vec::new(),

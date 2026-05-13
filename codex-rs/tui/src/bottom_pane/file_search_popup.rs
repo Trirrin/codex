@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use codex_file_search::FileMatch;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -51,17 +49,6 @@ impl FileSearchPopup {
         self.waiting = true; // waiting for new results
     }
 
-    /// Put the popup into an "idle" state used for an empty query (just "@").
-    /// Shows a hint instead of matches until the user types more characters.
-    pub(crate) fn set_empty_prompt(&mut self) {
-        self.display_query.clear();
-        self.pending_query.clear();
-        self.waiting = false;
-        self.matches.clear();
-        // Reset selection/scroll state when showing the empty prompt.
-        self.state.reset();
-    }
-
     /// Replace matches when a `FileSearchResult` arrives.
     /// Replace matches. Only applied when `query` matches `pending_query`.
     pub(crate) fn set_matches(&mut self, query: &str, matches: Vec<FileMatch>) {
@@ -70,7 +57,7 @@ impl FileSearchPopup {
         }
 
         self.display_query = query.to_string();
-        self.matches = matches.into_iter().take(MAX_POPUP_ROWS).collect();
+        self.matches = matches;
         self.waiting = false;
         let len = self.matches.len();
         self.state.clamp_selection(len);
@@ -91,11 +78,10 @@ impl FileSearchPopup {
         self.state.ensure_visible(len, len.min(MAX_POPUP_ROWS));
     }
 
-    pub(crate) fn selected_match(&self) -> Option<&PathBuf> {
+    pub(crate) fn selected_match(&self) -> Option<&codex_file_search::FileMatch> {
         self.state
             .selected_idx
             .and_then(|idx| self.matches.get(idx))
-            .map(|file_match| &file_match.path)
     }
 
     pub(crate) fn calculate_required_height(&self) -> u16 {
@@ -117,19 +103,27 @@ impl WidgetRef for &FileSearchPopup {
         } else {
             self.matches
                 .iter()
-                .map(|m| GenericDisplayRow {
-                    name: m.path.to_string_lossy().to_string(),
-                    name_prefix_spans: Vec::new(),
-                    match_indices: m
-                        .indices
-                        .as_ref()
-                        .map(|v| v.iter().map(|&i| i as usize).collect()),
-                    display_shortcut: None,
-                    description: None,
-                    category_tag: None,
-                    wrap_indent: None,
-                    is_disabled: false,
-                    disabled_reason: None,
+                .map(|m| {
+                    let mut name = m.path.to_string_lossy().to_string();
+                    if matches!(m.match_type, codex_file_search::MatchType::Directory)
+                        && !name.ends_with('/')
+                    {
+                        name.push('/');
+                    }
+                    GenericDisplayRow {
+                        name,
+                        name_prefix_spans: Vec::new(),
+                        match_indices: m
+                            .indices
+                            .as_ref()
+                            .map(|v| v.iter().map(|&i| i as usize).collect()),
+                        display_shortcut: None,
+                        description: None,
+                        category_tag: None,
+                        wrap_indent: None,
+                        is_disabled: false,
+                        disabled_reason: None,
+                    }
                 })
                 .collect()
         };
@@ -158,6 +152,7 @@ mod tests {
     use super::*;
     use codex_file_search::MatchType;
     use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
 
     fn file_match(index: usize) -> FileMatch {
         FileMatch {
@@ -170,14 +165,16 @@ mod tests {
     }
 
     #[test]
-    fn set_matches_keeps_only_the_first_page_of_results() {
+    fn set_matches_keeps_all_results_but_clamps_height() {
         let mut popup = FileSearchPopup::new();
         popup.set_query("file");
         popup.set_matches("file", (0..(MAX_POPUP_ROWS + 2)).map(file_match).collect());
 
         assert_eq!(
             popup.matches,
-            (0..MAX_POPUP_ROWS).map(file_match).collect::<Vec<_>>()
+            (0..(MAX_POPUP_ROWS + 2))
+                .map(file_match)
+                .collect::<Vec<_>>()
         );
         assert_eq!(popup.calculate_required_height(), MAX_POPUP_ROWS as u16);
     }

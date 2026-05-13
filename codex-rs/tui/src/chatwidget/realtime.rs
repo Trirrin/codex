@@ -138,7 +138,6 @@ impl ChatWidget {
         Self::pending_steer_compare_key_from_items(&item.content)
     }
 
-    #[cfg(test)]
     pub(super) fn rendered_user_message_event_from_inputs(
         items: &[UserInput],
     ) -> RenderedUserMessageEvent {

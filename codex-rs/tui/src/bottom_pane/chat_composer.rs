@@ -414,8 +414,9 @@ struct ComposerDraft {
 #[derive(Clone, Debug)]
 struct ComposerMentionBinding {
     token: String,
-    mention: String,
+    display: String,
     path: String,
+    is_directory: bool,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -604,8 +605,9 @@ impl ChatComposer {
                 && binding.token == token
             {
                 ordered.push(MentionBinding {
-                    mention: binding.mention,
+                    display: binding.display,
                     path: binding.path,
+                    is_directory: binding.is_directory,
                 });
             }
         }
@@ -1767,7 +1769,10 @@ impl ChatComposer {
                     };
                 };
 
-                let sel_path = sel.to_string_lossy().to_string();
+                let sel_path = sel.path.to_string_lossy().to_string();
+                let sel_display = sel.path.to_string_lossy().to_string();
+                let is_directory =
+                    matches!(sel.match_type, codex_file_search::MatchType::Directory);
                 // If selected path looks like an image (png/jpeg), attach as image instead of inserting text.
                 let is_image = Self::is_image_path(&sel_path);
                 if is_image {
@@ -1808,12 +1813,12 @@ impl ChatComposer {
                         Err(err) => {
                             tracing::trace!("image dimensions lookup failed: {err}");
                             // Fallback to plain path insertion if metadata read fails.
-                            self.insert_selected_path(&sel_path);
+                            self.insert_selected_path(&sel_display, &sel_path, is_directory);
                         }
                     }
                 } else {
                     // Non-image: inserting file path.
-                    self.insert_selected_path(&sel_path);
+                    self.insert_selected_path(&sel_display, &sel_path, is_directory);
                 }
                 self.active_popup = ActivePopup::None;
                 (InputResult::None, true)
@@ -2156,7 +2161,7 @@ impl ChatComposer {
     ///
     /// The returned string **does not** include the leading `@`.
     fn current_at_token(textarea: &TextArea) -> Option<String> {
-        Self::current_prefixed_token(textarea, '@', /*allow_empty*/ false)
+        Self::current_prefixed_token(textarea, '@', /*allow_empty*/ true)
     }
 
     fn current_mention_token(&self) -> Option<String> {
@@ -2187,11 +2192,15 @@ impl ChatComposer {
     }
 
     /// Replace the active `@token` with an atomic file mention.
-    fn insert_selected_path(&mut self, path: &str) {
+    fn insert_selected_path(&mut self, display: &str, path: &str, is_directory: bool) {
         let Some(token_range) = self.active_token_range() else {
             return;
         };
-        let insert_text = format!("@{path}");
+        let insert_text = if is_directory {
+            format!("@{display}/")
+        } else {
+            format!("@{display}")
+        };
 
         self.textarea.replace_range(token_range.clone(), "");
         self.textarea.set_cursor(token_range.start);
@@ -2199,14 +2208,15 @@ impl ChatComposer {
         self.mention_bindings.insert(
             id,
             ComposerMentionBinding {
-                token: insert_text,
-                mention: path.to_string(),
+                token: insert_text.clone(),
+                display: display.to_string(),
                 path: path.to_string(),
+                is_directory,
             },
         );
         self.textarea.insert_str(" ");
         self.textarea
-            .set_cursor(token_range.start + path.len().saturating_add(2));
+            .set_cursor(token_range.start + insert_text.len());
     }
 
     fn insert_selected_mention(&mut self, insert_text: &str, path: Option<&str>) {
@@ -2219,15 +2229,16 @@ impl ChatComposer {
         self.textarea.set_cursor(token_range.start);
         let id = self.textarea.insert_element(insert_text);
 
-        if let (Some(path), Some(mention)) =
+        if let (Some(path), Some(display)) =
             (path, Self::mention_name_from_insert_text(insert_text))
         {
             self.mention_bindings.insert(
                 id,
                 ComposerMentionBinding {
-                    token: format!("${mention}"),
-                    mention,
+                    token: format!("${display}"),
+                    display,
                     path: path.to_string(),
+                    is_directory: false,
                 },
             );
         }
@@ -2271,8 +2282,9 @@ impl ChatComposer {
                 && binding.token == token
             {
                 ordered.push(MentionBinding {
-                    mention: binding.mention.clone(),
+                    display: binding.display.clone(),
                     path: binding.path.clone(),
+                    is_directory: binding.is_directory,
                 });
             }
         }
@@ -2306,8 +2318,9 @@ impl ChatComposer {
                     id,
                     ComposerMentionBinding {
                         token,
-                        mention: binding.mention,
+                        display: binding.display,
                         path: binding.path,
+                        is_directory: binding.is_directory,
                     },
                 );
                 scan_from = range.end;
@@ -3514,38 +3527,21 @@ impl ChatComposer {
             return;
         }
 
-        if query.is_empty() {
-            self.app_event_tx
-                .send(AppEvent::StartFileSearch(String::new()));
-        } else {
-            self.app_event_tx
-                .send(AppEvent::StartFileSearch(query.clone()));
-        }
+        self.app_event_tx
+            .send(AppEvent::StartFileSearch(query.clone()));
 
         match &mut self.active_popup {
             ActivePopup::File(popup) => {
-                if query.is_empty() {
-                    popup.set_empty_prompt();
-                } else {
-                    popup.set_query(&query);
-                }
+                popup.set_query(&query);
             }
             _ => {
                 let mut popup = FileSearchPopup::new();
-                if query.is_empty() {
-                    popup.set_empty_prompt();
-                } else {
-                    popup.set_query(&query);
-                }
+                popup.set_query(&query);
                 self.active_popup = ActivePopup::File(popup);
             }
         }
 
-        if query.is_empty() {
-            self.current_file_query = None;
-        } else {
-            self.current_file_query = Some(query);
-        }
+        self.current_file_query = Some(query);
         self.dismissed_file_popup_token = None;
     }
 
@@ -3793,19 +3789,22 @@ fn skill_description(skill: &SkillMetadata) -> Option<String> {
 }
 
 fn binding_token(binding: &MentionBinding) -> String {
-    if binding.mention.starts_with(['$', '@']) {
-        return binding.mention.clone();
+    if binding.display.starts_with(['$', '@']) {
+        return binding.display.clone();
     }
     if is_file_binding(binding) {
-        format!("@{}", binding.mention)
+        if binding.is_directory {
+            format!("@{}/", binding.display)
+        } else {
+            format!("@{}", binding.display)
+        }
     } else {
-        format!("${}", binding.mention)
+        format!("${}", binding.display)
     }
 }
 
 fn is_file_binding(binding: &MentionBinding) -> bool {
-    binding.mention == binding.path
-        && !binding.path.starts_with("skill://")
+    !binding.path.starts_with("skill://")
         && !binding.path.starts_with("plugin://")
         && !binding.path.starts_with("app://")
         && !binding.path.starts_with("mcp://")
@@ -3838,10 +3837,8 @@ fn find_next_mention_token_range(text: &str, token: &str, from: usize) -> Option
             continue;
         }
 
-        let bounded_before = index == 0
-            || bytes
-                .get(index - 1)
-                .is_some_and(u8::is_ascii_whitespace);
+        let bounded_before =
+            index == 0 || bytes.get(index - 1).is_some_and(u8::is_ascii_whitespace);
         let bounded_after = bytes
             .get(end)
             .is_none_or(|byte| byte.is_ascii_whitespace() || !is_mention_name_char(*byte));
@@ -4539,8 +4536,9 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     vec![MentionBinding {
-                        mention: "src/main.rs".to_string(),
+                        display: "src/main.rs".to_string(),
                         path: "src/main.rs".to_string(),
+                        is_directory: false,
                     }],
                 );
             },
@@ -5712,7 +5710,12 @@ mod tests {
                 "Only @ symbol triggers empty query",
             ),
             ("@ hello", 2, None, "@ followed by space"),
-            ("test @ world", 6, None, "@ with spaces around"),
+            (
+                "test @ world",
+                6,
+                Some("".to_string()),
+                "Cursor after @ with query before following space",
+            ),
         ];
 
         for (input, cursor_pos, expected, description) in test_cases {
@@ -7426,8 +7429,9 @@ mod tests {
         assert_eq!(
             composer.mention_bindings(),
             vec![MentionBinding {
-                mention: "src/main.rs".to_string(),
+                display: "src/main.rs".to_string(),
                 path: "src/main.rs".to_string(),
+                is_directory: false,
             }]
         );
 
@@ -7445,8 +7449,9 @@ mod tests {
                 assert_eq!(
                     composer.take_recent_submission_mention_bindings(),
                     vec![MentionBinding {
-                        mention: "src/main.rs".to_string(),
+                        display: "src/main.rs".to_string(),
                         path: "src/main.rs".to_string(),
+                        is_directory: false,
                     }]
                 );
             }
@@ -7791,8 +7796,9 @@ mod tests {
         );
 
         let mention_bindings = vec![MentionBinding {
-            mention: "figma".to_string(),
+            display: "figma".to_string(),
             path: "/tmp/user/figma/SKILL.md".to_string(),
+            is_directory: false,
         }];
         composer.set_text_content_with_mention_bindings(
             "$figma please".to_string(),
@@ -7824,8 +7830,9 @@ mod tests {
         );
 
         let mention_bindings = vec![MentionBinding {
-            mention: "src/main.rs".to_string(),
+            display: "src/main.rs".to_string(),
             path: "src/main.rs".to_string(),
+            is_directory: false,
         }];
         composer.set_text_content_with_mention_bindings(
             "read @src/main.rs".to_string(),

@@ -1600,13 +1600,16 @@ fn expand_file_mentions_for_model(
             cursor = end;
             continue;
         };
-        if let Some(expanded) = mention_bindings
+        if let Some(binding) = mention_bindings
             .iter()
             .find(|binding| file_mention_token(binding).as_deref() == Some(token))
-            .and_then(|binding| read_file_mention_block(binding, cwd))
         {
-            rebuilt.push_str(&expanded);
-            changed = true;
+            if let Some(expanded) = read_file_mention_block(binding, cwd) {
+                rebuilt.push_str(&expanded);
+                changed = true;
+            } else {
+                rebuilt.push_str(token);
+            }
         } else {
             rebuilt.push_str(token);
         }
@@ -1624,19 +1627,23 @@ fn expand_file_mentions_for_model(
 }
 
 fn file_mention_token(binding: &MentionBinding) -> Option<String> {
-    if binding.mention.is_empty()
+    if binding.display.is_empty()
         || binding.path.starts_with("skill://")
         || binding.path.starts_with("plugin://")
         || binding.path.starts_with("app://")
         || binding.path.starts_with("mcp://")
         || Path::new(&binding.path)
             .file_name()
-            .is_some_and(|name| name == "SKILL.md")
+            .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"))
     {
         return None;
     }
 
-    Some(format!("@{}", binding.mention))
+    Some(if binding.is_directory {
+        format!("@{}/", binding.display)
+    } else {
+        format!("@{}", binding.display)
+    })
 }
 
 fn read_file_mention_block(binding: &MentionBinding, cwd: &Path) -> Option<String> {
@@ -1646,6 +1653,9 @@ fn read_file_mention_block(binding: &MentionBinding, cwd: &Path) -> Option<Strin
     } else {
         cwd.join(path)
     };
+    if binding.is_directory {
+        return read_directory_mention_block(&resolved, &binding.display);
+    }
     let content = match std::fs::read_to_string(&resolved) {
         Ok(content) => content,
         Err(err) => {
@@ -1653,7 +1663,7 @@ fn read_file_mention_block(binding: &MentionBinding, cwd: &Path) -> Option<Strin
             return None;
         }
     };
-    Some(format_file_mention_block(&binding.mention, &content))
+    Some(format_file_mention_block(&binding.display, &content))
 }
 
 fn format_file_mention_block(display_path: &str, content: &str) -> String {
@@ -1664,6 +1674,32 @@ fn format_file_mention_block(display_path: &str, content: &str) -> String {
         String::new()
     };
     format!("<file path=\"{display_path}\">\n{content}{truncation_note}\n</file>")
+}
+
+fn read_directory_mention_block(resolved: &Path, display_path: &str) -> Option<String> {
+    let entries = match std::fs::read_dir(resolved) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(path = %resolved.display(), %err, "failed to read directory mention");
+            return None;
+        }
+    };
+
+    let mut lines = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            lines.push(format!("{name}/"));
+        } else {
+            lines.push(name);
+        }
+    }
+    lines.sort();
+    Some(format!(
+        "<file path=\"{display_path}/\">\n{}\n</file>",
+        lines.join("\n")
+    ))
 }
 
 fn truncate_file_mention_content(content: &str, max_chars: usize) -> (String, bool) {
@@ -1827,8 +1863,35 @@ fn user_message_preview_text(
         }
         Some(UserMessageHistoryRecord::Override(_))
         | Some(UserMessageHistoryRecord::UserMessageText)
-        | None => message.text.clone(),
+        | None => preview_user_message_text(message),
         Some(UserMessageHistoryRecord::Hidden) => String::new(),
+    }
+}
+
+fn preview_user_message_text(message: &UserMessage) -> String {
+    if message.mention_bindings.is_empty() {
+        return message.text.clone();
+    }
+
+    let mut rebuilt = String::new();
+    let mut remaining = message.text.as_str();
+    for binding in &message.mention_bindings {
+        let Some(start) = remaining.find(&binding.path) else {
+            continue;
+        };
+        rebuilt.push_str(&remaining[..start]);
+        if binding.is_directory {
+            rebuilt.push_str(&format!("@{}/", binding.display));
+        } else {
+            rebuilt.push_str(&format!("@{}", binding.display));
+        }
+        remaining = &remaining[start + binding.path.len()..];
+    }
+    rebuilt.push_str(remaining);
+    if rebuilt.is_empty() {
+        message.text.clone()
+    } else {
+        rebuilt
     }
 }
 
@@ -7557,7 +7620,7 @@ impl ChatWidget {
         let mentions = collect_tool_mentions(&text, &HashMap::new());
         let bound_names: HashSet<String> = mention_bindings
             .iter()
-            .map(|binding| binding.mention.clone())
+            .map(|binding| binding.display.clone())
             .collect();
         let mut skill_names_lower: HashSet<String> = HashSet::new();
         let mut selected_skill_paths: HashSet<AbsolutePathBuf> = HashSet::new();
@@ -7708,6 +7771,7 @@ impl ChatWidget {
             None => None,
         };
         let permission_profile = Some(self.config.permissions.permission_profile());
+        let submitted_render_key = Self::rendered_user_message_event_from_inputs(&items);
         let op = AppCommand::user_turn(
             items,
             self.config.cwd.to_path_buf(),
@@ -7737,7 +7801,7 @@ impl ChatWidget {
         let encoded_mentions = mention_bindings
             .iter()
             .map(|binding| LinkedMention {
-                mention: binding.mention.clone(),
+                mention: binding.display.clone(),
                 path: binding.path.clone(),
             })
             .collect::<Vec<_>>();
@@ -7785,13 +7849,7 @@ impl ChatWidget {
                     .into_iter()
                     .map(|img| img.path)
                     .collect::<Vec<_>>();
-                self.last_rendered_user_message_event =
-                    Some(Self::rendered_user_message_event_from_parts(
-                        text.clone(),
-                        text_elements.clone(),
-                        local_image_paths.clone(),
-                        remote_image_urls.clone(),
-                    ));
+                self.last_rendered_user_message_event = Some(submitted_render_key);
                 self.add_to_history(history_cell::new_user_prompt(
                     text,
                     text_elements,

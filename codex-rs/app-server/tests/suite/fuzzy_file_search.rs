@@ -25,7 +25,6 @@ const SESSION_COMPLETED_METHOD: &str = "fuzzyFileSearch/sessionCompleted";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FileExpectation {
     Any,
-    Empty,
     NonEmpty,
 }
 
@@ -74,7 +73,6 @@ async fn wait_for_session_updated(
             };
             let files_match = match file_expectation {
                 FileExpectation::Any => true,
-                FileExpectation::Empty => payload.files.is_empty(),
                 FileExpectation::NonEmpty => !payload.files.is_empty(),
             };
             payload.session_id == session_id && payload.query == query && files_match
@@ -587,15 +585,15 @@ async fn test_fuzzy_file_search_two_sessions_are_independent() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_fuzzy_file_search_query_cleared_sends_blank_snapshot() -> Result<()> {
+async fn test_fuzzy_file_search_empty_query_sends_full_tree_snapshot() -> Result<()> {
     let codex_home = TempDir::new()?;
     let root = TempDir::new()?;
     std::fs::write(root.path().join("alpha.txt"), "contents")?;
     let mut mcp = initialized_mcp(&codex_home).await?;
 
     let root_path = root.path().to_string_lossy().to_string();
-    let session_id = "session-clear-query";
-    mcp.start_fuzzy_file_search_session(session_id, vec![root_path])
+    let session_id = "session-empty-query";
+    mcp.start_fuzzy_file_search_session(session_id, vec![root_path.clone()])
         .await?;
 
     mcp.update_fuzzy_file_search_session(session_id, "alp")
@@ -604,8 +602,23 @@ async fn test_fuzzy_file_search_query_cleared_sends_blank_snapshot() -> Result<(
 
     mcp.update_fuzzy_file_search_session(session_id, "").await?;
     let payload =
-        wait_for_session_updated(&mut mcp, session_id, "", FileExpectation::Empty).await?;
-    assert_eq!(payload.files.is_empty(), true);
+        wait_for_session_updated(&mut mcp, session_id, "", FileExpectation::NonEmpty).await?;
+    assert_eq!(
+        payload
+            .files
+            .iter()
+            .map(|file| file.root.as_str())
+            .collect::<Vec<_>>(),
+        vec![root_path.as_str(), root_path.as_str()]
+    );
+    assert_eq!(
+        payload
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["", "alpha.txt"]
+    );
 
     Ok(())
 }

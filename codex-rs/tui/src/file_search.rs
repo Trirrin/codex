@@ -2,8 +2,8 @@
 //!
 //! `ChatComposer` publishes every change of the `@token` as
 //! `AppEvent::StartFileSearch(query)`. This manager owns a single
-//! `codex-file-search` session for the current search root, updates the query
-//! on every keystroke, and drops the session when the query becomes empty.
+//! `codex-file-search` session for the current search root, and updates the query
+//! on every keystroke. Empty queries intentionally ask the session for the full tree.
 
 use codex_file_search as file_search;
 use std::path::PathBuf;
@@ -59,11 +59,6 @@ impl FileSearchManager {
         st.latest_query.clear();
         st.latest_query.push_str(&query);
 
-        if query.is_empty() {
-            st.session.take();
-            return;
-        }
-
         if st.session.is_none() {
             self.start_session_locked(&mut st);
         }
@@ -109,10 +104,7 @@ impl TuiSessionReporter {
     fn send_snapshot(&self, snapshot: &file_search::FileSearchSnapshot) {
         #[expect(clippy::unwrap_used)]
         let st = self.state.lock().unwrap();
-        if st.session_token != self.session_token
-            || st.latest_query.is_empty()
-            || snapshot.query.is_empty()
-        {
+        if st.session_token != self.session_token {
             return;
         }
         let query = snapshot.query.clone();

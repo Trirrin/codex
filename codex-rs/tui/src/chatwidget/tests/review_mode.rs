@@ -913,8 +913,9 @@ async fn manual_interrupt_restores_pending_steer_mention_bindings_to_composer() 
     chat.on_agent_message_delta("Final answer line\n".to_string());
 
     let mention_bindings = vec![MentionBinding {
-        mention: "figma".to_string(),
+        display: "figma".to_string(),
         path: "/tmp/skills/figma/SKILL.md".to_string(),
+        is_directory: false,
     }];
     chat.bottom_pane.set_composer_text_with_mention_bindings(
         "please use $figma".to_string(),

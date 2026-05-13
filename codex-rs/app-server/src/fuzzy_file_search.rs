@@ -183,11 +183,7 @@ impl SessionReporterImpl {
             return;
         }
 
-        let files = if query.is_empty() {
-            Vec::new()
-        } else {
-            collect_files(snapshot)
-        };
+        let files = collect_files(snapshot);
 
         let notification = ServerNotification::FuzzyFileSearchSessionUpdated(
             FuzzyFileSearchSessionUpdatedNotification {

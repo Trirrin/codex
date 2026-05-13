@@ -130,8 +130,9 @@ async fn submission_expands_file_mentions_for_model_only() {
         text_elements.clone(),
         Vec::new(),
         vec![MentionBinding {
-            mention: "src/main.rs".to_string(),
+            display: "src/main.rs".to_string(),
             path: "src/main.rs".to_string(),
+            is_directory: false,
         }],
     );
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -169,6 +170,95 @@ async fn submission_expands_file_mentions_for_model_only() {
         user_cell.expect("expected submitted user history cell");
     assert_eq!(stored_message, text);
     assert_eq!(stored_elements, text_elements);
+
+    complete_user_message_for_inputs(&mut chat, "user-1", items);
+    assert!(drain_insert_history(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn submission_expands_directory_mentions_for_model_only() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let project = tempfile::tempdir().expect("tempdir");
+    let src_dir = project.path().join("src");
+    std::fs::create_dir(&src_dir).expect("create src dir");
+    std::fs::write(src_dir.join("main.rs"), "fn main() {}\n").expect("write file");
+    std::fs::create_dir(src_dir.join("nested")).expect("create nested dir");
+
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_protocol::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: PermissionProfile::read_only(),
+        cwd: project.path().to_path_buf().abs(),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    drain_insert_history(&mut rx);
+
+    let text = "list @src/".to_string();
+    let mention_start = text.find("@src/").expect("mention");
+    let text_elements = vec![TextElement::new(
+        (mention_start..mention_start + "@src/".len()).into(),
+        Some("@src/".to_string()),
+    )];
+    chat.bottom_pane.set_composer_text_with_mention_bindings(
+        text.clone(),
+        text_elements.clone(),
+        Vec::new(),
+        vec![MentionBinding {
+            display: "src".to_string(),
+            path: "src".to_string(),
+            is_directory: true,
+        }],
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    };
+    let model_text = match &items[0] {
+        UserInput::Text {
+            text,
+            text_elements,
+        } => {
+            assert!(text_elements.is_empty());
+            text
+        }
+        other => panic!("expected text input, got {other:?}"),
+    };
+    assert_eq!(
+        model_text,
+        "list <file path=\"src/\">\nmain.rs\nnested/\n</file>"
+    );
+
+    let mut user_cells = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = ev
+            && let Some(cell) = cell.as_any().downcast_ref::<UserHistoryCell>()
+        {
+            user_cells.push((cell.message.clone(), cell.text_elements.clone()));
+        }
+    }
+    assert_eq!(user_cells, vec![(text, text_elements)]);
+
+    complete_user_message_for_inputs(&mut chat, "user-1", items);
+    assert!(drain_insert_history(&mut rx).is_empty());
 }
 
 #[tokio::test]
@@ -217,8 +307,9 @@ async fn submission_truncates_long_file_mentions() {
         )],
         Vec::new(),
         vec![MentionBinding {
-            mention: "large.txt".to_string(),
+            display: "large.txt".to_string(),
             path: "large.txt".to_string(),
+            is_directory: false,
         }],
     );
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -691,8 +782,9 @@ async fn submission_prefers_selected_duplicate_skill_path() {
         Vec::new(),
         Vec::new(),
         vec![MentionBinding {
-            mention: "figma".to_string(),
+            display: "figma".to_string(),
             path: user_skill_path.to_string_lossy().into_owned(),
+            is_directory: false,
         }],
     );
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -726,8 +818,9 @@ async fn blocked_image_restore_preserves_mention_bindings() {
         path: PathBuf::from("/tmp/blocked.png"),
     }];
     let mention_bindings = vec![MentionBinding {
-        mention: "file".to_string(),
+        display: "file".to_string(),
         path: "/tmp/skills/file/SKILL.md".to_string(),
+        is_directory: false,
     }];
 
     chat.restore_blocked_image_submission(
