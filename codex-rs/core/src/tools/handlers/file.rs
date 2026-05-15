@@ -646,6 +646,7 @@ impl ToolHandler for FileHandler {
                     &path,
                     &previous_hash,
                     &observation_plan.required_ranges,
+                    &text,
                 )
                 .await?;
                 let applied = apply_edit_operations(&text, &request)?;
@@ -1170,15 +1171,30 @@ async fn ensure_ranges_observed_for_edit(
     path: &Path,
     content_hash: &str,
     ranges: &[(usize, usize)],
+    text: &str,
 ) -> Result<(), FunctionCallError> {
-    tracker
+    let verification = tracker
         .lock()
         .await
-        .verify_file_observation(path, content_hash, ranges)
-        .map_err(|err| observation_error(path, err))
+        .verify_file_observation(path, content_hash, ranges);
+    if let Err(err) = verification {
+        let context_ranges = context_ranges_for_ranges(text, ranges, 3);
+        tracker.lock().await.record_file_observation(
+            path,
+            content_hash.to_string(),
+            context_ranges,
+        );
+        return Err(observation_error(path, err, text, ranges));
+    }
+    Ok(())
 }
 
-fn observation_error(path: &Path, err: FileObservationError) -> FunctionCallError {
+fn observation_error(
+    path: &Path,
+    err: FileObservationError,
+    text: &str,
+    edit_ranges: &[(usize, usize)],
+) -> FunctionCallError {
     let message = match err {
         FileObservationError::NotObserved => format!(
             "refusing to edit `{}` because the target lines have not been read or searched this turn",
@@ -1197,7 +1213,73 @@ fn observation_error(path: &Path, err: FileObservationError) -> FunctionCallErro
             format_line_ranges(&ranges)
         ),
     };
-    FunctionCallError::RespondToModel(message)
+    FunctionCallError::RespondToModel(format_observation_error(message, text, edit_ranges))
+}
+
+fn format_observation_error(message: String, text: &str, edit_ranges: &[(usize, usize)]) -> String {
+    let context = edit_context_snippet(text, edit_ranges);
+    if context.is_empty() {
+        message
+    } else {
+        format!("{message}\n\nRelevant lines:\n{context}")
+    }
+}
+
+fn edit_context_snippet(text: &str, edit_ranges: &[(usize, usize)]) -> String {
+    let lines = context_lines_for_ranges(text, edit_ranges, 3);
+    format_read_lines(&lines, true)
+}
+
+fn context_ranges_for_ranges(
+    text: &str,
+    ranges: &[(usize, usize)],
+    context: usize,
+) -> Vec<(usize, usize)> {
+    let line_count = file_line_count(text);
+    if line_count == 0 {
+        return Vec::new();
+    }
+
+    let mut ranges = ranges
+        .iter()
+        .filter_map(|(start, end)| {
+            if *start == 0 || end < start {
+                None
+            } else {
+                Some((
+                    start.saturating_sub(context).max(1),
+                    end.saturating_add(context).min(line_count),
+                ))
+            }
+        })
+        .collect::<Vec<_>>();
+    merge_line_ranges(&mut ranges);
+    ranges
+}
+
+fn context_lines_for_ranges<'a>(
+    text: &'a str,
+    ranges: &[(usize, usize)],
+    context: usize,
+) -> Vec<(usize, &'a str)> {
+    let mut next_range = context_ranges_for_ranges(text, ranges, context)
+        .into_iter()
+        .peekable();
+    text.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line_number = index + 1;
+            while let Some((_, end)) = next_range.peek()
+                && *end < line_number
+            {
+                next_range.next();
+            }
+            next_range
+                .peek()
+                .filter(|(start, end)| *start <= line_number && line_number <= *end)
+                .map(|_| (line_number, line))
+        })
+        .collect()
 }
 
 fn format_line_ranges(ranges: &[(usize, usize)]) -> String {
@@ -2399,6 +2481,135 @@ mod tests {
         );
     }
 
+    #[test]
+    fn edit_context_snippet_includes_three_lines_around_merged_ranges() {
+        let text = "01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n";
+        assert_eq!(
+            edit_context_snippet(text, &[(5, 5), (7, 7)]),
+            "2:02\n3:03\n4:04\n5:05\n6:06\n7:07\n8:08\n9:09\n10:10"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_reread_error_observes_returned_context_for_retry() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let path = root.path().join("sample.txt");
+        fs::write(&path, "alpha\nbeta\ngamma\n").await?;
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+
+        let err = match FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "beta",
+                        "new_text": "omega"
+                    }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await
+        {
+            Ok(_) => panic!("first edit should require prior observation"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(format!(
+                "refusing to edit `{}` because the target lines have not been read or searched this turn\n\nRelevant lines:\n1:alpha\n2:beta\n3:gamma",
+                path.display()
+            ))
+        );
+
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "beta",
+                        "new_text": "omega"
+                    }),
+                    tracker,
+                )
+                .await,
+            )
+            .await?;
+        assert_eq!(fs::read_to_string(path).await?, "alpha\nomega\ngamma\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_stale_error_observes_current_context_for_retry() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let path = root.path().join("sample.txt");
+        fs::write(&path, "alpha\nbeta\ngamma\n").await?;
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({ "path": "sample.txt", "start_line": 2, "end_line": 2 }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+        fs::write(&path, "alpha\nBETA\ngamma\n").await?;
+        let err = match FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "BETA",
+                        "new_text": "omega"
+                    }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await
+        {
+            Ok(_) => panic!("first edit should reject stale observation"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(format!(
+                "refusing to edit `{}` because it changed since it was read or searched: observed {}, actual {}\n\nRelevant lines:\n1:alpha\n2:BETA\n3:gamma",
+                path.display(),
+                content_hash("alpha\nbeta\ngamma\n"),
+                content_hash("alpha\nBETA\ngamma\n")
+            ))
+        );
+
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "BETA",
+                        "new_text": "omega"
+                    }),
+                    tracker,
+                )
+                .await,
+            )
+            .await?;
+        assert_eq!(fs::read_to_string(path).await?, "alpha\nomega\ngamma\n");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn read_file_returns_requested_page() -> anyhow::Result<()> {
         let root = TempDir::new()?;
@@ -3275,7 +3486,7 @@ mod tests {
         assert_eq!(
             err,
             FunctionCallError::RespondToModel(format!(
-                "refusing to edit `{}` because the target lines have not been read or searched this turn",
+                "refusing to edit `{}` because the target lines have not been read or searched this turn\n\nRelevant lines:\n1:alpha\n2:beta\n3:gamma",
                 path.display()
             ))
         );
@@ -3318,7 +3529,7 @@ mod tests {
         assert_eq!(
             err,
             FunctionCallError::RespondToModel(format!(
-                "refusing to edit `{}` because lines 2 have not been read or searched this turn",
+                "refusing to edit `{}` because lines 2 have not been read or searched this turn\n\nRelevant lines:\n1:alpha\n2:beta\n3:gamma",
                 path.display()
             ))
         );
@@ -3361,7 +3572,7 @@ mod tests {
         assert_eq!(
             err,
             FunctionCallError::RespondToModel(format!(
-                "refusing to edit `{}` because it changed since it was read or searched: observed {}, actual {}",
+                "refusing to edit `{}` because it changed since it was read or searched: observed {}, actual {}\n\nRelevant lines:\n1:alpha\n2:BETA\n3:gamma",
                 path.display(),
                 content_hash("alpha\nbeta\ngamma\n"),
                 content_hash("alpha\nBETA\ngamma\n")
@@ -3565,7 +3776,7 @@ mod tests {
         assert_eq!(
             err,
             FunctionCallError::RespondToModel(format!(
-                "refusing to edit `{}` because it changed since it was read or searched: observed {}, actual {}",
+                "refusing to edit `{}` because it changed since it was read or searched: observed {}, actual {}\n\nRelevant lines:\n1:alpha\n2:OMEGA\n3:gamma",
                 path.display(),
                 content_hash("alpha\nomega\ngamma\n"),
                 content_hash("alpha\nOMEGA\ngamma\n")
