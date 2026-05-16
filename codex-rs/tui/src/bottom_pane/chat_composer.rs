@@ -698,9 +698,9 @@ impl ChatComposer {
             Layout::vertical([Constraint::Min(1), popup_constraint]).areas(area);
         let mut textarea_rect = composer_rect.inset(Insets::tlbr(
             /*top*/ 0,
-            LIVE_PREFIX_COLS,
+            LIVE_PREFIX_COLS + 1,
             /*bottom*/ 0,
-            /*right*/ 1,
+            /*right*/ 0,
         ));
         let remote_images_height = self
             .remote_images_lines(textarea_rect.width)
@@ -4675,11 +4675,11 @@ mod tests {
 
         composer.set_text_content("!git".to_string(), Vec::new(), Vec::new());
         composer.move_cursor_to_end();
-        assert_eq!(composer.cursor_pos(area), Some((5, 1)));
+        assert_eq!(composer.cursor_pos(area), Some((6, 0)));
 
         composer.set_text_content("! git".to_string(), Vec::new(), Vec::new());
         composer.move_cursor_to_end();
-        assert_eq!(composer.cursor_pos(area), Some((6, 1)));
+        assert_eq!(composer.cursor_pos(area), Some((7, 0)));
     }
 
     #[test]
@@ -4703,7 +4703,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         composer.render(area, &mut buf);
 
-        let prompt_cell = &buf[(0, 1)];
+        let prompt_cell = &buf[(1, 0)];
         assert_eq!(prompt_cell.symbol(), "!");
         assert_eq!(prompt_cell.style().fg, Some(Color::LightRed));
 

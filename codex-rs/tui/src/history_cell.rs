@@ -305,11 +305,7 @@ fn trim_trailing_blank_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>
 
 impl HistoryCell for UserHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let wrap_width = width
-            .saturating_sub(
-                LIVE_PREFIX_COLS + 1, /* keep a one-column right margin for wrapping */
-            )
-            .max(1);
+        let wrap_width = width.saturating_sub(LIVE_PREFIX_COLS + 1).max(1);
 
         let style = user_message_style();
         let element_style = style.fg(Color::Cyan);
@@ -368,8 +364,8 @@ impl HistoryCell for UserHistoryCell {
         if let Some(wrapped_remote_images) = wrapped_remote_images {
             lines.extend(prefix_lines(
                 wrapped_remote_images,
-                "  ".into(),
-                "  ".into(),
+                "   ".into(),
+                "   ".into(),
             ));
             if wrapped_message.is_some() {
                 lines.push(Line::from("").style(style));
@@ -379,8 +375,8 @@ impl HistoryCell for UserHistoryCell {
         if let Some(wrapped_message) = wrapped_message {
             lines.extend(prefix_lines(
                 wrapped_message,
-                "› ".bold().dim(),
-                "  ".into(),
+                " › ".bold().dim(),
+                "   ".into(),
             ));
         }
         lines
