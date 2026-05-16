@@ -2022,10 +2022,66 @@ fn text_occurrence_byte_range(
     occurrence: Option<usize>,
     field_name: &str,
 ) -> Result<std::ops::Range<usize>, FunctionCallError> {
-    let occurrence = resolve_occurrence(text, needle, occurrence, field_name)?;
-    let start = occurrence_start(text, needle, occurrence)
+    if occurrence == Some(0) {
+        return Err(FunctionCallError::RespondToModel(
+            "occurrence must be one-based".to_string(),
+        ));
+    }
+
+    let count = text.matches(needle).count();
+    if count != 0 {
+        let occurrence = resolve_occurrence(text, needle, occurrence, field_name)?;
+        let start = occurrence_start(text, needle, occurrence).ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!("{field_name} was not found"))
+        })?;
+        return Ok(start..start + needle.len());
+    }
+
+    let normalized_needle = normalize_quotes(needle);
+    let normalized_text = normalize_quotes(text);
+    if normalized_needle == needle && normalized_text == text {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{field_name} was not found"
+        )));
+    }
+
+    let occurrence =
+        resolve_occurrence(&normalized_text, &normalized_needle, occurrence, field_name)?;
+    let start = occurrence_start(&normalized_text, &normalized_needle, occurrence)
         .ok_or_else(|| FunctionCallError::RespondToModel(format!("{field_name} was not found")))?;
-    Ok(start..start + needle.len())
+    let end = start + normalized_needle.len();
+    Ok(normalized_byte_range_to_original(
+        text,
+        &normalized_text,
+        start,
+        end,
+    ))
+}
+
+fn normalize_quotes(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '‘' | '’' => '\'',
+            '“' | '”' => '"',
+            ch => ch,
+        })
+        .collect()
+}
+
+fn normalized_byte_range_to_original(
+    original: &str,
+    normalized: &str,
+    start: usize,
+    end: usize,
+) -> std::ops::Range<usize> {
+    let start_char = normalized[..start].chars().count();
+    let end_char = normalized[..end].chars().count();
+    let mut original_byte_indexes = original
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    original_byte_indexes.push(original.len());
+    original_byte_indexes[start_char]..original_byte_indexes[end_char]
 }
 
 fn occurrence_start(text: &str, needle: &str, occurrence: usize) -> Option<usize> {
@@ -2166,54 +2222,69 @@ fn resolve_operation_edits(
             old_text,
             new_text,
             occurrence,
-        } => Ok(vec![ResolvedEdit {
+        } => Ok(vec![resolve_text_replacement_edit(
+            text,
             op_index,
-            range: text_occurrence_byte_range(text, old_text, *occurrence, "old_text")?,
-            replacement: new_text.clone(),
-        }]),
+            old_text,
+            new_text,
+            *occurrence,
+        )?]),
         EditOperation::InsertBefore {
             anchor,
             text: insert_text,
             occurrence,
-        } => Ok(vec![ResolvedEdit {
-            op_index,
-            range: text_occurrence_byte_range(text, anchor, *occurrence, "anchor")?,
-            replacement: format!("{insert_text}{anchor}"),
-        }]),
+        } => {
+            let anchor_range = text_occurrence_byte_range(text, anchor, *occurrence, "anchor")?;
+            let actual_anchor = &text[anchor_range.clone()];
+            Ok(vec![resolved_edit(
+                text,
+                op_index,
+                anchor_range,
+                format!("{insert_text}{actual_anchor}"),
+            )?])
+        }
         EditOperation::InsertAfter {
             anchor,
             text: insert_text,
             occurrence,
-        } => Ok(vec![ResolvedEdit {
-            op_index,
-            range: text_occurrence_byte_range(text, anchor, *occurrence, "anchor")?,
-            replacement: format!("{anchor}{insert_text}"),
-        }]),
+        } => {
+            let anchor_range = text_occurrence_byte_range(text, anchor, *occurrence, "anchor")?;
+            let actual_anchor = &text[anchor_range.clone()];
+            Ok(vec![resolved_edit(
+                text,
+                op_index,
+                anchor_range,
+                format!("{actual_anchor}{insert_text}"),
+            )?])
+        }
         EditOperation::ReplaceRange {
             start_line,
             end_line,
             new_text,
-        } => Ok(vec![ResolvedEdit {
+        } => Ok(vec![resolved_edit(
+            text,
             op_index,
-            range: line_byte_range(text, *start_line, *end_line)?,
-            replacement: new_text.clone(),
-        }]),
+            line_byte_range(text, *start_line, *end_line)?,
+            new_text.clone(),
+        )?]),
         EditOperation::DeleteRange {
             start_line,
             end_line,
-        } => Ok(vec![ResolvedEdit {
+        } => Ok(vec![resolved_edit(
+            text,
             op_index,
-            range: line_byte_range(text, *start_line, *end_line)?,
-            replacement: String::new(),
-        }]),
+            line_byte_range(text, *start_line, *end_line)?,
+            String::new(),
+        )?]),
         EditOperation::DeleteText {
             old_text,
             occurrence,
-        } => Ok(vec![ResolvedEdit {
+        } => Ok(vec![resolved_edit(
+            text,
             op_index,
-            range: text_occurrence_byte_range(text, old_text, *occurrence, "old_text")?,
-            replacement: String::new(),
-        }]),
+            text_occurrence_byte_range(text, old_text, *occurrence, "old_text")?,
+            String::new(),
+        )?]),
         EditOperation::ReplaceOccurrences {
             old_text,
             new_text,
@@ -2227,20 +2298,114 @@ fn resolve_operation_edits(
             occurrences
                 .iter()
                 .map(|occurrence| {
-                    Ok(ResolvedEdit {
+                    resolve_text_replacement_edit(
+                        text,
                         op_index,
-                        range: text_occurrence_byte_range(
-                            text,
-                            old_text,
-                            Some(*occurrence),
-                            "old_text",
-                        )?,
-                        replacement: new_text.clone(),
-                    })
+                        old_text,
+                        new_text,
+                        Some(*occurrence),
+                    )
                 })
                 .collect()
         }
     }
+}
+
+fn resolve_text_replacement_edit(
+    text: &str,
+    op_index: usize,
+    old_text: &str,
+    new_text: &str,
+    occurrence: Option<usize>,
+) -> Result<ResolvedEdit, FunctionCallError> {
+    let old_range = text_occurrence_byte_range(text, old_text, occurrence, "old_text")?;
+    let actual_old_text = &text[old_range.clone()];
+    let replacement = preserve_quote_style(old_text, actual_old_text, new_text);
+    resolved_edit(text, op_index, old_range, replacement)
+}
+
+fn resolved_edit(
+    text: &str,
+    op_index: usize,
+    range: std::ops::Range<usize>,
+    replacement: String,
+) -> Result<ResolvedEdit, FunctionCallError> {
+    if text[range.clone()] == replacement {
+        return Err(FunctionCallError::RespondToModel(
+            "no changes to make: replacement is identical to matched text".to_string(),
+        ));
+    }
+    Ok(ResolvedEdit {
+        op_index,
+        range,
+        replacement,
+    })
+}
+
+fn preserve_quote_style(old_text: &str, actual_old_text: &str, new_text: &str) -> String {
+    if old_text == actual_old_text {
+        return new_text.to_string();
+    }
+
+    let mut replacement = new_text.to_string();
+    if actual_old_text.contains('“') || actual_old_text.contains('”') {
+        replacement = apply_curly_double_quotes(&replacement);
+    }
+    if actual_old_text.contains('‘') || actual_old_text.contains('’') {
+        replacement = apply_curly_single_quotes(&replacement);
+    }
+    replacement
+}
+
+fn apply_curly_double_quotes(text: &str) -> String {
+    text.char_indices()
+        .map(|(index, ch)| {
+            if ch == '"' && is_opening_quote_context(text, index) {
+                '“'
+            } else if ch == '"' {
+                '”'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn apply_curly_single_quotes(text: &str) -> String {
+    text.char_indices()
+        .map(|(index, ch)| {
+            if ch != '\'' {
+                return ch;
+            }
+            let previous = previous_char(text, index);
+            let next = next_char(text, index);
+            if previous.is_some_and(char::is_alphabetic) && next.is_some_and(char::is_alphabetic) {
+                return '’';
+            }
+            if is_opening_quote_context(text, index) {
+                '‘'
+            } else {
+                '’'
+            }
+        })
+        .collect()
+}
+
+fn is_opening_quote_context(text: &str, index: usize) -> bool {
+    previous_char(text, index).is_none_or(|previous| {
+        matches!(
+            previous,
+            ' ' | '\t' | '\n' | '\r' | '(' | '[' | '{' | '—' | '–'
+        )
+    })
+}
+
+fn previous_char(text: &str, index: usize) -> Option<char> {
+    text[..index].chars().next_back()
+}
+
+fn next_char(text: &str, index: usize) -> Option<char> {
+    text[index..].chars().nth(1)
 }
 
 fn line_byte_range(
@@ -3455,6 +3620,81 @@ mod tests {
             FunctionCallError::RespondToModel(
                 "old_text occurs 2 times; specify occurrence".to_string()
             )
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_matches_curly_quotes_and_preserves_quote_style() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let path = root.path().join("sample.txt");
+        fs::write(&path, "quote: “hello”\n").await?;
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "read_file",
+                    json!({ "path": "sample.txt", "start_line": 1, "end_line": 1 }),
+                    tracker.clone(),
+                )
+                .await,
+            )
+            .await?;
+        FileHandler
+            .handle(
+                invocation_with_tracker(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "quote: \"hello\"",
+                        "new_text": "quote: \"goodbye\""
+                    }),
+                    tracker,
+                )
+                .await,
+            )
+            .await?;
+
+        assert_eq!(fs::read_to_string(path).await?, "quote: “goodbye”\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_no_op_replacement() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        fs::write(root.path().join("sample.txt"), "alpha\n").await?;
+
+        let err = match FileHandler
+            .handle(
+                invocation(
+                    &root,
+                    "edit",
+                    json!({
+                        "path": "sample.txt",
+                        "old_text": "alpha",
+                        "new_text": "alpha"
+                    }),
+                )
+                .await,
+            )
+            .await
+        {
+            Ok(_) => panic!("no-op edit should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(
+                "no changes to make: replacement is identical to matched text".to_string()
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("sample.txt")).await?,
+            "alpha\n"
         );
         Ok(())
     }

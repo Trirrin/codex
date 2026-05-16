@@ -312,7 +312,10 @@ fn edit_operation_schema() -> JsonSchema {
             ),
             (
                 "old_text".to_string(),
-                JsonSchema::string(Some("Existing text to replace or delete.".to_string())),
+                JsonSchema::string(Some(
+                    "Existing text to replace or delete. Use the smallest unique snippet, and do not include read_file line-number prefixes."
+                        .to_string(),
+                )),
             ),
             (
                 "new_text".to_string(),
@@ -320,7 +323,10 @@ fn edit_operation_schema() -> JsonSchema {
             ),
             (
                 "anchor".to_string(),
-                JsonSchema::string(Some("Existing text to insert before or after.".to_string())),
+                JsonSchema::string(Some(
+                    "Existing text to insert before or after. Use the smallest unique snippet, and do not include read_file line-number prefixes."
+                        .to_string(),
+                )),
             ),
             (
                 "text".to_string(),
@@ -410,7 +416,7 @@ pub fn create_edit_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "edit".to_string(),
         description:
-            "Edits a single local file. Prefer ops for atomic inserts, deletes, ranges, or multiple edits; legacy old_text/new_text remains supported. After observing a file, batch all planned edits for that file into one edit call when possible, because a successful edit changes the file hash and later edits require fresh observation."
+            "Edits a single local file. Prefer ops for atomic inserts, deletes, ranges, or multiple edits; legacy old_text/new_text remains supported. Read or search the target lines first, then use the smallest unique old_text or anchor without line-number prefixes. The editor rejects no-op replacements and can match straight quotes against curly quotes while preserving the file's quote style. After observing a file, batch all planned edits for that file into one edit call when possible, because a successful edit changes the file hash and later edits require fresh observation."
                 .to_string(),
         strict: false,
         defer_loading: None,
