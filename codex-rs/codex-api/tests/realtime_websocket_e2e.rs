@@ -71,7 +71,6 @@ fn test_provider(base_url: String) -> Provider {
             retry_5xx: false,
             retry_transport: false,
         },
-        stream_connect_timeout: Duration::from_secs(1),
         stream_idle_timeout: Duration::from_secs(5),
     }
 }

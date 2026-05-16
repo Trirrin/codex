@@ -41,11 +41,7 @@ impl ReqwestTransport {
         }
     }
 
-    fn build(
-        &self,
-        req: Request,
-        apply_timeout: bool,
-    ) -> Result<CodexRequestBuilder, TransportError> {
+    fn build(&self, req: Request) -> Result<CodexRequestBuilder, TransportError> {
         let prepared = req.prepare_body_for_send().map_err(TransportError::Build)?;
 
         let Request {
@@ -62,7 +58,7 @@ impl ReqwestTransport {
             &url,
         );
 
-        if apply_timeout && let Some(timeout) = timeout {
+        if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
         }
 
@@ -103,7 +99,7 @@ impl HttpTransport for ReqwestTransport {
         }
 
         let url = req.url.clone();
-        let builder = self.build(req, /*apply_timeout*/ true)?;
+        let builder = self.build(req)?;
         let resp = builder.send().await.map_err(Self::map_error)?;
         let status = resp.status();
         let headers = resp.headers().clone();
@@ -135,15 +131,8 @@ impl HttpTransport for ReqwestTransport {
         }
 
         let url = req.url.clone();
-        let timeout = req.timeout;
-        let builder = self.build(req, /*apply_timeout*/ false)?;
-        let resp = match timeout {
-            Some(timeout) => tokio::time::timeout(timeout, builder.send())
-                .await
-                .map_err(|_| TransportError::Timeout)?
-                .map_err(Self::map_error)?,
-            None => builder.send().await.map_err(Self::map_error)?,
-        };
+        let builder = self.build(req)?;
+        let resp = builder.send().await.map_err(Self::map_error)?;
         let status = resp.status();
         let headers = resp.headers().clone();
         if !status.is_success() {

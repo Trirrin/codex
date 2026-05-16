@@ -124,7 +124,6 @@ impl<T: HttpTransport> ResponsesClient<T> {
             Compression::Zstd => RequestCompression::Zstd,
         };
 
-        let stream_connect_timeout = self.session.provider().stream_connect_timeout;
         let stream_response = self
             .session
             .stream_with(
@@ -138,7 +137,6 @@ impl<T: HttpTransport> ResponsesClient<T> {
                         HeaderValue::from_static("text/event-stream"),
                     );
                     req.compression = request_compression;
-                    req.timeout = Some(stream_connect_timeout);
                 },
             )
             .await?;

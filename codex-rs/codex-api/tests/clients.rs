@@ -136,21 +136,13 @@ fn provider(name: &str) -> Provider {
             retry_5xx: false,
             retry_transport: true,
         },
-        stream_connect_timeout: Duration::from_secs(10),
         stream_idle_timeout: Duration::from_millis(10),
     }
-}
-
-#[derive(Clone, Copy)]
-enum FirstStreamFailure {
-    Network,
-    Timeout,
 }
 
 #[derive(Clone)]
 struct FlakyTransport {
     state: Arc<Mutex<i64>>,
-    first_failure: FirstStreamFailure,
 }
 
 impl Default for FlakyTransport {
@@ -163,14 +155,6 @@ impl FlakyTransport {
     fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(0)),
-            first_failure: FirstStreamFailure::Network,
-        }
-    }
-
-    fn timeout() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(0)),
-            first_failure: FirstStreamFailure::Timeout,
         }
     }
 
@@ -249,12 +233,7 @@ impl HttpTransport for FlakyTransport {
         *attempts += 1;
 
         if *attempts == 1 {
-            return match self.first_failure {
-                FirstStreamFailure::Network => {
-                    Err(TransportError::Network("first attempt fails".to_string()))
-                }
-                FirstStreamFailure::Timeout => Err(TransportError::Timeout),
-            };
+            return Err(TransportError::Network("first attempt fails".to_string()));
         }
 
         let stream = futures::stream::iter(vec![Ok(Bytes::from(
@@ -321,8 +300,6 @@ async fn streaming_client_adds_auth_headers() -> Result<()> {
         Some("Bearer secret-token")
     );
 
-    assert_eq!(req.timeout, Some(Duration::from_secs(10)));
-
     let account_header = req.headers.get("ChatGPT-Account-ID");
     assert!(account_header.is_some(), "missing account header");
     assert_eq!(account_header.unwrap().to_str().ok(), Some("acct-1"));
@@ -339,44 +316,6 @@ async fn streaming_client_adds_auth_headers() -> Result<()> {
 #[tokio::test]
 async fn streaming_client_retries_on_transport_error() -> Result<()> {
     let transport = FlakyTransport::new();
-
-    let mut provider = provider("openai");
-    provider.retry.max_attempts = 2;
-
-    let request = ResponsesApiRequest {
-        model: "gpt-test".into(),
-        instructions: "Say hi".into(),
-        input: Vec::new(),
-        tools: Vec::new(),
-        tool_choice: "auto".into(),
-        parallel_tool_calls: false,
-        reasoning: None,
-        store: false,
-        stream: true,
-        include: Vec::new(),
-        service_tier: None,
-        prompt_cache_key: None,
-        text: None,
-        client_metadata: None,
-    };
-    let client = ResponsesClient::new(transport.clone(), provider, Arc::new(NoAuth));
-
-    let _stream = client
-        .stream_request(
-            request,
-            ResponsesOptions {
-                compression: Compression::None,
-                ..Default::default()
-            },
-        )
-        .await?;
-    assert_eq!(transport.attempts(), 2);
-    Ok(())
-}
-
-#[tokio::test]
-async fn streaming_client_retries_on_connect_timeout() -> Result<()> {
-    let transport = FlakyTransport::timeout();
 
     let mut provider = provider("openai");
     provider.retry.max_attempts = 2;
