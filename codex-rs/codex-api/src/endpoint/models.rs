@@ -155,6 +155,7 @@ mod tests {
                 retry_5xx: true,
                 retry_transport: true,
             },
+            stream_connect_timeout: Duration::from_secs(1),
             stream_idle_timeout: Duration::from_secs(1),
         }
     }

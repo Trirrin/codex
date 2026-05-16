@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
+use codex_api::ApiError;
 use codex_api::AuthProvider;
 use codex_api::Compression;
 use codex_api::Provider;
@@ -50,6 +51,24 @@ impl HttpTransport for FixtureSseTransport {
     }
 }
 
+#[derive(Clone)]
+struct PendingSseTransport;
+
+#[async_trait]
+impl HttpTransport for PendingSseTransport {
+    async fn execute(&self, _req: Request) -> Result<Response, TransportError> {
+        Err(TransportError::Build("execute should not run".to_string()))
+    }
+
+    async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError> {
+        Ok(StreamResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            bytes: Box::pin(futures::stream::pending()),
+        })
+    }
+}
+
 #[derive(Clone, Default)]
 struct NoAuth;
 
@@ -70,6 +89,7 @@ fn provider(name: &str) -> Provider {
             retry_5xx: false,
             retry_transport: true,
         },
+        stream_connect_timeout: Duration::from_secs(10),
         stream_idle_timeout: Duration::from_millis(50),
     }
 }
@@ -165,6 +185,37 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
             assert!(end_turn.is_none());
         }
         other => panic!("unexpected third event: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn responses_stream_errors_after_idle_timeout() -> Result<()> {
+    let mut provider = provider("openai");
+    provider.stream_idle_timeout = Duration::from_millis(10);
+    let client = ResponsesClient::new(PendingSseTransport, provider, Arc::new(NoAuth));
+
+    let mut stream = client
+        .stream(
+            serde_json::json!({"echo": true}),
+            HeaderMap::new(),
+            Compression::None,
+            /*turn_state*/ None,
+        )
+        .await?;
+
+    loop {
+        let event = stream
+            .next()
+            .await
+            .expect("idle timeout should produce a stream error");
+        match event {
+            Ok(ResponseEvent::RateLimits(_)) => continue,
+            Err(ApiError::Stream(message)) => assert_eq!(message, "idle timeout waiting for SSE"),
+            other => panic!("unexpected idle timeout event: {other:?}"),
+        }
+        break;
     }
 
     Ok(())

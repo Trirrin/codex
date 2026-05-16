@@ -133,6 +133,25 @@ supports_websockets = true
 }
 
 #[test]
+fn test_default_stream_timeouts_are_short() {
+    let provider = ModelProviderInfo::default();
+    assert_eq!(
+        provider.stream_idle_timeout(),
+        std::time::Duration::from_secs(20)
+    );
+    assert_eq!(
+        provider.websocket_connect_timeout(),
+        std::time::Duration::from_secs(10)
+    );
+
+    let api_provider = provider.to_api_provider(/*auth_mode*/ None).unwrap();
+    assert_eq!(
+        api_provider.stream_connect_timeout,
+        std::time::Duration::from_secs(10)
+    );
+}
+
+#[test]
 fn test_supports_remote_compaction_for_openai() {
     let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
 

@@ -41,6 +41,7 @@ fn provider(base_url: &str) -> Provider {
             retry_5xx: true,
             retry_transport: true,
         },
+        stream_connect_timeout: std::time::Duration::from_secs(1),
         stream_idle_timeout: std::time::Duration::from_secs(1),
     }
 }
