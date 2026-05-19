@@ -65,6 +65,14 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     assert!(description.contains("`max_concurrent_threads_per_session = 4`"));
     assert!(description.contains("### Codebase exploration first"));
     assert!(description.contains("start by spawning a blocking `explorer` agent"));
+    assert_eq!(
+        properties
+            .get("mode")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(
+            "Execution mode: \"blocking\" waits for the target agent to reach a final status and is the default when the next step depends on the agent's result. Use \"background\" only for long-running work that does not block the next step, or when you want to keep working while the agent runs."
+        )
+    );
     assert!(description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
     assert!(
         description
@@ -133,6 +141,14 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
     assert!(properties.contains_key("fork_context"));
     assert!(description.contains("### Codebase exploration first"));
     assert!(description.contains("start by spawning a blocking `explorer` subagent"));
+    assert_eq!(
+        properties
+            .get("mode")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(
+            "Execution mode: \"blocking\" waits for the target agent to reach a final status and is the default when the next step depends on the agent's result. Use \"background\" only for long-running work that does not block the next step, or when you want to keep working while the agent runs."
+        )
+    );
     assert!(!properties.contains_key("fork_turns"));
     assert_eq!(
         properties

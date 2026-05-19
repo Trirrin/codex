@@ -360,7 +360,7 @@ fn add_agent_mode_property(properties: &mut BTreeMap<String, JsonSchema>) {
     properties.insert(
         "mode".to_string(),
         JsonSchema::string(Some(
-            "Execution mode: \"background\" returns immediately after starting the agent; \"blocking\" waits for the target agent to reach a final status."
+            "Execution mode: \"blocking\" waits for the target agent to reach a final status and is the default when the next step depends on the agent's result. Use \"background\" only for long-running work that does not block the next step, or when you want to keep working while the agent runs."
                 .to_string(),
         )),
     );
