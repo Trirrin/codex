@@ -77,6 +77,7 @@ pub mod legacy_core {
     pub use codex_core::grant_read_root_non_elevated;
     pub use codex_core::lookup_message_history_entry;
     pub use codex_core::message_history_metadata;
+    pub use codex_core::web_search_action_label;
     pub use codex_core::web_search_detail;
 
     pub mod config {

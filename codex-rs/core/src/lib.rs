@@ -123,6 +123,7 @@ pub use thread_manager::StartThreadWithToolsOptions;
 pub use thread_manager::ThreadManager;
 pub use thread_manager::build_models_manager;
 pub use web_search::web_search_action_detail;
+pub use web_search::web_search_action_label;
 pub use web_search::web_search_detail;
 pub use windows_sandbox_read_grants::grant_read_root_non_elevated;
 #[deprecated(note = "use ThreadManager")]

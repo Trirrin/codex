@@ -15,6 +15,39 @@ fn search_action_detail(query: &Option<String>, queries: &Option<Vec<String>>) -
     })
 }
 
+pub fn web_search_action_label(action: Option<&WebSearchAction>, completed: bool) -> &'static str {
+    match action {
+        Some(WebSearchAction::Search { .. }) | None => {
+            if completed {
+                "Searched"
+            } else {
+                "Searching the web"
+            }
+        }
+        Some(WebSearchAction::OpenPage { .. }) => {
+            if completed {
+                "Opened page"
+            } else {
+                "Opening page"
+            }
+        }
+        Some(WebSearchAction::FindInPage { .. }) => {
+            if completed {
+                "Found in page"
+            } else {
+                "Finding in page"
+            }
+        }
+        Some(WebSearchAction::Other) => {
+            if completed {
+                "Used web"
+            } else {
+                "Using web"
+            }
+        }
+    }
+}
+
 pub fn web_search_action_detail(action: &WebSearchAction) -> String {
     match action {
         WebSearchAction::Search { query, queries } => search_action_detail(query, queries),

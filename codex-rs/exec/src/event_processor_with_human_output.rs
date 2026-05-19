@@ -9,6 +9,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::WebSearchAction;
 use codex_core::config::Config;
 use codex_model_provider_info::WireApi;
 use codex_protocol::models::PermissionProfile;
@@ -22,6 +23,39 @@ use owo_colors::Style;
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use crate::event_processor::handle_last_message;
+
+fn web_search_item_label(action: Option<&WebSearchAction>, completed: bool) -> &'static str {
+    match action {
+        Some(WebSearchAction::Search { .. }) | None => {
+            if completed {
+                "Searched"
+            } else {
+                "Searching the web"
+            }
+        }
+        Some(WebSearchAction::OpenPage { .. }) => {
+            if completed {
+                "Opened page"
+            } else {
+                "Opening page"
+            }
+        }
+        Some(WebSearchAction::FindInPage { .. }) => {
+            if completed {
+                "Found in page"
+            } else {
+                "Finding in page"
+            }
+        }
+        Some(WebSearchAction::Other) => {
+            if completed {
+                "Used web"
+            } else {
+                "Using web"
+            }
+        }
+    }
+}
 
 pub(crate) struct EventProcessorWithHumanOutput {
     bold: Style,
@@ -85,8 +119,9 @@ impl EventProcessorWithHumanOutput {
                     "started".style(self.dimmed)
                 );
             }
-            ThreadItem::WebSearch { query, .. } => {
-                eprintln!("{} {}", "web search:".style(self.bold), query);
+            ThreadItem::WebSearch { action, query, .. } => {
+                let label = web_search_item_label(action.as_ref(), /*completed*/ false);
+                eprintln!("{} {}", format!("{label}:").style(self.bold), query);
             }
             ThreadItem::FileChange { .. } => {
                 eprintln!("{}", "apply patch".style(self.bold));
@@ -200,8 +235,9 @@ impl EventProcessorWithHumanOutput {
                     eprintln!("{}", error.message.style(self.red));
                 }
             }
-            ThreadItem::WebSearch { query, .. } => {
-                eprintln!("{} {}", "web search:".style(self.bold), query);
+            ThreadItem::WebSearch { action, query, .. } => {
+                let label = web_search_item_label(action.as_ref(), /*completed*/ true);
+                eprintln!("{} {}", format!("{label}:").style(self.bold), query);
             }
             ThreadItem::ContextCompaction { .. } => {
                 eprintln!("{}", "context compacted".style(self.dimmed));

@@ -20,6 +20,7 @@ use crate::exec_cell::spinner;
 use crate::exec_command::relativize_to_home;
 use crate::exec_command::strip_bash_lc_and_escape;
 use crate::legacy_core::config::Config;
+use crate::legacy_core::web_search_action_label;
 use crate::legacy_core::web_search_detail;
 use crate::live_wrap::take_prefix_by_width;
 use crate::markdown::append_markdown;
@@ -1722,14 +1723,6 @@ pub(crate) fn new_active_mcp_tool_call(
     McpToolCallCell::new(call_id, invocation, animations_enabled)
 }
 
-fn web_search_header(completed: bool) -> &'static str {
-    if completed {
-        "Searched"
-    } else {
-        "Searching the web"
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct WebSearchCell {
     call_id: String,
@@ -1778,7 +1771,7 @@ impl HistoryCell for WebSearchCell {
         } else {
             spinner(Some(self.start_time), self.animations_enabled)
         };
-        let header = web_search_header(self.completed);
+        let header = web_search_action_label(self.action.as_ref(), self.completed);
         let detail = web_search_detail(self.action.as_ref(), &self.query);
         let text: Text<'static> = if detail.is_empty() {
             Line::from(vec![header.bold()]).into()
@@ -3823,6 +3816,39 @@ mod tests {
         let rendered = render_lines(&cell.display_lines(/*width*/ 64));
 
         assert_eq!(rendered, vec!["• Searched short query".to_string()]);
+    }
+
+    #[test]
+    fn web_search_history_cell_labels_open_page() {
+        let url = "https://example.com/reference".to_string();
+        let cell = new_web_search_call(
+            "call-1".to_string(),
+            String::new(),
+            WebSearchAction::OpenPage {
+                url: Some(url.clone()),
+            },
+        );
+        let rendered = render_lines(&cell.display_lines(/*width*/ 64));
+
+        assert_eq!(rendered, vec![format!("• Opened page {url}")]);
+    }
+
+    #[test]
+    fn web_search_history_cell_labels_find_in_page() {
+        let cell = new_web_search_call(
+            "call-1".to_string(),
+            String::new(),
+            WebSearchAction::FindInPage {
+                url: Some("https://example.com/reference".to_string()),
+                pattern: Some("needle".to_string()),
+            },
+        );
+        let rendered = render_lines(&cell.display_lines(/*width*/ 80));
+
+        assert_eq!(
+            rendered,
+            vec!["• Found in page 'needle' in https://example.com/reference".to_string()]
+        );
     }
 
     #[test]
