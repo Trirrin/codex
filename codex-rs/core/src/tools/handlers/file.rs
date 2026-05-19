@@ -306,7 +306,7 @@ struct GrepContextLine {
 struct FileLineObservation {
     path: PathBuf,
     content_hash: String,
-    lines: Vec<usize>,
+    ranges: Vec<(usize, usize)>,
 }
 
 #[derive(Serialize)]
@@ -1131,12 +1131,11 @@ async fn record_file_line_observations(
 ) {
     let mut tracker = tracker.lock().await;
     for observation in observations {
-        let ranges = observation
-            .lines
-            .into_iter()
-            .map(|line| (line, line))
-            .collect::<Vec<_>>();
-        tracker.record_file_observation(&observation.path, observation.content_hash, ranges);
+        tracker.record_file_observation(
+            &observation.path,
+            observation.content_hash,
+            observation.ranges,
+        );
     }
 }
 
@@ -1173,17 +1172,10 @@ async fn ensure_ranges_observed_for_edit(
     ranges: &[(usize, usize)],
     text: &str,
 ) -> Result<(), FunctionCallError> {
-    let verification = tracker
-        .lock()
-        .await
-        .verify_file_observation(path, content_hash, ranges);
-    if let Err(err) = verification {
+    let mut tracker = tracker.lock().await;
+    if let Err(err) = tracker.verify_file_observation(path, content_hash, ranges) {
         let context_ranges = context_ranges_for_ranges(text, ranges, 3);
-        tracker.lock().await.record_file_observation(
-            path,
-            content_hash.to_string(),
-            context_ranges,
-        );
+        tracker.record_file_observation(path, content_hash.to_string(), context_ranges);
         return Err(observation_error(path, err, text, ranges));
     }
     Ok(())
@@ -1484,10 +1476,15 @@ fn push_file_line_observation(
     if lines.is_empty() {
         return;
     }
+    let mut ranges = lines
+        .into_iter()
+        .map(|line| (line, line))
+        .collect::<Vec<_>>();
+    merge_line_ranges(&mut ranges);
     observations.push(FileLineObservation {
         path,
         content_hash: content_hash(text),
-        lines,
+        ranges,
     });
 }
 

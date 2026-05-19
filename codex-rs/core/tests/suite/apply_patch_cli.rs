@@ -298,12 +298,10 @@ async fn apply_patch_cli_insert_only_hunk_modifies_file(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[test_case(ApplyPatchModelOutput::Freeform)]
-#[test_case(ApplyPatchModelOutput::Function)]
 #[test_case(ApplyPatchModelOutput::Shell)]
 #[test_case(ApplyPatchModelOutput::ShellViaHeredoc)]
 #[test_case(ApplyPatchModelOutput::ShellCommandViaHeredoc)]
-async fn apply_patch_cli_move_overwrites_existing_destination(
+async fn apply_patch_cli_rejects_move_overwrite_destination(
     model_output: ApplyPatchModelOutput,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -321,10 +319,15 @@ async fn apply_patch_cli_move_overwrites_existing_destination(
 
     harness.submit("apply move overwrite patch").await?;
 
-    assert!(!harness.path_exists("old/name.txt").await?);
+    let out = harness.apply_patch_output(call_id, model_output).await;
+    assert!(
+        out.contains("Refusing to overwrite existing file"),
+        "expected overwrite diagnostic in output: {out}"
+    );
+    assert_eq!(harness.read_file_text("old/name.txt").await?, "from\n");
     assert_eq!(
         harness.read_file_text("renamed/dir/name.txt").await?,
-        "new\n"
+        "existing\n"
     );
     Ok(())
 }
@@ -395,12 +398,10 @@ async fn apply_patch_cli_move_without_content_change_has_no_turn_diff(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[test_case(ApplyPatchModelOutput::Freeform)]
-#[test_case(ApplyPatchModelOutput::Function)]
 #[test_case(ApplyPatchModelOutput::Shell)]
 #[test_case(ApplyPatchModelOutput::ShellViaHeredoc)]
 #[test_case(ApplyPatchModelOutput::ShellCommandViaHeredoc)]
-async fn apply_patch_cli_add_overwrites_existing_file(
+async fn apply_patch_cli_rejects_add_overwrite_existing_file(
     model_output: ApplyPatchModelOutput,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -415,9 +416,14 @@ async fn apply_patch_cli_add_overwrites_existing_file(
 
     harness.submit("apply add overwrite patch").await?;
 
+    let out = harness.apply_patch_output(call_id, model_output).await;
+    assert!(
+        out.contains("Refusing to overwrite existing file"),
+        "expected overwrite diagnostic in output: {out}"
+    );
     assert_eq!(
         harness.read_file_text("duplicate.txt").await?,
-        "new content\n"
+        "old content\n"
     );
     Ok(())
 }

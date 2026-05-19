@@ -275,6 +275,7 @@ async fn apply_hunks_to_files(
         let path_abs = hunk.resolve_path(cwd);
         match hunk {
             Hunk::AddFile { contents, .. } => {
+                ensure_path_missing(fs, &path_abs, sandbox).await?;
                 write_file_with_missing_parent_retry(
                     fs,
                     &path_abs,
@@ -314,6 +315,10 @@ async fn apply_hunks_to_files(
                     derive_new_contents_from_chunks(&path_abs, chunks, fs, sandbox).await?;
                 if let Some(dest) = move_path {
                     let dest_abs = AbsolutePathBuf::resolve_path_against_base(dest, cwd);
+                    if path_abs == dest_abs {
+                        anyhow::bail!("Refusing to move {} onto itself", path_abs.display());
+                    }
+                    ensure_path_missing(fs, &dest_abs, sandbox).await?;
                     write_file_with_missing_parent_retry(
                         fs,
                         &dest_abs,
@@ -358,6 +363,19 @@ async fn apply_hunks_to_files(
         modified,
         deleted,
     })
+}
+
+async fn ensure_path_missing(
+    fs: &dyn ExecutorFileSystem,
+    path_abs: &AbsolutePathBuf,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> anyhow::Result<()> {
+    match fs.get_metadata(path_abs, sandbox).await {
+        Ok(_) => anyhow::bail!("Refusing to overwrite existing file {}", path_abs.display()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err)
+            .with_context(|| format!("Failed to check whether {} exists", path_abs.display())),
+    }
 }
 
 async fn write_file_with_missing_parent_retry(
@@ -661,6 +679,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_file_hunk_rejects_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("add.txt");
+        fs::write(&path, "old\n").unwrap();
+        let patch = wrap_patch(&format!(
+            r#"*** Add File: {}
++new"#,
+            path.display()
+        ));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        apply_patch(
+            &patch,
+            &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
+            &mut stdout,
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(String::from_utf8(stdout).unwrap(), "");
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("Refusing to overwrite existing file"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "old\n");
+    }
+
+    #[tokio::test]
     async fn test_apply_patch_hunks_accept_relative_and_absolute_paths() {
         let dir = tempdir().unwrap();
         let cwd = dir.path().abs();
@@ -838,6 +886,43 @@ mod tests {
         assert!(!src.exists());
         let contents = fs::read_to_string(&dest).unwrap();
         assert_eq!(contents, "line2\n");
+    }
+
+    #[tokio::test]
+    async fn test_update_file_hunk_rejects_existing_move_destination() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        let dest = dir.path().join("dst.txt");
+        fs::write(&src, "line\n").unwrap();
+        fs::write(&dest, "existing\n").unwrap();
+        let patch = wrap_patch(&format!(
+            r#"*** Update File: {}
+*** Move to: {}
+@@
+-line
++line2"#,
+            src.display(),
+            dest.display()
+        ));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        apply_patch(
+            &patch,
+            &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
+            &mut stdout,
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(String::from_utf8(stdout).unwrap(), "");
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("Refusing to overwrite existing file"));
+        assert_eq!(fs::read_to_string(src).unwrap(), "line\n");
+        assert_eq!(fs::read_to_string(dest).unwrap(), "existing\n");
     }
 
     /// Verify that a single `Update File` hunk with multiple change chunks can update different

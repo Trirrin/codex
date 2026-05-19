@@ -40,6 +40,30 @@ impl ObservedLineRange {
     }
 }
 
+fn observed_ranges_from_tuples(
+    ranges: impl IntoIterator<Item = (usize, usize)>,
+) -> Vec<ObservedLineRange> {
+    let mut ranges = ranges
+        .into_iter()
+        .filter_map(|(start, end)| {
+            if start == 0 || end < start {
+                None
+            } else {
+                Some(ObservedLineRange { start, end })
+            }
+        })
+        .collect::<Vec<_>>();
+    merge_observed_ranges(&mut ranges);
+    ranges
+}
+
+fn observed_ranges_contain(ranges: &[ObservedLineRange], start: usize, end: usize) -> bool {
+    ranges
+        .partition_point(|range| range.start <= start)
+        .checked_sub(1)
+        .is_some_and(|index| ranges[index].end >= end)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileObservationError {
     NotObserved,
@@ -102,16 +126,7 @@ impl TurnDiffTracker {
         content_hash: String,
         ranges: impl IntoIterator<Item = (usize, usize)>,
     ) {
-        let mut ranges = ranges
-            .into_iter()
-            .filter_map(|(start, end)| {
-                if start == 0 || end < start {
-                    None
-                } else {
-                    Some(ObservedLineRange { start, end })
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut ranges = observed_ranges_from_tuples(ranges);
         if ranges.is_empty() {
             return;
         }
@@ -154,12 +169,7 @@ impl TurnDiffTracker {
         let missing = ranges
             .iter()
             .copied()
-            .filter(|(start, end)| {
-                !observed
-                    .ranges
-                    .iter()
-                    .any(|range| range.start <= *start && range.end >= *end)
-            })
+            .filter(|(start, end)| !observed_ranges_contain(&observed.ranges, *start, *end))
             .collect::<Vec<_>>();
         if missing.is_empty() {
             Ok(())
@@ -196,17 +206,7 @@ impl TurnDiffTracker {
         }
 
         next_ranges.extend(ranges);
-        let mut ranges = next_ranges
-            .into_iter()
-            .filter_map(|(start, end)| {
-                if start == 0 || end < start {
-                    None
-                } else {
-                    Some(ObservedLineRange { start, end })
-                }
-            })
-            .collect::<Vec<_>>();
-        merge_observed_ranges(&mut ranges);
+        let ranges = observed_ranges_from_tuples(next_ranges);
         self.observed_files.insert(
             path.to_path_buf(),
             ObservedFileInfo {

@@ -137,6 +137,24 @@ pub async fn maybe_parse_apply_patch_verified(
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
 ) -> MaybeApplyPatchVerified {
+    async fn ensure_path_missing(
+        path: &AbsolutePathBuf,
+        fs: &dyn ExecutorFileSystem,
+        sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
+    ) -> Result<(), ApplyPatchError> {
+        match fs.get_metadata(path, sandbox).await {
+            Ok(_) => Err(ApplyPatchError::ComputeReplacements(format!(
+                "Refusing to overwrite existing file {}",
+                path.display()
+            ))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(ApplyPatchError::IoError(IoError {
+                context: format!("Failed to check whether {} exists", path.display()),
+                source: err,
+            })),
+        }
+    }
+
     // Detect a raw patch body passed directly as the command or as the body of a shell
     // script. In these cases, report an explicit error rather than applying the patch.
     if let [body] = argv
@@ -165,6 +183,9 @@ pub async fn maybe_parse_apply_patch_verified(
                 let path = hunk.resolve_path(&effective_cwd);
                 match hunk {
                     Hunk::AddFile { contents, .. } => {
+                        if let Err(e) = ensure_path_missing(&path, fs, sandbox).await {
+                            return MaybeApplyPatchVerified::CorrectnessError(e);
+                        }
                         changes.insert(
                             path.into_path_buf(),
                             ApplyPatchFileChange::Add { content: contents },
@@ -199,11 +220,29 @@ pub async fn maybe_parse_apply_patch_verified(
                                 return MaybeApplyPatchVerified::CorrectnessError(e);
                             }
                         };
+                        let move_path = match move_path {
+                            Some(move_path) => {
+                                let dest = effective_cwd.join(move_path);
+                                if path == dest {
+                                    return MaybeApplyPatchVerified::CorrectnessError(
+                                        ApplyPatchError::ComputeReplacements(format!(
+                                            "Refusing to move {} onto itself",
+                                            path.display()
+                                        )),
+                                    );
+                                }
+                                if let Err(e) = ensure_path_missing(&dest, fs, sandbox).await {
+                                    return MaybeApplyPatchVerified::CorrectnessError(e);
+                                }
+                                Some(dest.into_path_buf())
+                            }
+                            None => None,
+                        };
                         changes.insert(
                             path.into_path_buf(),
                             ApplyPatchFileChange::Update {
                                 unified_diff,
-                                move_path: move_path.map(|p| effective_cwd.join(p).into_path_buf()),
+                                move_path,
                                 new_content: contents,
                             },
                         );

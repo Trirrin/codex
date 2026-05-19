@@ -165,7 +165,7 @@ fn test_apply_patch_cli_requires_existing_file_for_update() -> anyhow::Result<()
 }
 
 #[test]
-fn test_apply_patch_cli_move_overwrites_existing_destination() -> anyhow::Result<()> {
+fn test_apply_patch_cli_rejects_move_overwrite_destination() -> anyhow::Result<()> {
     let tmp = tempdir()?;
     let original_path = tmp.path().join("old/name.txt");
     let destination = tmp.path().join("renamed/dir/name.txt");
@@ -178,17 +178,20 @@ fn test_apply_patch_cli_move_overwrites_existing_destination() -> anyhow::Result
         tmp.path(),
         "*** Begin Patch\n*** Update File: old/name.txt\n*** Move to: renamed/dir/name.txt\n@@\n-from\n+new\n*** End Patch",
     )?
-    .success()
-    .stdout("Success. Updated the following files:\nM renamed/dir/name.txt\n");
+    .failure()
+    .stderr(format!(
+        "Refusing to overwrite existing file {}\n",
+        destination.display()
+    ));
 
-    assert!(!original_path.exists());
-    assert_eq!(fs::read_to_string(&destination)?, "new\n");
+    assert_eq!(fs::read_to_string(&original_path)?, "from\n");
+    assert_eq!(fs::read_to_string(&destination)?, "existing\n");
 
     Ok(())
 }
 
 #[test]
-fn test_apply_patch_cli_add_overwrites_existing_file() -> anyhow::Result<()> {
+fn test_apply_patch_cli_rejects_add_overwrite_existing_file() -> anyhow::Result<()> {
     let tmp = tempdir()?;
     let path = tmp.path().join("duplicate.txt");
     fs::write(&path, "old content\n")?;
@@ -197,10 +200,13 @@ fn test_apply_patch_cli_add_overwrites_existing_file() -> anyhow::Result<()> {
         tmp.path(),
         "*** Begin Patch\n*** Add File: duplicate.txt\n+new content\n*** End Patch",
     )?
-    .success()
-    .stdout("Success. Updated the following files:\nA duplicate.txt\n");
+    .failure()
+    .stderr(format!(
+        "Refusing to overwrite existing file {}\n",
+        path.display()
+    ));
 
-    assert_eq!(fs::read_to_string(&path)?, "new content\n");
+    assert_eq!(fs::read_to_string(&path)?, "old content\n");
 
     Ok(())
 }

@@ -425,3 +425,46 @@ index {ZERO_OID}..{right_oid}
     };
     assert_eq!(combined, expected_combined);
 }
+
+#[test]
+fn file_observations_merge_ranges_and_verify_by_range_lookup() {
+    let path = PathBuf::from("sample.txt");
+    let mut tracker = TurnDiffTracker::new();
+
+    tracker.record_file_observation(
+        &path,
+        "hash-a".to_string(),
+        [(5, 6), (1, 2), (3, 4), (0, 9), (8, 7)],
+    );
+
+    assert_eq!(
+        tracker.verify_file_observation(&path, "hash-a", &[(1, 6), (2, 5)]),
+        Ok(())
+    );
+    assert_eq!(
+        tracker.verify_file_observation(&path, "hash-a", &[(1, 7)]),
+        Err(FileObservationError::MissingLines {
+            ranges: vec![(1, 7)]
+        })
+    );
+}
+
+#[test]
+fn file_observation_hash_change_replaces_old_ranges() {
+    let path = PathBuf::from("sample.txt");
+    let mut tracker = TurnDiffTracker::new();
+
+    tracker.record_file_observation(&path, "hash-a".to_string(), [(1, 10)]);
+    tracker.record_file_observation(&path, "hash-b".to_string(), [(5, 5)]);
+
+    assert_eq!(
+        tracker.verify_file_observation(&path, "hash-b", &[(5, 5)]),
+        Ok(())
+    );
+    assert_eq!(
+        tracker.verify_file_observation(&path, "hash-b", &[(1, 1)]),
+        Err(FileObservationError::MissingLines {
+            ranges: vec![(1, 1)]
+        })
+    );
+}
